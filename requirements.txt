@@ -1,0 +1,12 @@
+# 通用/远程
+paramiko>=3.0.0       # 可选：SSH 远程执行（参考 datahub_test/gui_test.py 的用法）
+
+# 测试数据 / 统计输出
+openpyxl>=3.1.0       # perf_stats.write_excel 写 xlsx；缺失时自动退化成 CSV
+
+# 可选：CPU 采样（perf_stats.CpuSampler）
+# 缺失时自动退化成 os.times / time.process_time，仍能给出进程 CPU
+psutil>=5.9.0
+
+# 注意：本目录的 Redis 访问一律走 resp_min.py（纯 socket 实现 RESP），
+# 不依赖 redis-py —— 目标 Linux 机（136 的 python3.9）上没有 redis 模块。

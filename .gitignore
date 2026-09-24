@@ -1,0 +1,19 @@
+# 运行输出
+out/logs/
+out/performance/
+out/*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE / 系统
+.vs/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
