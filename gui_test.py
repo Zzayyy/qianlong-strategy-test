@@ -416,6 +416,10 @@ class MainWindow(QWidget):
             # 「每次发送前自动清空日志」记住用户的选择（纯偏好，无风险）
             self.cp.set("gui", "autoclear_log",
                         "1" if self.chk_autoclear.isChecked() else "0")
+            # 生成压测数据的参数（只是默认值，误填也不会自动发送）
+            self.cp.set("gui", "bulk_accounts", str(self.spin_bulk_accounts.value()))
+            self.cp.set("gui", "bulk_start", str(self.spin_bulk_start.value()))
+            self.cp.set("gui", "ref_map", self.edit_ref_map.text().strip())
         except Exception:
             pass
 
@@ -617,8 +621,163 @@ class MainWindow(QWidget):
         self.lbl_cases.setStyleSheet("color:#555;")
         g.addWidget(self.lbl_cases, len(names) // 3 + 3, 0, 1, 3)
 
+        # ---------------- 生成压测数据（--bulk-normal / --ref-map）----------------
+        # 默认每个接口 normal 只有 2~5 条，压测会循环复用同一批报文；
+        # 这里按 datahub_test 的做法：批量账号 + 用 create 落盘的真实单号回填。
+        row_gen = len(names) // 3 + 4
+        self.spin_bulk_accounts = QSpinBox()
+        self.spin_bulk_accounts.setRange(0, 1000000)
+        self.spin_bulk_accounts.setValue(int(ini_get(self.cp, "gui", "bulk_accounts", "0") or 0))
+        self.spin_bulk_accounts.setMaximumWidth(90)
+        self.spin_bulk_accounts.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_bulk_accounts.setToolTip(
+            "为勾选的接口生成 N 行正常数据、每行一个不同账号（压测不循环）。\n"
+            "modify/remove 的第 i 行会引用单号，需配合下面的「Ref回填文件」才是真实单号。\n"
+            "0 = 不启用（保持原来的小表）。")
+        self.guard.install(self.spin_bulk_accounts)
+
+        self.spin_bulk_start = QSpinBox()
+        self.spin_bulk_start.setRange(0, 999999)
+        self.spin_bulk_start.setValue(int(ini_get(self.cp, "gui", "bulk_start", "0") or 0))
+        self.spin_bulk_start.setMaximumWidth(90)
+        self.spin_bulk_start.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_bulk_start.setToolTip(
+            "账号 6 位序号起点。0 = 接口默认（11301，紧邻真实账号 010100011300 之后）。\n"
+            "★ 用 Ref 回填时必须保持 0：回填是拿「账号」去 refs.json 查单号的，\n"
+            "  改了起点会和 create 的账号序列错位，导致全部查不到。")
+        self.guard.install(self.spin_bulk_start)
+
+        self.edit_ref_map = QLineEdit(ini_get(self.cp, "gui", "ref_map", ""))
+        self.edit_ref_map.setPlaceholderText("Ref回填文件 *_refs.json（发 create 后自动落盘，可选）")
+        self.edit_ref_map.setToolTip(
+            "选 send_test 发 create 时自动落盘的 refs JSON（out/performance/*_refs.json）。\n"
+            "生成 modify/remove 时按【账号】把 __REF token 换成平台真实返回的单号 ——\n"
+            "比靠行序猜可靠得多，不依赖 create 是否按行序全部成功。\n\n"
+            "【前置】必须先真的发过一次 create（勾选 create 点「开始发送」），\n"
+            "        日志里会出现「★ 抓到 N 个条件单号，已写入: ...」，把那个文件选上。\n\n"
+            "【注意】填了它，「批量账号数」必须等于 create 造单的数量，且「起始序号」保持 0；\n"
+            "        否则按账号查不到，会打印 ERROR。")
+        self.edit_ref_map.textChanged.connect(self._update_case_count)
+        btn_pick_map = QPushButton("浏览…")
+        btn_pick_map.setToolTip("选择 create 落盘的 *_refs.json")
+        btn_pick_map.clicked.connect(self._pick_ref_map)
+
+        self.btn_gen = QPushButton("生成压测数据")
+        self.btn_gen.setToolTip(
+            "对勾选的接口执行 make_excel.py：\n"
+            "  批量账号数 > 0  -> 加 --bulk-normal N（替换 normal 段为 N 行不同账号）\n"
+            "  选了 Ref文件    -> 对 modify/remove 加 --ref-map（回填真实单号）\n"
+            "只重写 data/*.xlsx，不会发送任何数据。")
+        self.btn_gen.clicked.connect(self.on_generate)
+        self.btn_open_data = QPushButton("打开 data 目录")
+        self.btn_open_data.clicked.connect(self._open_data_dir)
+
+        g.addWidget(QLabel("批量账号数"), row_gen, 0)
+        g.addWidget(self.spin_bulk_accounts, row_gen, 1)
+        g.addWidget(self.btn_gen, row_gen, 2)
+        g.addWidget(self.btn_open_data, row_gen, 3)
+        g.addWidget(QLabel("账号起始"), row_gen + 1, 0)
+        g.addWidget(self.spin_bulk_start, row_gen + 1, 1)
+        g.addWidget(QLabel("Ref回填"), row_gen + 2, 0)
+        g.addWidget(self.edit_ref_map, row_gen + 2, 1, 1, 2)
+        g.addWidget(btn_pick_map, row_gen + 2, 3)
+
+        self.lbl_gen = QLabel("")
+        self.lbl_gen.setWordWrap(True)
+        self.lbl_gen.setStyleSheet("color:#666;")
+        g.addWidget(self.lbl_gen, row_gen + 3, 0, 1, 4)
+
         self.guard.install(self.combo_type)
         return box
+
+    def _pick_ref_map(self):
+        """浏览选择 create 落盘的 refs.json。"""
+        cur = self.edit_ref_map.text().strip() or os.path.join(BASE_DIR, "out", "performance")
+        d, _ = QFileDialog.getOpenFileName(
+            self, "选择 create 回填 JSON (*_refs.json)", cur, "JSON (*.json)")
+        if d:
+            self.edit_ref_map.setText(d)
+
+    def _open_data_dir(self):
+        d = os.path.join(BASE_DIR, "data")
+        try:
+            os.makedirs(d, exist_ok=True)
+            if sys.platform.startswith("win"):
+                os.startfile(d)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", d])
+            else:
+                subprocess.Popen(["xdg-open", d])
+        except Exception as e:
+            QMessageBox.warning(self, "提示", "打不开目录：%s" % e)
+
+    def on_generate(self):
+        """按界面参数生成 data/*.xlsx（只写文件，不发送）。"""
+        names = self.selected_interfaces()
+        if not names:
+            QMessageBox.warning(self, "提示", "请先勾选至少一个接口")
+            return
+        bulk_n = self.spin_bulk_accounts.value()
+        ref_map = self.edit_ref_map.text().strip()
+        ref_ifaces = [n for n in names if n in ("modify", "remove")]
+
+        # ---- 生成前的一致性校验（照 datahub_test：宁可先问，也别生成无效数据）----
+        if ref_map and not bulk_n:
+            QMessageBox.warning(
+                self, "参数不匹配",
+                "填了「Ref回填」但「批量账号数」是 0。\n\n"
+                "Ref 回填要按【账号】去 refs.json 查单号，必须先勾「批量账号数」"
+                "生成多账号行（数量要与 create 造单数量一致）。")
+            return
+        if ref_map and not ref_ifaces:
+            self.append_log("[提示] Ref回填只对 modify/remove 生效，"
+                            "当前勾选的接口用不到，将忽略。")
+        if ref_map and ref_ifaces and self.spin_bulk_start.value() != 0:
+            if not self._ask("可能生成无效数据",
+                             "「账号起始序号」是 %d（非 0）。\n\n"
+                             "回填是按【账号】查单号的，改了起点会和 create 的账号序列"
+                             "错位，导致一行都查不到、Ref 仍是 __REF token。\n\n"
+                             "确定继续吗？" % self.spin_bulk_start.value()):
+                return
+        if not bulk_n and not (ref_map and ref_ifaces):
+            if not self._ask("确认",
+                             "「批量账号数」是 0，也没有可用的 Ref 回填。\n\n"
+                             "这样生成出来还是原来的小表（每个接口 normal 只有 2~5 条），"
+                             "压测时会被循环复用。\n\n仍要继续吗？"):
+                return
+
+        cmds = []
+        for n in names:
+            cmd = self._base_cmd("make_excel.py") + ["--interface", n]
+            if bulk_n:
+                cmd += ["--bulk-normal", str(bulk_n),
+                        "--bulk-start", str(self.spin_bulk_start.value())]
+                if ref_map and n in ("modify", "remove"):
+                    cmd += ["--ref-map", ref_map]
+            cmds.append(cmd)
+
+        self.append_log("")
+        self.append_log("#" * 60)
+        self.append_log("# 生成压测数据（只写 data/*.xlsx，不发送）")
+        self.append_log("#   接口=%s  批量账号=%s  Ref回填=%s"
+                        % (",".join(names), bulk_n or "关",
+                           os.path.basename(ref_map) if ref_map else "关"))
+        self.append_log("#" * 60)
+        self._run(cmds, on_done=lambda rc: self._after_generate(rc, names))
+
+    def _after_generate(self, rc, names):
+        """生成完刷新提示与用例计数。"""
+        try:
+            parts = []
+            for n in names:
+                p = CASES.default_excel(n) if CASES else ""
+                if p and os.path.exists(p):
+                    parts.append("%s %.1fMB" % (n, os.path.getsize(p) / 1e6))
+            self.lbl_gen.setText("已生成：%s（点「开始发送」才会真的发）"
+                                 % "，".join(parts) if parts else "生成结束")
+        except Exception:
+            self.lbl_gen.setText("生成结束（退出码 %s）" % rc)
+        self._update_case_count()
 
     def _box_send(self):
         box = CollapsibleBox("4. 发送参数")
