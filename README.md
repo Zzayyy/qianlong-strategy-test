@@ -58,6 +58,30 @@ cd strategy_test
 > 日志缓冲区有上限（`MAX_LOG_LINES`），超了会自动丢最旧的；完整日志始终在
 > `out/logs/{label}.log` 里，所以「清空」不会丢任何东西。
 
+#### 想看发出去的 JSON 报文，有四种方式
+
+| 方式 | 怎么做 | 特点 |
+|---|---|---|
+| **① GUI 预览**（最方便） | 勾好接口/类型 → 点 **「预览报文（不发）」** | 日志里打印 `XADD ... task {...}`；**不发数据**。⚠ 每条只打印前 **1500** 字符，长报文会被截 |
+| **② 看流里真实的**（最接近真相） | `python tests/_show_stream.py --stream ST-50 -n 5` | 直接从 Redis 读回**真正写进去的**内容，含 `request_id`，不截断 |
+| **③ 落盘成文件** | `--no-send --dump out/payload.jsonl` | 完整 JSON 逐行写入，适合存档/对比 |
+| **④ 看历史** | `out/logs/{label}.log` | 只记条数/统计，**不含报文内容**（要看报文用 ①②③） |
+
+```bash
+# ② 看实际发出去的（推荐排查用）
+python tests/_show_stream.py --stream ST-50 -n 5          # 最近 5 条
+python tests/_show_stream.py --stream ST-50 -n 1 --json   # 格式化缩进
+python tests/_show_stream.py --stream ST-50 --full        # 不截断
+python tests/_show_stream.py --stream ST-50 --out d.jsonl # 导出
+
+# ③ 发送前预览并落盘（不写 Redis）
+python send_test.py --interface create --cases C001 --no-send --dump out/payload.jsonl
+```
+
+> **什么时候用哪个**：只想确认"将要发什么" → ① 或 ③；
+> 怀疑"实际发出去的跟预览不一样" → ②（它是唯一读**真实流**的，时间戳、
+> `request_id` 都是最终值）；要给同事看完整报文 → ③ 或 ②`--out`。
+
 其它几个按钮：
 
 | 按钮 | 作用 |
@@ -650,6 +674,7 @@ mock_datahub.py       ──PUBLISH───────┘
 | `_crosscheck_cpp.py` | 用 136 上真 `pwdEncode.cpp` 双向交叉验证 `pwd_encode.py` |
 | `_test_pwd17.py` | 定位 pwdUpdate 明文/密文差异（就是它发现"明文被静默吞掉"） |
 | `_cleanup_my_consumers.py` | 误测后在真平台流上留下的 `-wN` 消费者清理（先查 pending=0 才删） |
+| `_show_stream.py` | **看实际发出去的报文**：从 Redis 流里读回（`--json` 格式化 / `--full` 不截断 / `--out` 导出） |
 
 > **GUI 里有 3 个按钮会调用 `tests/` 下的脚本**（一键自测 ×2、真插件复核），
 > 所以删 `tests/` 会让这几个按钮失效。
