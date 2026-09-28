@@ -25,23 +25,25 @@ datahub_test/mock_datahub.py 是"数据中台应答委托服务器(WT)"，
   B) 只做观察者（真数据中台在跑，你想看它给策略平台分了几号）：
        python mock_datahub.py --observe-only
 
-  C) 想造业务流量：
-       python mock_datahub.py --push --push-interface create --push-interval 0.5
+【重要】默认流程【不需要】本脚本：
+  send_test.py 直接 XADD 进 ST-N，本身就扮演了"数据中台发报文"这个角色；
+  而"分配编号"这一步，mock_strategy.py 用 --assign-id N 自应答即可绕过。
+  本脚本唯一不可替代的是"回应策略平台上线、分配编号"那一段 ——
+  实测：用 --no-assign 起 mock_strategy 而不起本脚本，ST-N 永远不会被创建。
+  所以只有要测【完整上线握手】或【观察真中台】时才需要它。
 """
 import argparse
 import json
 import os
-import random
 import sys
 import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import cases as C
 import config as cfgmod
 import protocol as P
-from resp_min import RespClient, RespError
+from resp_min import RespClient
 
 
 def ts():
@@ -59,20 +61,12 @@ class MockDataHub(object):
 
     def __init__(self, kw, alloc_start=1, usecount_aware=True, quiet=False,
                  beat_interval=10.0, observe_only=False,
-                 push=False, push_interface="create", push_rate=0.0,
-                 push_interval=1.0, push_max=0, push_destroy=False,
                  online_channels=None, channel_suffix=""):
         self.kw = kw
         self.alloc_start = int(alloc_start)
         self.quiet = quiet
         self.beat_interval = float(beat_interval)
         self.observe_only = observe_only
-        self.push = push
-        self.push_interface = push_interface
-        self.push_rate = float(push_rate or 0)
-        self.push_interval = float(push_interval or 0)
-        self.push_max = int(push_max or 0)
-        self.push_destroy = bool(push_destroy)
         self.channel_suffix = channel_suffix or ""
         self.ch_online = P.chan(P.CH_STRATEGY_ONLINE, self.channel_suffix)
         self.ch_beat = P.chan(P.CH_STRATEGY_BEAT, self.channel_suffix)
@@ -93,7 +87,6 @@ class MockDataHub(object):
         self.stat = {
             "online_recv": 0, "online_id_m1": 0, "online_confirmed": 0,
             "assigned": 0, "beats_recv": 0, "offline_recv": 0,
-            "push_sent": 0, "push_bytes": 0,
             "last_error": "", "start": time.time(),
         }
         self._pub_conn = None
@@ -293,72 +286,6 @@ class MockDataHub(object):
                         self.stat["last_error"] = "beat: %s" % e
             self.stop.wait(self.beat_interval)
 
-    # ------------------------------------------------------------ 推报文
-    def _push_loop(self):
-        """往 ST-<id> 持续 XADD 业务报文（--push 才跑）。"""
-        if not self.push:
-            return
-        # 等第一个策略平台上线
-        while not self.stop.is_set():
-            with self.lock:
-                if self.servers:
-                    break
-            self.stop.wait(0.5)
-        if self.stop.is_set():
-            return
-
-        type_tag = "destroy" if self.push_destroy else "normal"
-        pool = C.filter_cases(type_tag=type_tag,
-                              interface=(self.push_interface or "all"))
-        if not pool:
-            log("推送：没有可用用例（interface=%s type=%s）"
-                % (self.push_interface, type_tag), self.quiet, force=True)
-            return
-        log("推送线程启动：%s / %s，共 %d 种用例，interval=%.3fs rate=%.1f"
-            % (self.push_interface, type_tag, len(pool),
-               self.push_interval, self.push_rate), self.quiet, force=True)
-
-        n = 0
-        next_t = time.time()
-        while not self.stop.is_set():
-            if self.push_max and n >= self.push_max:
-                log("推送达到 --push-max=%d，停止" % self.push_max,
-                    self.quiet, force=True)
-                return
-            with self.lock:
-                sids = [v["id"] for v in self.servers.values()
-                        if isinstance(v["id"], int) and v["id"] >= 0]
-            if not sids:
-                self.stop.wait(0.5)
-                continue
-            sid = random.choice(sids)
-            no, iface, desc, fn = pool[n % len(pool)]
-            try:
-                payload = C.payload_text(fn())
-                rid = "datahub_%d_%d" % (int(time.time()), n)
-                self._pub().cmd("XADD", P.stream_for(sid), "*",
-                                "request_id", rid, "task", payload)
-                with self.lock:
-                    self.stat["push_sent"] += 1
-                    self.stat["push_bytes"] += len(payload.encode("utf-8"))
-                if not self.quiet and n < 50:
-                    log("→ 推送 ST-%s #%s %s rid=%s len=%d"
-                        % (sid, no, desc, rid, len(payload.encode("utf-8"))),
-                        self.quiet)
-                n += 1
-            except Exception as e:
-                self.stat["last_error"] = "push: %s" % e
-                log("推送失败: %s" % e, self.quiet, force=True)
-                time.sleep(0.5)
-            # 限速
-            if self.push_rate > 0:
-                next_t += 1.0 / self.push_rate
-                d = next_t - time.time()
-                if d > 0:
-                    self.stop.wait(d)
-            elif self.push_interval > 0:
-                self.stop.wait(self.push_interval)
-
     # ------------------------------------------------------------ 生命周期
     def start(self):
         self._pub().ping()
@@ -381,8 +308,6 @@ class MockDataHub(object):
                              daemon=True),
             threading.Thread(target=self._beat_loop, daemon=True),
         ]
-        if self.push:
-            self._threads.append(threading.Thread(target=self._push_loop, daemon=True))
         for t in self._threads:
             t.start()
 
@@ -421,9 +346,6 @@ class MockDataHub(object):
         print("  分配编号次数      : %d" % s["assigned"])
         print("  收到心跳          : %d" % s["beats_recv"])
         print("  收到下线          : %d" % s["offline_recv"])
-        if self.push:
-            print("  推送报文          : %d 条 (%.2f MB)"
-                  % (s["push_sent"], s["push_bytes"] / 1048576.0))
         if servers:
             print("-" * 74)
             print("  在线策略平台 (%d):" % len(servers))
@@ -463,14 +385,6 @@ def main():
     ap.add_argument("--channel-suffix", default="",
                     help="频道后缀：现场存在不带后缀(插件用)与 _1(真中台用)两套，"
                          "默认空且会同时监听两套；只想听一套就用这个指定")
-    ap.add_argument("--push", action="store_true",
-                    help="持续往 ST-<id> 推业务报文")
-    ap.add_argument("--push-interface", default="create",
-                    help="推送的接口名（create/modify/.../all）")
-    ap.add_argument("--push-rate", type=float, default=0.0, help="推送限速 条/秒")
-    ap.add_argument("--push-interval", type=float, default=1.0, help="推送间隔秒")
-    ap.add_argument("--push-max", type=int, default=0, help="最多推多少条，0=不限")
-    ap.add_argument("--push-destroy", action="store_true", help="推送破坏用例")
     ap.add_argument("--seconds", type=float, default=0, help="运行秒数，0=一直跑")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--no-report", action="store_true")
@@ -483,9 +397,7 @@ def main():
     mock = MockDataHub(
         kw=kw, alloc_start=alloc, quiet=a.quiet,
         beat_interval=a.beat_interval, observe_only=a.observe_only,
-        push=a.push, push_interface=a.push_interface, push_rate=a.push_rate,
-        push_interval=a.push_interval, push_max=a.push_max,
-        push_destroy=a.push_destroy, channel_suffix=a.channel_suffix)
+        channel_suffix=a.channel_suffix)
 
     log("数据中台 Mock 启动 → %s:%s db%s（编号起始 %d）"
         % (kw["host"], kw["port"], kw["db"], alloc), a.quiet, force=True)

@@ -9,6 +9,7 @@ _plugin_e2e.py —— 验证「真插件当策略平台」这条路也能和 moc
 
 本脚本由 Windows 侧通过 SSH 驱动。
 """
+import os
 import paramiko
 import sys
 
@@ -20,9 +21,13 @@ UPLOAD = {
     r"D:\Code\Python\多线程\strategy_test\resp_min.py": REMOTE_DIR + "/resp_min.py",
     r"D:\Code\Python\多线程\strategy_test\protocol.py": REMOTE_DIR + "/protocol.py",
     r"D:\Code\Python\多线程\strategy_test\config.py": REMOTE_DIR + "/config.py",
-    r"D:\Code\Python\多线程\strategy_test\cases.py": REMOTE_DIR + "/cases.py",
     r"D:\Code\Python\多线程\strategy_test\config.ini": REMOTE_DIR + "/config.ini",
 }
+
+# 推上 136 后要用到的用例文件（interfaces/create.py 依赖 _common.py）
+UPLOAD_DIRS = [
+    (r"D:\Code\Python\多线程\strategy_test\interfaces", REMOTE_DIR + "/interfaces"),
+]
 
 
 def sh(cli, cmd, timeout=180):
@@ -42,6 +47,17 @@ def main():
     for src, dst in UPLOAD.items():
         sftp.put(src, dst)
         print("  上传 %s" % dst)
+    # interfaces/ 整个目录（create.py + _common.py）
+    for local_dir, remote_dir in UPLOAD_DIRS:
+        try:
+            sftp.mkdir(remote_dir)
+        except Exception:
+            pass
+        for fn in os.listdir(local_dir):
+            if not fn.endswith(".py"):
+                continue
+            sftp.put(os.path.join(local_dir, fn), remote_dir + "/" + fn)
+            print("  上传 %s/%s" % (remote_dir, fn))
     sftp.close()
 
     # 远程配置指向 137 db0
@@ -53,13 +69,19 @@ def main():
     print("\n" + "=" * 74)
     print("### 1) 语法检查")
     print("=" * 74)
-    o, e = sh(cli, "cd %s && python3 -m py_compile resp_min.py protocol.py config.py cases.py && echo COMPILE_OK" % REMOTE_DIR)
+    o, e = sh(cli, "cd %s && python3 -m py_compile resp_min.py protocol.py config.py "
+                   "interfaces/_common.py interfaces/create.py && echo COMPILE_OK" % REMOTE_DIR)
     print(o.strip() or e.strip())
 
     print("\n" + "=" * 74)
-    print("### 2) 用例库自检（应打印 normal/destroy 数量）")
+    print("### 2) 用例定义自检（应打印 create 的 normal/error/destroy 数量）")
     print("=" * 74)
-    o, e = sh(cli, "cd %s && PYTHONIOENCODING=utf-8 python3 -c \"import cases; cases.summarize()\"" % REMOTE_DIR)
+    o, e = sh(cli, "cd %s && PYTHONIOENCODING=utf-8 python3 -c \""
+                   "import sys; sys.path.insert(0,'interfaces'); import create; "
+                   "from collections import Counter; "
+                   "k=[x for x,_ in create.HEADERS]; ti=k.index('case_type'); "
+                   "print('create 用例:', len(create.ROWS), "
+                   "dict(Counter(str(r[ti]) for r in create.ROWS)))\"" % REMOTE_DIR)
     print(o.strip() or e.strip()[:2000])
 
     print("\n" + "=" * 74)
@@ -182,11 +204,20 @@ if pub.cmd("EXISTS", P.stream_for(ASSIGN)):
         for cc in pub.xinfo_consumers(P.stream_for(ASSIGN), g.get("name")):
             say("    CONSUMER %s pending=%s" % (cc.get("name"), cc.get("pending")))
 
-import cases as C
+import sys as _s
+_s.path.insert(0, "/home/yangsh/so_test/strategy/interfaces")
+import create as _create
+# 取一条 normal 模板行，直接用它构造报文
+_k = [x for x, _ in _create.HEADERS]
+_ti = _k.index("case_type")
+_tpl = next(dict(zip(_k, r)) for r in _create.ROWS if str(r[_ti]) == "normal")
+import json as _json
+_PAYLOAD = _json.dumps(_create.build_payload(_tpl), ensure_ascii=False,
+                       separators=(",", ":"))
 n0 = pub.xlen(P.STREAM_REPLY)
 say("发 3 条业务报文到 ST-%d" % ASSIGN)
 for i in range(3):
-    payload = C.payload_text(C.build_payload("create", "normal"))
+    payload = _PAYLOAD
     rid = "PLUGIN_E2E_%d" % i
     pub.cmd("XADD", P.stream_for(ASSIGN), "*", "request_id", rid, "task", payload)
     say("→ XADD ST-%d rid=%s" % (ASSIGN, rid))

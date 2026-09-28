@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config as cfgmod
 import protocol as P
+import safety
 from resp_min import RespClient, RespError
 
 
@@ -67,7 +68,7 @@ class MockStrategy(object):
                  online_interval=2.0, beat_interval=5.0, reply_mode=P.REPLY_AUTO,
                  workers=1, read_count=100, quiet=False, listener=None,
                  max_messages=0, channel_suffix="", verbose=False,
-                 log_first=20, log_every=200):
+                 log_first=20, log_every=200, force_live=False):
         self.kw = kw
         self.unique = unique
         self.assign_id = int(assign_id)
@@ -91,6 +92,9 @@ class MockStrategy(object):
         self.read_count = max(1, int(read_count))
         self.quiet = quiet
         self.verbose = bool(verbose)      # True=每条都打印
+        self.force_live = bool(force_live)  # 关掉安全闸
+        self._guard_decided = threading.Event()   # 安全闸是否已出结论
+        self._guard_ok = threading.Event()        # 可以开始消费了
         self.log_first = int(log_first)   # 前 N 条逐条打印
         self.log_every = int(log_every)   # 之后每 N 条打一行进度
         self.listener = listener      # 可选回调 listener(event_dict)
@@ -277,9 +281,33 @@ class MockStrategy(object):
         log("← 数据中台心跳 %s" % payload, self.quiet)
 
     def _ensure_streams(self):
-        """建 ST-<id> / ST-<id>-reply 两个流 + user_group（插件实测行为）。"""
+        """建 ST-<id> / ST-<id>-reply 两个流 + user_group（插件实测行为）。
+
+        安全闸也在这里做，而且是【同步】做的 —— 必须在任何 worker 以
+        XREADGROUP 加入消费组之前出结论。早期版本把闸放在 worker 线程里，
+        结果 worker 1..N 抢在 stop 传播之前就注册成了消费者（实测踩过：
+        ST-0 上真的多出了 -w1/-w2/-w3 三个消费者），所以改成阻塞式。
+        """
+        if self._guard_decided.is_set():
+            return
+        self._guard_decided.set()
+
         req = P.stream_for(self.assign_id)
         rep = P.reply_stream_for(self.assign_id)
+
+        # ---- 安全闸 ----
+        try:
+            c = self._pub()
+            if not safety.guard_stream(c, req, force_live=self.force_live,
+                                       tool="mock_strategy", what="消费"):
+                log("安全闸拦截：拒绝消费 %s。若确认无害，加 --force-live" % req,
+                    self.quiet, force=True)
+                self.stop.set()
+                self._guard_ok.set()      # 放行等待者，让它们看到 stop 后退出
+                return
+        except Exception as e:
+            log("安全闸检查异常（为安全起见放行）: %s" % e, self.quiet, force=True)
+
         try:
             c = self._pub()
             for s in (req, rep):
@@ -287,6 +315,8 @@ class MockStrategy(object):
                 log("  XGROUP CREATE %s %s -> %s" % (s, P.GROUP, r), self.quiet)
         except Exception as e:
             log("建流失败: %s" % e, self.quiet, force=True)
+        finally:
+            self._guard_ok.set()          # 无论成败都放行，worker 自己看 stop
 
     def _reply_targets(self):
         """回包写哪些流（见 protocol.py 的说明）。"""
@@ -301,6 +331,14 @@ class MockStrategy(object):
         # 等拿到编号
         while not self.stop.is_set() and not self.have_id.is_set():
             self.stop.wait(0.3)
+        if self.stop.is_set():
+            return
+
+        # 等安全闸结论出来（_ensure_streams 里同步做的），避免抢跑注册成消费者。
+        # 【关键】必须等完再算 req/rep：--no-assign 模式下编号是稍后由
+        # _handle_sub 收到的分配报文决定的，提前算会拿到 CLI 默认值，
+        # 结果去消费错的流（实测踩过：分配了 ST-91，却去消费 ST-2）。
+        self._guard_ok.wait(15.0)
         if self.stop.is_set():
             return
 
@@ -607,6 +645,9 @@ def build_parser():
     ap.add_argument("--quiet", action="store_true", help="安静模式")
     ap.add_argument("--verbose", action="store_true",
                     help="逐条打印收到的报文（压测时别开，会刷屏）")
+    ap.add_argument("--force-live", action="store_true",
+                    help="关掉安全闸，允许在「已有真实策略平台消费者」的流上消费。"
+                         "危险：会把真平台的消息抢走一部分。确认过 check_env.py 再用")
     ap.add_argument("--no-report", action="store_true", help="退出时不打印统计")
     return ap, cp
 
@@ -661,6 +702,7 @@ def main():
                  else int(cfgmod.get(cp, "test", "workers"))),
         quiet=a.quiet,
         verbose=a.verbose,
+        force_live=a.force_live,
         max_messages=a.max_messages,
     )
 

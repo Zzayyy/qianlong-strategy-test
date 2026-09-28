@@ -22,7 +22,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
 HOST, DB = "192.168.1.137", 0
-ASSIGN = 1
+ASSIGN = 91      # 用高位号段：137 上 ST-0/ST-1 可能被真实策略平台占用
 
 sys.path.insert(0, HERE)
 from resp_min import RespClient

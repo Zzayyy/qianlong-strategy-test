@@ -7,13 +7,18 @@ _lat_test.py —— 验证"响应时间"到底是链路真实 RTT 还是读取�
 import sys, time, json
 sys.path.insert(0, r"D:\Code\Python\多线程\strategy_test")
 from resp_min import RespClient
-import protocol as P, cases as C
+import protocol as P
+import excel_loader as XL
+
+_CASES = XL.load_cases(XL.default_excel("create"), want_types={"normal"}, quiet=True)
+if not _CASES:
+    sys.exit("没有可用用例，先生成：python make_excel.py --interface create")
 
 kw = dict(host="192.168.1.137", port=6379, password="QianLong@2026&", db=0)
 send = RespClient(**kw).connect()
 read = RespClient(**kw).connect()
 
-ASSIGN = 3
+ASSIGN = 93      # 高位号段，避开真平台
 stream = P.stream_for(ASSIGN)
 send.xgroup_create(stream, P.GROUP, "0", mkstream=True)
 
@@ -25,7 +30,7 @@ print("reply stream last id =", last)
 print("\n=== 单条同步 RTT（发一条立刻读回包）===")
 lat = []
 for i in range(30):
-    payload = C.payload_text(C.build_payload("create", "normal"))
+    payload = _CASES[i % len(_CASES)][3]
     rid = "LAT_%d_%d" % (i, int(time.time() * 1000))
     t0 = time.perf_counter()
     send.cmd("XADD", stream, "*", "request_id", rid, "task", payload)

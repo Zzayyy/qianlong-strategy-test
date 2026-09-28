@@ -19,9 +19,9 @@ send_test.py —— 手动 XADD 发送器（数据中台 → 策略平台）
     # 破坏测试
     python send_test.py --type destroy --workers 8 --max 5000
     # 指定用例发送（定位问题时很有用）
-    python send_test.py --cases D001,D003-D010 --no-send
+    python send_test.py --cases C201,C203-C210 --no-send
     # 只发指定的几条，逐条打印
-    python send_test.py --cases N001 --quiet 0
+    python send_test.py --cases C001 --quiet 0
 
 注意：--max 大于用例数时会循环复用用例（压测数据不够时的常规做法）。
 """
@@ -35,10 +35,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import cases as C
 import config as cfgmod
+import excel_loader as XL
 import perf_stats as PS
 import protocol as P
+import safety
 from resp_min import RespClient, RespError
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -173,14 +174,13 @@ class Sender(object):
                 continue
             if item is None:
                 break
-            no, iface, desc, fn = item
+            no, typ, desc, payload = item[:4]
             if self.max_count and self._sent >= self.max_count:
                 break
             try:
                 if conn is None or not conn.connected:
                     conn = RespClient(self.kw["host"], self.kw["port"],
                                       self.kw["password"], self.kw["db"]).connect()
-                payload = C.payload_text(fn())
                 rid = self._next_req_id()
                 self._pace()
                 # 关键：必须在 XADD 之前登记，否则回包可能在 track() 之前就回来了
@@ -353,8 +353,7 @@ def probe_sync_latency(kw, stream, reply_stream, cases, n=30, logger=None,
         raw = read.cmd("XREVRANGE", reply_stream, "+", "-", "COUNT", "1")
         last = raw[0][0] if raw else "$"
         for i in range(int(n)):
-            no, iface, desc, fn = cases[i % len(cases)]
-            payload = C.payload_text(fn())
+            payload = cases[i % len(cases)][3]
             rid = "SYNC_%d_%d" % (int(time.time() * 1000), i)
             t0 = time.perf_counter()
             send.cmd("XADD", stream, "*", "request_id", rid, "task", payload)
@@ -383,11 +382,13 @@ def probe_sync_latency(kw, stream, reply_stream, cases, n=30, logger=None,
             "p95_ms": PS.percentile(lat, 0.95),
             "max_ms": lat[-1],
         }
+        warn = ("（这 %d 条是额外真实写入 %s 的报文，"
+                "会计入该流 XLEN 但不计入上面的发送/回包统计）" % (m, stream))
         if logger:
             logger.write("同步RTT探测（单发单收，%d 次）: 平均 %.3f ms  "
-                         "P50 %.3f  P95 %.3f  最大 %.3f"
+                         "P50 %.3f  P95 %.3f  最大 %.3f %s"
                          % (m, out["avg_ms"], out["p50_ms"],
-                            out["p95_ms"], out["max_ms"]), force=True)
+                            out["p95_ms"], out["max_ms"], warn), force=True)
         if not quiet:
             print("[同步RTT] %d 次  平均 %.3f ms  P50 %.3f  P95 %.3f  最大 %.3f"
                   % (m, out["avg_ms"], out["p50_ms"], out["p95_ms"], out["max_ms"]),
@@ -428,10 +429,12 @@ def build_parser(cp):
     # 用例
     ap.add_argument("--interface", default=None,
                     help="接口：create/modify/remove/pwdUpdate/account/all")
+    ap.add_argument("--excel", default="",
+                    help="Excel 路径（默认 data/{接口}.xlsx）")
     ap.add_argument("--type", default=None,
                     help="用例类型：normal/destroy/all")
     ap.add_argument("--cases", default="",
-                    help="按编号筛选，如 D001,D003-D010,N001")
+                    help="按编号筛选，如 C201,C203-C210。前缀=接口首字母：C=create M=modify R=remove P=pwdUpdate A=account")
     ap.add_argument("--list-cases", action="store_true", help="只列出用例，不发送")
 
     # 压测参数
@@ -460,6 +463,9 @@ def build_parser(cp):
     ap.add_argument("--dump", default="",
                     help="把生成的报文写到这个 jsonl（便于复核）")
     ap.add_argument("--label", default="", help="统计标签")
+    ap.add_argument("--force-live", action="store_true",
+                    help="关掉「目标流有外来消费者」的安全闸，强行发送（危险："
+                         "可能给真实策略平台下假单。确认过 check_env.py 再用）")
     return ap
 
 
@@ -476,7 +482,7 @@ def main():
     interface = g("interface", "test", "interface")
     type_tag = g("type", "test", "type")
     # 用户显式给了 --cases 但没给 --type 时，自动放宽到 all：
-    # 否则 --cases D001（destroy 用例）会被默认的 type=normal 过滤成 0 条，
+    # 否则 --cases C201（destroy 用例）会被默认的 type=normal 过滤成 0 条，
     # 看起来像"用例不存在"，很坑。
     if a.cases and a.type is None:
         type_tag = "all"
@@ -489,13 +495,22 @@ def main():
         cfgmod.get(cp, "strategy", "assign_id"))
     stream = a.stream or P.stream_for(assign_id)
 
-    pool = C.filter_cases(type_tag=type_tag, interface=interface, cases=a.cases)
+    # ---- 从 Excel 读用例 ----
+    excel = a.excel or XL.default_excel(interface)
+    want = None
+    if type_tag and type_tag != "all":
+        want = {x.strip().lower() for x in str(type_tag).split(",") if x.strip()}
+    # max_cases 提前终止：只要 --max 小且没按编号筛，就没必要读完整表
+    early = max_count if (max_count and not a.cases) else 0
+    pool = XL.load_cases(excel, want_types=want, cases_spec=a.cases,
+                         max_cases=early, quiet=bool(a.quiet))
 
     if not pool:
-        msg = ("没有匹配的用例：type=%s interface=%s cases=%r\n"
-               "提示：--cases 支持编号与区间，如 D001,D003-D010,N001；"
-               "写 --cases 时会自动把 --type 放宽为 all。"
-               % (type_tag, interface, a.cases))
+        msg = ("没有匹配的用例：excel=%s type=%s interface=%s cases=%r\n"
+               "提示：--cases 支持编号与区间，如 C001,C003-C010；"
+               "写 --cases 时会自动把 --type 放宽为 all。\n"
+               "若 Excel 不存在，先生成：python make_excel.py --interface %s"
+               % (excel, type_tag, interface, a.cases, interface))
         if a.list_cases or a.no_send:
             print(msg)
             return 1
@@ -506,11 +521,10 @@ def main():
 
     # ---- 只列用例 ----
     if a.list_cases:
-        print("用例总数: %d（type=%s interface=%s cases=%r）"
-              % (len(pool), type_tag, interface, a.cases))
-        for no, iface, desc, fn in pool:
-            t = C.payload_text(fn())
-            print("  [%s] %-9s %-46s len=%d" % (no, iface, desc, nbytes_len(t)))
+        print("用例总数: %d（excel=%s type=%s cases=%r）"
+              % (len(pool), os.path.basename(excel), type_tag, a.cases))
+        for no, typ, desc, txt, _rn in pool:
+            print("  [%-6s] %-8s %-46s len=%d" % (no, typ, desc, nbytes_len(txt)))
         return 0
 
     # ---- 预览模式 ----
@@ -518,18 +532,18 @@ def main():
         print("=" * 78)
         print("预览模式（不发送） 目标流 = %s @ %s:%s db%s"
               % (stream, kw["host"], kw["port"], kw["db"]))
-        print("用例数 %d  type=%s interface=%s" % (len(pool), type_tag, interface))
+        print("Excel = %s" % excel)
+        print("用例数 %d  type=%s" % (len(pool), type_tag))
         print("=" * 78)
         dump = open(a.dump, "w", encoding="utf-8") if a.dump else None
         try:
-            for i, (no, iface, desc, fn) in enumerate(pool):
-                t = C.payload_text(fn())
-                print("\n--- [%s] %s  %s  (len=%d)" % (no, iface, desc, nbytes_len(t)))
-                print("XADD %s * request_id <rid> task %s" % (stream, t[:1500]))
+            for no, typ, desc, txt, _rn in pool:
+                print("\n--- [%s] %s  %s  (len=%d)" % (no, typ, desc, nbytes_len(txt)))
+                print("XADD %s * request_id <rid> task %s" % (stream, txt[:1500]))
                 if dump:
-                    dump.write(json.dumps({"case": no, "interface": iface,
+                    dump.write(json.dumps({"case": no, "type": typ,
                                            "desc": desc, "stream": stream,
-                                           "task": t}, ensure_ascii=False) + "\n")
+                                           "task": txt}, ensure_ascii=False) + "\n")
         finally:
             if dump:
                 dump.close()
@@ -553,6 +567,20 @@ def main():
     # 确保流和消费组存在（策略平台 Mock 会建；这里兜底，且保证 XLEN 可查）
     try:
         c = RespClient(kw["host"], kw["port"], kw["password"], kw["db"]).connect()
+
+        # ---------------------------------------------------------------
+        # 安全闸：目标流若已被"不是我们建的"消费者占着，说明那可能是
+        # 【真实策略平台】的流。往它里面 XADD = 给真平台下假单，
+        # 可能触发真实交易。判定逻辑见 safety.py（与 mock 共用）。
+        # ---------------------------------------------------------------
+        if not safety.guard_stream(c, stream, force_live=a.force_live,
+                                   tool="send_test", what="发送"):
+            c.close()
+            return 2
+        if c.cmd("EXISTS", stream):
+            logger.write("安全闸：%s 上未发现外来消费者，可安全发送" % stream,
+                         force=True)
+
         r = c.xgroup_create(stream, P.GROUP, "0", mkstream=True)
         logger.write("XGROUP CREATE %s %s -> %s" % (stream, P.GROUP, r), force=True)
         logger.write("目标流发送前 XLEN = %s" % c.xlen(stream), force=True)

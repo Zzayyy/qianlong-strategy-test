@@ -15,7 +15,7 @@ from resp_min import RespClient
 import protocol as P
 
 PY = sys.executable
-HOST, DB, ASSIGN = "192.168.1.137", 0, 2
+HOST, DB, ASSIGN = "192.168.1.137", 0, 92   # 高位号段，避开真平台
 
 
 def ts():
@@ -40,7 +40,15 @@ def spawn(args, tag, sink):
 def main():
     kw = dict(host=HOST, port=6379, password="QianLong@2026&", db=DB)
     c = RespClient(**kw).connect()
-    c.delete(P.stream_for(ASSIGN), P.reply_stream_for(ASSIGN))
+    # 安全：删之前先确认这条流不是真平台的（真平台的 consumer 名 = 流名本身）
+    streams = [P.stream_for(ASSIGN), P.reply_stream_for(ASSIGN)]
+    import safety
+    for s in streams:
+        if safety.foreign_consumers(c, s):
+            say("!! %s 上有非本工具的消费者，拒绝删除（可能是真实策略平台）" % s)
+            c.close()
+            return 2
+    c.delete(*streams)
     say("已清理 ST-%d / ST-%d-reply" % (ASSIGN, ASSIGN))
     before = c.xlen(P.STREAM_REPLY)
     say("DataHub_reply_stream 起始 XLEN=%s" % before)
