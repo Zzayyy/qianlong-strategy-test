@@ -653,11 +653,15 @@ class MainWindow(QWidget):
                               "全局限速 条/秒。0=不限速")
         self.spin_wait = spin(0, 3600, int(float(ini_get(cp, "test", "wait", "5") or 5)), 90,
                               "发完等回包的秒数（收齐或稳定后提前结束）")
-        self.spin_sync = spin(0, 10000, 20, 90,
+        # 默认 0（关闭）：它是「额外真实报文」，默认开着 = 默认多发给真平台 20 条；
+        # 而且没回包时每条干等 5 秒（填 20 可能白等 100 秒），很容易被当成卡死。
+        # 需要真实 RTT 的人会主动填。
+        self.spin_sync = spin(0, 10000, 0, 90,
                               "压测后单发单收 N 次，测链路真实 RTT（对比批量口径）。\n"
-                              "注意：这 N 条是【真实写入 ST-N 的额外报文】，\n"
-                              "会一并被消费和回包，所以流里的条数 = 总条数 + N。\n"
-                              "它们不计入上面的「发送/回包」统计。填 0 关闭。")
+                              "★ 这 N 条是【额外真实写入 ST-N 的报文】，计入该流 XLEN\n"
+                              "  但【不计入】上面的发送/回包统计，流里条数 = 总条数 + N。\n"
+                              "★ 收不到回包时每条要干等 5 秒（填 20 = 最多白等 100 秒）。\n"
+                              "默认 0 = 关闭。要测真实 RTT 再填，建议先填 1~3。")
         self.edit_reply_stream = QLineEdit("")
         self.edit_reply_stream.setPlaceholderText("留空=DataHub_reply_stream")
         self.chk_no_reply = QCheckBox("只发不收（--no-reply）")

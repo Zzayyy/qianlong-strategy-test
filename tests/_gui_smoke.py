@@ -97,7 +97,17 @@ def main():
     check("含 --host/--db", "--host 192.168.1.137" in joined and "--db 0" in joined)
     check("含 --type normal", "--type normal" in joined)
     check("含 --interface create", "--interface create" in joined)
-    check("含 --sync-probe", "--sync-probe" in joined)
+    # 【改过】RTT 探测默认值从 20 改成 0（关闭）：它是"额外真实报文"，
+    # 默认开着等于默认多发给真平台 20 条，没收包时还会白等 100 秒。
+    check("RTT 探测默认 0（不加 --sync-probe）", "--sync-probe" not in joined,
+          joined[-60:])
+    check("RTT 探测默认值 == 0", w.spin_sync.value() == 0,
+          str(w.spin_sync.value()))
+    # 主动填了就应该带上
+    w.spin_sync.setValue(3)
+    check("填了 RTT 就加 --sync-probe",
+          "--sync-probe 3" in " ".join(w._send_argv("create", "normal")))
+    w.spin_sync.setValue(0)
     check("含 --workers", "--workers" in joined)
 
     prev = " ".join(w._send_argv("create", "normal", preview=True))
