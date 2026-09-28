@@ -22,7 +22,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (ZH, REAL_ACCOUNT, REAL_UNIQUE_ACCOUNT, REAL_BLOCKS,
                      collect, is_blank, put, to_typed, gen_fuzz, gen_cross,
-                     add_cases)
+                     add_cases, fmt_account, unique_account, ACCOUNT_START)
 
 NAME = "modify"
 TITLE = "修改条件单 (modify, MsgType=11)"
@@ -159,6 +159,65 @@ _BULK += add_cases(HEADERS, _BASE, [
 ], type_tag="destroy", start=500, prefix=_PREFIX)
 
 ROWS = ROWS + _BULK
+
+
+# ==================== 批量 normal（--bulk-normal）====================
+def build_bulk_rows(count, start=0, ref_seq=1):
+    """生成 count 行 normal：每行一个不同账号 + 引用一个【当天已存在的单号】。
+
+    ★ 为什么必须和 create 对齐：
+      modify 的 Ref 必须是平台上真实存在的单号，否则得到 `ref not exist`。
+      单号规则是「当天日期 + 全局递增序号」，create 批量第 i 行建出来的单
+      就是当天第 i 号。所以这里第 i 行引用 __REF{i}__，只要
+      **create 按行顺序先发一遍**，这些单号就都真实存在了。
+
+    参数：
+      start   : 账号 6 位序号起点（默认 _common.ACCOUNT_START，与 create 对齐）
+      ref_seq : 当天全局起始单号。当日已经建过 ref_seq-1 张单时传入它，
+                这样本表第 i 行引用的就是 __REF{ref_seq+i-1}__。
+                ⚠ 若 create 用的是默认（从 1 开始），这里保持 1 即可。
+
+    发送顺序：create 全部 -> 再发本表（见 README §5.2）。
+    """
+    count = int(count)
+    if count <= 0:
+        raise ValueError("条数必须 > 0")
+    start = int(start) or ACCOUNT_START
+    ref_seq = max(1, int(ref_seq))
+    if start + count - 1 > 999999:
+        raise ValueError("账号序号 %d 超出 6 位上限 999999" % (start + count - 1))
+
+    keys = list(_KEYS)
+    idx = {k: i for i, k in enumerate(keys)}
+    template = None
+    for r in ROWS:
+        if (isinstance(r, (list, tuple)) and len(r) == len(keys)
+                and str(r[idx["case_type"]]) == "normal"):
+            template = list(r)
+            break
+    if template is None:
+        raise ValueError("ROWS 中没有 normal 模板行")
+
+    at = REAL_ACCOUNT["AccountType"]
+    aa = REAL_ACCOUNT["AccAtt"]
+    out = []
+    for i in range(count):
+        seq = start + i
+        facct = fmt_account(seq)
+        r = list(template)
+        r[idx["case_no"]] = "MB%05d" % (i + 1)
+        r[idx["case_type"]] = "normal"
+        r[idx["case_desc"]] = ("账号%s 修改当日第 %d 号单（需先 create）"
+                               % (facct, ref_seq + i))
+        r[idx["Account_Model"]] = REAL_ACCOUNT["Model"]
+        r[idx["Account_AccountType"]] = at
+        r[idx["Account_AccAtt"]] = aa
+        r[idx["Account_FAccount"]] = facct
+        r[idx["UniqueAccount"]] = unique_account(facct, at, aa)
+        r[idx["Ref"]] = "__REF%d__" % (ref_seq + i)
+        r[idx["CondName"]] = "mod%d" % (i + 1)
+        out.append(tuple(r))
+    return out
 
 
 def build_payload(row):

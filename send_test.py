@@ -119,6 +119,13 @@ class Sender(object):
         self._reader = None
         self.reply_seen = 0
 
+        # ---- 回包明细：用于「create 造完单 -> 落盘 refs.json -> 再生成 modify/remove」
+        # rid -> 用例编号 / 账号（发送时登记），以及成功回包里的 Ref
+        self._rid_meta = {}
+        self._rid_meta_lock = threading.Lock()
+        self.refs = []          # [{"account":..., "case_no":..., "ref":...}, ...]
+        self._refs_lock = threading.Lock()
+
         # 全局限速用
         self._rate_lock = threading.Lock()
         self._next_allow = 0.0
@@ -141,6 +148,84 @@ class Sender(object):
             delay = self._next_allow - now
         if delay > 0:
             time.sleep(min(delay, 1.0))
+
+    # ------------------------------------------------------------ 回包明细
+    def _remember_rid(self, rid, case_no, payload):
+        """登记 rid -> (用例编号, 账号)，供回包回来时关联出 Ref。
+
+        只对 create 有意义（它才产生条件单号），但登记很便宜，不做区分，
+        这样任何接口想扩展"从回包抓字段"都能直接用。
+        """
+        acct = ""
+        try:
+            obj = json.loads(payload)
+            body = obj.get("create") if isinstance(obj, dict) else None
+            if isinstance(body, dict):
+                a = body.get("Account")
+                if isinstance(a, dict):
+                    acct = str(a.get("FAccount") or "")
+        except Exception:
+            pass
+        with self._rid_meta_lock:
+            self._rid_meta[rid] = (str(case_no), acct)
+            # 防内存无限增长（压了几十万条时没回包的 rid 会堆积）
+            if len(self._rid_meta) > 500000:
+                for k in list(self._rid_meta)[:100000]:
+                    self._rid_meta.pop(k, None)
+
+    def _on_reply_body(self, rid, task):
+        """回包里若带 Ref，就记成 (账号, 用例号, Ref)。
+
+        ⚠ 策略平台方向的回包格式与 datahub_test(WT 方向)【不同】：
+          ST 方向是平的   {"Ref":"2026...","Errmsg":"insert success","ErrID":0}
+          WT 方向是嵌套的 {"Err":0,"results":[{"Ref":"..."}]}
+        这里两种都兼容，取到第一个 Ref 就记下。
+        """
+        if not task:
+            return
+        try:
+            obj = json.loads(task)
+        except Exception:
+            return
+        if not isinstance(obj, dict):
+            return
+        ref = obj.get("Ref")
+        if not ref:
+            for key in ("results", "Results"):
+                lst = obj.get(key)
+                if isinstance(lst, list):
+                    for it in lst:
+                        if isinstance(it, dict) and it.get("Ref"):
+                            ref = it["Ref"]
+                            break
+                if ref:
+                    break
+        if not ref:
+            return
+        with self._rid_meta_lock:
+            meta = self._rid_meta.pop(rid, None)
+        if not meta:
+            return
+        case_no, acct = meta
+        with self._refs_lock:
+            self.refs.append({"account": acct, "case_no": case_no,
+                              "ref": str(ref)})
+
+    def save_refs(self, path):
+        """把 (账号, 用例号, Ref) 落盘成 JSON。返回路径或 None（没抓到）。"""
+        with self._refs_lock:
+            rows = list(self.refs)
+        if not rows:
+            return None
+        # 去重（同一个 Ref 只留一条，压测循环复用时同一用例会重复出现）
+        seen = {}
+        for r in rows:
+            seen[r["ref"]] = r
+        rows = sorted(seen.values(), key=lambda x: x["case_no"])
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+        return path
 
     # ------------------------------------------------------------ 发送
     def _producer(self):
@@ -188,6 +273,7 @@ class Sender(object):
                 # 同时 pending 里留下一个永远不消失的孤儿，把"在途"和响应时间都算错。
                 if not self.no_reply:
                     self.perf.track(rid)
+                    self._remember_rid(rid, no, payload)
                 conn.cmd("XADD", self.stream, "*", "request_id", rid, "task", payload)
                 nbytes = len(payload.encode("utf-8"))
                 with self._sent_lock:
@@ -267,6 +353,8 @@ class Sender(object):
                         task = fields.get("task", "")
                         self.reply_seen += 1
                         self.perf.record_reply(rid, len(str(task).encode("utf-8")))
+                        # 从回包里抓 Ref（create 造单后落盘，供 modify/remove 用）
+                        self._on_reply_body(rid, task)
                         if self.logger and not self.quiet:
                             self.logger.write("← [%s] #%s rid=%s task=%s"
                                               % (st, eid, rid, str(task)[:200]))
@@ -454,6 +542,13 @@ def build_parser(cp):
     ap.add_argument("--sync-probe", type=int, default=0,
                     help="压测后额外跑 N 次单发单收，测链路真实 RTT（对比批量值）")
 
+    # 回填：create 造完单后把 (账号, Ref) 落盘，供 modify/remove 生成用例
+    ap.add_argument("--refs-out", default="",
+                    help="把回包里抓到的条件单号写成 JSON（默认 <stats-out>/<标签>_refs.json）。"
+                         "发 create 时用，之后配合 make_excel --ref-map 生成 modify/remove 数据")
+    ap.add_argument("--no-refs-out", action="store_true",
+                    help="不写 refs JSON（默认发 create 会自动写）")
+
     # 输出
     ap.add_argument("--no-send", action="store_true", help="只生成/预览报文，不发送")
     ap.add_argument("--quiet", type=int, default=1, help="1=安静（默认）")
@@ -636,6 +731,26 @@ def main():
             c.close()
         except Exception:
             pass
+
+    # ---- 回填文件：create 造完单，把 (账号, Ref) 落盘 ----
+    # 有了它，modify/remove 就能用【真实存在的单号】生成用例（--ref-map），
+    # 而不是靠行序猜。见 README §5.2。
+    if not a.no_refs_out and not a.no_reply and sender.refs:
+        rp = a.refs_out or os.path.join(a.stats_out,
+                                        "%s_refs.json" % label)
+        try:
+            saved = sender.save_refs(rp)
+            if saved:
+                with sender._refs_lock:
+                    n = len({r["ref"] for r in sender.refs})
+                logger.write("★ 抓到 %d 个条件单号，已写入: %s" % (n, saved),
+                             force=True)
+                logger.write("  下一步可用它生成 modify/remove 用例：", force=True)
+                logger.write("    python make_excel.py --interface remove "
+                             "--bulk-normal %d --ref-map %s" % (n, saved),
+                             force=True)
+        except Exception as e:
+            logger.write("写 refs 失败: %s" % e, force=True)
 
     logger.write("日志: %s" % logfile, force=True)
     logger.close()

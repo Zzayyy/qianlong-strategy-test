@@ -274,10 +274,53 @@ def add_cases(headers, template, items, type_tag, start, prefix=""):
     return out
 
 
+# ==================== 批量测试账号号段（--bulk-normal 用）====================
+# 真实账号 010100011300 = 前缀 010100 + 6 位序号 011300。
+# 批量账号从 ACCOUNT_START 起递增，只保证【格式】与真实样本一致。
+# 约定与 datahub_test/interfaces/_common.py 对齐，便于两边造的数据互通。
+ACCOUNT_PREFIX = "010100"      # 12 位云单账号的前 6 位固定前缀
+ACCOUNT_START = 11301          # 默认起点：紧邻真实账号 010100011300 之后
+
 # ==================== 真实样本（照抄 ST-0 真实流量）====================
 REAL_ACCOUNT = {"Model": 0, "FAccount": "010100011300",
                 "AccountType": 7, "AccAtt": 6}
 REAL_UNIQUE_ACCOUNT = "010100011300_7_6"
+
+
+def fmt_account(seq):
+    """把 6 位序号格式化成云单账号（ACCOUNT_PREFIX + 6位序号）。"""
+    return "%s%06d" % (ACCOUNT_PREFIX, int(seq))
+
+
+def unique_account(facct, account_type=None, acc_att=None):
+    """按线上规则拼 UniqueAccount：<FAccount>_<AccountType>_<AccAtt>。
+
+    【坑】批量造账号时它必须跟着 FAccount 一起变。若照抄模板的
+    `010100011300_7_6`，平台会判"账号与唯一账号不一致"直接拒。
+    """
+    at = REAL_ACCOUNT["AccountType"] if account_type is None else account_type
+    aa = REAL_ACCOUNT["AccAtt"] if acc_att is None else acc_att
+    return "%s_%s_%s" % (facct, at, aa)
+
+
+# 股东号真实格式（实测 136 ST-0 的 12 条 MsgType=18）：
+#   沪市  A442523077      = 'A' + 9 位数字，共 10 字符
+#   深市  0199908393      = 10 位数字（首位 0）
+# 【坑】datahub_test 里写的是 'A' + '%08d'（8 位，共 9 字符），比真实样本短一位。
+# 这里按实测修正为 9 位。
+SH_BASE_SH = 442000000      # 沪市数字部分基数（9 位）
+SH_BASE_SZ = 199000000      # 深市数字部分基数（10 位，首位 0）
+
+
+def fmt_shareholders(seq):
+    """按序号生成一对股东号 (沪, 深)，格式对齐真实样本。
+
+    返回 ([("A442011301", 1), ("0199011301", 2)]) 这样的列表。
+    """
+    n = int(seq)
+    sh = "A%09d" % (SH_BASE_SH + n)
+    sz = "%010d" % (SH_BASE_SZ + n)
+    return [(sh, 1), (sz, 2)]
 
 REAL_ENTRUST = {
     "ContractCode": "90007461", "ExchangeNum": 2, "EntrustPrice": "0.1033",

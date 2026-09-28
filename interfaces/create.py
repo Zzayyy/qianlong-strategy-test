@@ -28,7 +28,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (ZH, REAL_ACCOUNT, REAL_UNIQUE_ACCOUNT, REAL_BLOCKS,
                      collect, is_blank, put, to_typed, gen_fuzz, gen_cross,
-                     add_cases)
+                     add_cases, fmt_account, ACCOUNT_START)
 
 NAME = "create"
 TITLE = "插入条件单 (create, MsgType=4)"
@@ -285,6 +285,69 @@ _BULK += gen_cross(HEADERS, _BASE, _ACCT_VARIANTS, injects=[
 ], type_tag="destroy", start=300, prefix=_PREFIX)
 
 ROWS = ROWS + _BULK
+
+
+# ==================== 批量 normal（--bulk-normal）====================
+def build_bulk_rows(count, start=0):
+    """生成 count 行 normal，每行一个【不同账号】。供 make_excel --bulk-normal N 使用。
+
+    为什么要它：原来的 normal 只有 5 条（C001~C005），压测时 --max 会循环复用，
+    同一 Ref/账号被反复发 —— create 用重复 Ref 会得到 `ref already inserted`，
+    测出来的是"业务失败路径"，不是"大量真实成功下单"的负载。
+
+    设计要点（每条都有实测依据）：
+      * 账号 = ACCOUNT_PREFIX(010100) + 6 位递增序号，与 datahub_test 同一号段规则。
+      * UniqueAccount 必须【跟着 FAccount 变】，格式 <FAccount>_<AccountType>_<AccAtt>。
+        照抄模板的 `010100011300_7_6` 会被平台判为"账号与唯一账号不一致"。
+      * Ref 必须【逐行不同】：create 用重复 Ref 会 ref already inserted。第 i 行填
+        __REF{i+1}__，发送当天展开成 YYYYMMDD+6位序号，天然唯一。
+      * 条件块：实测 136 ST-0 的 6964 条真实 create 全是 CondType=1 且带全套
+        Cond* 块，所以这里保持 CondType=1 + 全套，不按 datahub_test 那样轮换 5 类。
+      * 字段名一律用实测的大写（CondPrice/Op/TriggerPercent/TriggerDate/
+        TriggerTime/Method/ValueType/WithdrawType/Withdraw）。
+        同事给的样本是小写（cond_price/op/TriggeredPercent…），实测 0 次出现，不采用。
+
+    ⚠ 这些账号只是"格式合法"，【不代表柜台上真的存在】。要真能下单成功，
+      账号必须先在柜台/中台批量签出（同 datahub_test 的 acc_sign 流程）。
+    """
+    count = int(count)
+    if count <= 0:
+        raise ValueError("条数必须 > 0")
+    start = int(start) or ACCOUNT_START
+    if start + count - 1 > 999999:
+        raise ValueError("账号序号 %d 超出 6 位上限 999999" % (start + count - 1))
+
+    keys = list(_KEYS)
+    idx = {k: i for i, k in enumerate(keys)}
+    template = None
+    for r in ROWS:
+        if (isinstance(r, (list, tuple)) and len(r) == len(keys)
+                and str(r[idx["case_type"]]) == "normal"):
+            template = list(r)
+            break
+    if template is None:
+        raise ValueError("ROWS 中没有 normal 模板行")
+
+    at = REAL_ACCOUNT["AccountType"]
+    aa = REAL_ACCOUNT["AccAtt"]
+    out = []
+    for i in range(count):
+        seq = start + i
+        facct = fmt_account(seq)
+        r = list(template)
+        r[idx["case_no"]] = "CB%05d" % (i + 1)
+        r[idx["case_type"]] = "normal"
+        r[idx["case_desc"]] = "压测账号%s（第 %d/%d 个）" % (facct, i + 1, count)
+        r[idx["Account_FAccount"]] = facct
+        r[idx["Account_AccountType"]] = at
+        r[idx["Account_AccAtt"]] = aa
+        r[idx["Account_Model"]] = REAL_ACCOUNT["Model"]
+        r[idx["UniqueAccount"]] = "%s_%d_%d" % (facct, at, aa)
+        r[idx["Ref"]] = "__REF%d__" % (i + 1)
+        r[idx["CondName"]] = "name%d" % (i + 1)
+        r[idx["CondDesc"]] = "stress%d" % seq
+        out.append(tuple(r))
+    return out
 
 
 # ==================== 报文构造 ====================

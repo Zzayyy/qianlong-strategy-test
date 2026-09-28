@@ -21,7 +21,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (ZH, REAL_ACCOUNT, REAL_UNIQUE_ACCOUNT, collect, is_blank,
-                     put, to_typed, gen_fuzz, add_cases)
+                     put, to_typed, gen_fuzz, add_cases,
+                     fmt_account, unique_account, ACCOUNT_START)
 
 # Pwd 加密（两层 AES-256-CBC + Base64，见 pwd_encode.py）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -133,6 +134,58 @@ _BULK += add_cases(HEADERS, _BASE, [
 ], type_tag="destroy", start=400, prefix=_PREFIX)
 
 ROWS = ROWS + _BULK
+
+
+# ==================== 批量 normal（--bulk-normal）====================
+def build_bulk_rows(count, start=0):
+    """生成 count 行 normal：每行一个不同账号，把该账号的密码改成同一明文。
+
+    ★ 与 create/account 共用同一号段（默认 11301 起），这样"先 account 登录、
+      再 create 下单、再改密码"都能落到同一批账号上。
+
+    ★ 没有 Ref：改密码是按账号维度操作的（MsgType=17 报文里只有 Account +
+      UniqueAccount + Pwd），不需要引用具体条件单。
+
+    ★ Pwd 存【明文】，build_payload 时按【本行账号】做两层加密 ——
+      账号不同密文就不同，这是对的。
+    """
+    count = int(count)
+    if count <= 0:
+        raise ValueError("条数必须 > 0")
+    start = int(start) or ACCOUNT_START
+    if start + count - 1 > 999999:
+        raise ValueError("账号序号 %d 超出 6 位上限 999999" % (start + count - 1))
+
+    keys = list(_KEYS)
+    idx = {k: i for i, k in enumerate(keys)}
+    template = None
+    for r in ROWS:
+        if (isinstance(r, (list, tuple)) and len(r) == len(keys)
+                and str(r[idx["case_type"]]) == "normal"):
+            template = list(r)
+            break
+    if template is None:
+        raise ValueError("ROWS 中没有 normal 模板行")
+
+    at = REAL_ACCOUNT["AccountType"]
+    aa = REAL_ACCOUNT["AccAtt"]
+    out = []
+    for i in range(count):
+        seq = start + i
+        facct = fmt_account(seq)
+        r = list(template)
+        r[idx["case_no"]] = "PB%05d" % (i + 1)
+        r[idx["case_type"]] = "normal"
+        r[idx["case_desc"]] = "压测账号%s 改密码（第 %d/%d 个）" % (facct, i + 1, count)
+        r[idx["Account_Model"]] = REAL_ACCOUNT["Model"]
+        r[idx["Account_AccountType"]] = at
+        r[idx["Account_AccAtt"]] = aa
+        r[idx["Account_FAccount"]] = facct
+        r[idx["Pwd"]] = REAL_PWD_PLAIN
+        r[idx["Pwd_raw"]] = ""
+        r[idx["UniqueAccount"]] = unique_account(facct, at, aa)
+        out.append(tuple(r))
+    return out
 
 
 def build_payload(row):

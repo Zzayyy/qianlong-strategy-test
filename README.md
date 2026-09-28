@@ -813,11 +813,25 @@ python send_test.py --cases C201,C203-C210 --assign-id 1  # 再发
 | `--no-reply` | 关 | 不读回包（纯发） |
 | `--reply-stream` | 空 | 回包流名，默认 `DataHub_reply_stream` |
 | `--sync-probe` | **0（关闭）** | 压测后单发单收 N 次，测链路真实 RTT。⚠ 会**额外真实写入 N 条**、不计入统计；收不到回包时每条干等 5 秒。要测再填，建议 1~3 |
+| `--refs-out` | 空 | 发 create 时把回包里的真实单号写成 JSON（默认 `<stats-out>/<标签>_refs.json`），供 `make_excel --ref-map` 用 |
+| `--no-refs-out` | 关 | 不写上面那个 refs JSON |
 | `--no-send` | 关 | 只预览报文 |
 | `--list-cases` | 关 | 只列出用例 |
 | `--dump` | 空 | 预览时把报文写 jsonl |
 | `--quiet` | 1 | 1=安静 |
 | `--no-stats` / `--stats-out` / `--stats-interval` | 开/`out/performance`/1.0 | 统计开关、输出目录、采样间隔 |
+
+### make_excel.py
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--interface` | `all` | 接口名或 `all` |
+| `--list` | 关 | 只列出各接口用例数，不生成 |
+| `--ref-spec` | 空 | **仅 modify/remove**：把 normal 段换成按单号区间生成的引用行，如 `7,100` 或 `20260904000001-20260904000100` |
+| `--bulk-normal` | 0 | **五个接口都支持**：把 normal 段换成 N 行**不同账号**的压测数据（见 §5.1 / §5.2） |
+| `--bulk-start` | 0（=11301） | 批量账号的 6 位序号起点 |
+| `--ref-seq` | 1 | **仅 modify/remove**：做法 B 用，批量行引用的「当天全局起始单号」。当天已建过 N 张就填 N+1 |
+| `--ref-map` | 空 | ★**推荐**：做法 A 用，读 `send_test` 落盘的 `refs.json` 回填**真实单号**（比 `--ref-seq` 可靠） |
 
 ### mock_strategy.py
 
@@ -864,6 +878,8 @@ python send_test.py --cases C201,C203-C210 --assign-id 1  # 再发
 
 ### 数量
 
+默认（`make_excel.py --interface all` 生成的规模）：
+
 ```
 接口        normal    error  destroy
 account          5        7       96
@@ -876,6 +892,155 @@ remove           2        5       34
 ```
 
 `make_excel.py --interface all --list` 可随时打印这张表。
+
+### 5.1 压测数据扩充：`--bulk-normal`
+
+默认每个接口 normal 只有 2~5 条，压测时 `--max` 会**循环复用**同一批报文 ——
+create 用重复 `Ref` 会得到 `ref already inserted`，测出来的是"业务失败路径"，
+不是"大量真实成功下单"的负载。所以提供批量扩充（**五个接口都支持**，
+完整用法与依赖顺序见 §5.2）：
+
+```bash
+# 账号先"登录"（MsgType=18），再造单（MsgType=4）
+python make_excel.py --interface account --bulk-normal 10000
+python make_excel.py --interface create  --bulk-normal 10000
+```
+
+扩充后：
+
+| 文件 | 结果 |
+|---|---|
+| `data/account.xlsx` | **10103 条**：normal 10000 + error 7 + destroy 96 |
+| `data/create.xlsx` | **10296 条**：normal 10000 + error 9 + destroy 287 |
+
+**五个接口的账号号段完全一致（`010100011301`~`010100021300`）** —— 同一个账号
+既要能登录、又要能下单/改单/删单，所以必须对齐，不能各用各的号段。
+
+生成规则（每条都有实测依据）：
+
+| 项 | 规则 | 为什么 |
+|---|---|---|
+| `Account.FAccount` | `010100` + 6 位递增序号 | 与 `datahub_test` 同一号段规则，两边数据可互通 |
+| `UniqueAccount` | `<FAccount>_<AccountType>_<AccAtt>` | **必须跟着 FAccount 变**；照抄模板会被判"账号与唯一账号不一致" |
+| `create.Ref` | `__REF1__` ~ `__REF10000__`（逐行不同） | 发送当天展开成 `YYYYMMDD+6位序号`，天然唯一，避免 `ref already inserted` |
+| `modify.Ref` / `remove.Ref` | `__REF{i}__`，**与 create 行序对齐** | 单号必须真实存在；靠行序对齐自动接上 create 造的单（见 §5.2） |
+| `create.CondType` | 固定 `1`，带全套 `Cond*` 块 | 实测 136 ST-0 的 6964 条真实 create **全是 1** |
+| `account.Pwd` / `pwdUpdate.Pwd` | Excel 存**明文**，发送时按**本行账号**加密 | 账号不同密文就不同，这是对的；已验证每行都能解回 `123123` |
+| `account.TradeAccount` | = `FAccount` | 实测真实样本里两者一致 |
+| 股东号 | 沪 `A`+9位、深 10位数字 | 实测样本 `A442523077` / `0199908393` |
+| 字段名 | 实测大写 `CondPrice`/`Op`/`TriggerPercent`/`TriggerDate`/`TriggerTime`/`Method`/`ValueType`/`WithdrawType`/`Withdraw` | 同事给的样本是小写（`cond_price`/`op`/`TriggeredPercent`…），实测 **0 次**出现，不能用 |
+
+> ⚠️ **modify / remove 在真实流量里一条都没有**（136 ST-0 只有 create=4 和 account=18）。
+> 它们的结构依据是协议文档 + 我们实测发过去拿到 `update success` / `remove success`
+> 的那几条，**证据强度弱于 create/account**，现场如果被拒要优先怀疑字段名/结构。
+
+> ⚠️ **账号只是"格式合法"，不代表柜台上真的存在。** 要真能登录/下单成功，
+> 账号必须先在柜台批量开立（同 `datahub_test` 的 `acc_sign` 流程）。
+> 否则这一万条大概率是"查不到账号"的业务失败，压测指标同样失真。
+
+> ⚠️ 批量行会**替换**掉原来手写的 5 条 normal（error/destroy 全部保留）。
+> 想恢复成小表：`python make_excel.py --interface all`。
+
+> ⚠️ `--bulk-normal` 与 `--ref-spec` **互斥**。`--ref-spec` 只对 `modify`/`remove`
+> 生效（按单号区间生成引用行）。**五个接口现在都实现了 `--bulk-normal`。**
+
+### 5.2 五个接口一起扩（含依赖顺序）
+
+五个接口**共用同一账号号段**（默认 `010100011301`~`010100021300`）：
+
+```bash
+python make_excel.py --interface account   --bulk-normal 10000
+python make_excel.py --interface create    --bulk-normal 10000
+python make_excel.py --interface modify    --bulk-normal 10000
+python make_excel.py --interface remove    --bulk-normal 10000
+python make_excel.py --interface pwdUpdate --bulk-normal 10000
+```
+
+| 接口 | 结果 | 引用单号？ |
+|---|---|---|
+| `account` | 10103 条（normal 10000） | 否 |
+| `create` | 10296 条（normal 10000） | 自己**产生**单号 |
+| `modify` | 10087 条（normal 10000） | ✅ 引用 `__REF{i}__` |
+| `remove` | 10039 条（normal 10000） | ✅ 引用 `__REF{i}__` |
+| `pwdUpdate` | 10046 条（normal 10000） | 否（按账号操作） |
+
+#### ⚠️ 发送顺序是硬约束
+
+`modify` / `remove` 的 `Ref` 必须是**平台上真实存在的单号**，否则得到
+`ref not exist`。有两种做法，**推荐第一种**：
+
+##### 做法 A（推荐）：用 create 实跑落盘的 `refs.json`
+
+`send_test.py` 发 `create` 时会**自动从回包里抓出真实单号**并落盘：
+
+```
+★ 抓到 10000 个条件单号，已写入: out/performance/create_xxx_refs.json
+  下一步可用它生成 modify/remove 用例：
+    python make_excel.py --interface remove --bulk-normal 10000 --ref-map <该文件>
+```
+
+它输出的 `refs.json` 形如（按**账号**索引）：
+
+```json
+[{"account":"010100011301","case_no":"CB00001","ref":"20260928000001"},
+ {"account":"010100011302","case_no":"CB00002","ref":"20260928000002"}]
+```
+
+然后用它回填：
+
+```bash
+python make_excel.py --interface remove --bulk-normal 10000 \
+    --ref-map out/performance/create_xxx_refs.json
+```
+
+**为什么比做法 B 可靠**：单号是**平台回包里给的真值**，不依赖"create 一定按行序
+成功"，跳过失败单也不会错位。填不上的行会保留 `__REF__` token 并告警；
+若**一行都没命中**会直接报 ERROR（说明账号起点对不上）。
+
+```bash
+# 不想自动写就用 --no-refs-out；想指定路径用 --refs-out
+python send_test.py --interface create --type normal --assign-id 50 --refs-out out/my_refs.json
+```
+
+##### 做法 B（备选）：靠行序对齐 `__REF{i}__`
+
+五张表的批量行**行序一一对应**：
+
+```
+create 第 i 行  ──建出──►  当天第 i 号单
+                              ▲
+modify 第 i 行  ──引用───────┘  __REF{i}__
+remove 第 i 行  ──引用───────┘  __REF{i}__
+```
+
+所以**必须按顺序发**：
+
+```
+1. account    账号先能"登录"
+2. create     产生 1..N 号单（同时落盘 refs.json）
+3. modify     改第 1..N 号（可选）
+4. remove     删第 1..N 号（若已 modify 过，删的就是改后的那张）
+```
+
+> **删除不可逆**。要同时测 modify 和 remove，就按上面 `create → modify → remove`；
+> 只想测 remove，`create → remove` 即可。
+
+#### 当天已经建过单怎么办
+
+`__REFn__` 的实际单号是「**发送当天**的日期 + 6 位序号」，比如
+`__REF1__` → `20260928000001`。若当天**已经发过** N 张单，再生成时序号要接着排：
+
+```bash
+# 做法 B：当天已有 500 张单，从第 501 号开始引用
+python make_excel.py --interface remove --bulk-normal 10000 --ref-seq 501
+```
+
+不填就是 `1`，即假设"今天还没建过单"。**用做法 A（--ref-map）时不需要管这个** ——
+单号直接来自 `refs.json`。
+
+> 也正因如此，**做法 B 的数据不能跨天用** —— 表里存的是 `__REFn__` 占位符，
+> 单号在**发送时**才按当天日期展开。今天生成的表明天发，引用的就是明天的单号。
+> 做法 A 写的是**完整静态单号**，不受日期影响（但那个单号本身当然仍要真实存在）。
 
 ### destroy 覆盖什么
 

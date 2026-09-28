@@ -76,7 +76,10 @@ w.combo_type.setCurrentText("normal")
 t = time.time()
 cnt, det, err = w._estimate_count()
 d = time.time() - t
-check("create normal 统计出 5 条", "create=5" in det, "%s (%.2fs)" % (det, d))
+# 【别写死条数】create.xlsx 可能被 --bulk-normal 扩到 1 万条
+check("create normal 统计出条数", cnt > 0 and "create=" in det,
+      "%s (%.2fs)" % (det, d))
+check("统计值自洽", "create=%d" % cnt in det, "cnt=%d" % cnt)
 w.combo_type.setCurrentText("destroy")
 cnt2, det2, _ = w._estimate_count()
 check("destroy 统计 >200", cnt2 > 200, "%d 条" % cnt2)
@@ -92,7 +95,7 @@ t = time.time()
 cnt, det, _ = w._estimate_count()
 d = time.time() - t
 check("只统计了 create", "=" in det and det.count("=") == 1, det)
-check("结果是 5", "create=5" in det, det)
+check("统计值自洽", "create=%d" % cnt in det, det)
 print("      （读 1 张表 %.2f s；改造前勾选一次要读 4 张）" % d)
 
 w.close()

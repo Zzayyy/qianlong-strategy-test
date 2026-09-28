@@ -26,7 +26,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (ZH, REAL_ACCOUNT, REAL_UNIQUE_ACCOUNT, is_blank, put,
-                     to_typed, collect, gen_fuzz, add_cases)
+                     to_typed, collect, gen_fuzz, add_cases,
+                     fmt_account, unique_account, fmt_shareholders,
+                     ACCOUNT_START)
 
 # Pwd 加密（两层 AES-256-CBC + Base64，见 pwd_encode.py）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -191,6 +193,71 @@ _BULK += add_cases(HEADERS, _BASE, [
 ], type_tag="destroy", start=500, prefix=_PREFIX)
 
 ROWS = ROWS + _BULK
+
+
+# ==================== 批量 normal（--bulk-normal）====================
+def build_bulk_rows(count, start=0):
+    """生成 count 行 normal，每行一个【不同账号】。供 make_excel --bulk-normal N 使用。
+
+    为什么要它：默认 normal 只有 5 条，压测时 --max 会循环复用同一个账号；
+    而模拟"大量账号各登录一次"才是这个接口的真实负载。
+
+    设计要点：
+      * 账号 = ACCOUNT_PREFIX + 6 位递增序号（与 create 同一号段规则）。
+        ⚠ 顺序很重要：create 的 1 万条用的就是这个号段，两边能对上。
+      * UniqueAccount = <FAccount>_<AccountType>_<AccAtt>，必须跟着变。
+      * Pwd 存【明文】123123，build_payload 时按各行的账号做两层加密
+        （账号不同 -> 密文不同，这是对的，不是 bug）。
+      * TradeAccount = FAccount（实测真实样本里两者一致）。
+      * 股东号按真实格式生成：沪 A+9位 / 深 10位（见 _common.fmt_shareholders）。
+
+    ⚠ 账号只是"格式合法"，【不代表柜台上真的存在】。要能真登录，
+      账号必须在柜台批量开立/签出。
+    """
+    count = int(count)
+    if count <= 0:
+        raise ValueError("条数必须 > 0")
+    start = int(start) or ACCOUNT_START
+    if start + count - 1 > 999999:
+        raise ValueError("账号序号 %d 超出 6 位上限 999999" % (start + count - 1))
+
+    keys = list(_KEYS)
+    idx = {k: i for i, k in enumerate(keys)}
+    template = None
+    for r in ROWS:
+        if (isinstance(r, (list, tuple)) and len(r) == len(keys)
+                and str(r[idx["case_type"]]) == "normal"):
+            template = list(r)
+            break
+    if template is None:
+        raise ValueError("ROWS 中没有 normal 模板行")
+
+    at = REAL_ACCOUNT["AccountType"]
+    aa = REAL_ACCOUNT["AccAtt"]
+    out = []
+    for i in range(count):
+        seq = start + i
+        facct = fmt_account(seq)
+        shs = fmt_shareholders(seq)
+        r = list(template)
+        r[idx["case_no"]] = "AB%05d" % (i + 1)
+        r[idx["case_type"]] = "normal"
+        r[idx["case_desc"]] = "压测账号%s 登录（第 %d/%d 个）" % (facct, i + 1, count)
+        r[idx["Account_Model"]] = REAL_ACCOUNT["Model"]
+        r[idx["Account_AccountType"]] = at
+        r[idx["Account_AccAtt"]] = aa
+        r[idx["Account_FAccount"]] = facct
+        r[idx["ClientName"]] = "压测客户%d" % seq
+        r[idx["Pwd"]] = REAL_PWD_PLAIN          # 明文，发送时按本行账号加密
+        r[idx["Pwd_raw"]] = ""
+        r[idx["TradeAccount"]] = facct
+        r[idx["UniqueAccount"]] = unique_account(facct, at, aa)
+        # 股东号：最多两组（沪/深）
+        for j, (sa, ex) in enumerate(shs):
+            r[idx["SH_SAccount%d" % (j + 1)]] = sa
+            r[idx["SH_ExchangeNum%d" % (j + 1)]] = ex
+        out.append(tuple(r))
+    return out
 
 
 def build_payload(row):

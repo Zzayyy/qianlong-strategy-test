@@ -76,9 +76,13 @@ def main():
           and "全库" not in txt, txt)
 
     # 读表统计仍然可用，只是改到点发送时才做（走 _count_pool）
+    # 【别写死条数】create.xlsx 可能是默认 5 条，也可能被
+    # `make_excel.py --bulk-normal 10000` 扩到 1 万条，断言要与数据无关。
     cnt, det, err = w._estimate_count()
-    check("需要时仍能统计出条数（create normal=5）",
-          "create=5" in det, "%s / %s" % (det, err))
+    check("需要时仍能统计出条数", cnt > 0 and "create=" in det,
+          "%s / %s" % (det, err))
+    check("统计值与实际读出的用例数一致",
+          "create=%d" % cnt in det, "cnt=%d det=%s" % (cnt, det))
     w.combo_type.setCurrentText("normal")
     app.processEvents()
 

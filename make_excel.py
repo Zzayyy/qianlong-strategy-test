@@ -16,6 +16,7 @@ send_test.py 用正则从括号里取 key。
 """
 import argparse
 import importlib
+import json
 import os
 import re
 import sys
@@ -180,9 +181,120 @@ def write_excel(mod, rows, out_path):
     return out_path
 
 
-def build_one(name, ref_spec=""):
+def build_bulk_rows(mod, count, start=0, ref_seq=1):
+    """调用接口自己的 build_bulk_rows，把 normal 段换成 N 行不同账号。
+
+    ref_seq: 当天全局起始单号（只有 modify/remove 用得到；它们的
+             build_bulk_rows 第 3 个参数就是它）。
+    """
+    fn = getattr(mod, "build_bulk_rows", None)
+    if fn is None:
+        # 只列名字，不要在这里 load_interface（会造成递归 import 报错）
+        supported = []
+        for n in list_interfaces():
+            try:
+                if hasattr(importlib.import_module(n), "build_bulk_rows"):
+                    supported.append(n)
+            except Exception:
+                pass
+        raise ValueError(
+            "接口 %s 未实现 build_bulk_rows(count, start)，不支持 --bulk-normal。\n"
+            "        目前支持：%s" % (mod.NAME, ", ".join(supported) or "（无）"))
+    # 只有引用了单号的接口才收 ref_seq，其余接口签名是 (count, start)
+    ref_key = getattr(mod, "REF_KEY", "")
+    if ref_key:
+        return fn(count, start, ref_seq)
+    return fn(count, start)
+
+
+def load_ref_map(path):
+    """读 send_test 落盘的 refs JSON，转成 {账号: Ref}。
+
+    文件是 send_test.py 发 create 时自动写的，内容是
+        [{"account":"010100011301","case_no":"CB00001","ref":"20260928000001"}, ...]
+    """
+    with open(path, encoding="utf-8") as f:
+        rows = json.load(f)
+    if isinstance(rows, dict):
+        rows = rows.get("refs") or []
+    out = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        acct, ref = r.get("account"), r.get("ref")
+        if acct and ref:
+            out[str(acct)] = str(ref)
+    return out
+
+
+def apply_ref_map(rows, fa_i, ref_i, refmap):
+    """把行内账号对应的【真实 Ref】写进单号列；未命中保留原 token。"""
+    out = []
+    miss = 0
+    for r in rows:
+        row = list(r)
+        acct = str(row[fa_i]) if fa_i is not None else ""
+        ref = refmap.get(acct)
+        if ref:
+            row[ref_i] = ref
+        else:
+            miss += 1
+        out.append(tuple(row))
+    hit = len(rows) - miss
+    if miss:
+        print("[WARN] %d/%d 行账号未在 refs 映射里，保留原 __REF__ token"
+              % (miss, len(rows)))
+    if rows and hit == 0:
+        print("[ERROR] 全部行都没命中 —— 生成的单号仍是 __REF__ token，发出去会 ref not exist！\n"
+              "        常见原因：账号起点不一致（别用 --bulk-start 改起点），\n"
+              "        或 create 发的时候用的不是同一批账号。")
+    return out
+
+
+def build_one(name, ref_spec="", bulk_normal=0, bulk_start=0, ref_seq=1,
+              ref_map=""):
     mod = load_interface(name)
     rows = list(mod.ROWS)
+    keys = [k for k, _ in mod.HEADERS]
+    type_i = keys.index("case_type")
+
+    if ref_spec and bulk_normal:
+        sys.exit("[FAIL] --ref-spec 与 --bulk-normal 互斥，不能同时使用")
+
+    if bulk_normal:
+        try:
+            extra = build_bulk_rows(mod, bulk_normal, bulk_start, ref_seq)
+        except ValueError as e:
+            sys.exit("[FAIL] %s --bulk-normal: %s" % (name, e))
+
+        # ---- 用 create 实跑落盘的 refs.json 回填真实单号 ----
+        # 这比"靠行序猜 __REF{i}__"可靠得多：单号来自平台回包，是确定存在的。
+        if ref_map:
+            ref_key = getattr(mod, "REF_KEY", "")
+            if not ref_key:
+                sys.exit("[FAIL] %s 没有 REF_KEY，不需要 --ref-map" % name)
+            if ref_key not in keys:
+                sys.exit("[FAIL] %s 表头无 %s 列" % (name, ref_key))
+            try:
+                refmap = load_ref_map(ref_map)
+            except Exception as e:
+                sys.exit("[FAIL] 读不了 --ref-map %s: %s" % (ref_map, e))
+            if not refmap:
+                sys.exit("[FAIL] --ref-map %s 里没有可用的 账号->Ref" % ref_map)
+            extra = apply_ref_map(extra, keys.index("Account_FAccount"),
+                                  keys.index(ref_key), refmap)
+            print("[OK] %s: 已用 %s 回填真实单号（映射 %d 条）"
+                  % (name, os.path.basename(ref_map), len(refmap)))
+
+        kept = [r for r in rows
+                if not (isinstance(r, (list, tuple)) and len(r) == len(keys)
+                        and str(r[type_i]) == "normal")]
+        rows = list(extra) + kept
+        extra_msg = ""
+        if getattr(mod, "REF_KEY", "") and ref_seq != 1 and not ref_map:
+            extra_msg = "，引用第 %d 号起的单号" % ref_seq
+        print("[OK] %s: normal 段替换为 %d 行不同账号（起始序号 %s%s）"
+              % (name, len(extra), bulk_start or "默认", extra_msg))
 
     if ref_spec:
         if name not in REF_INTERFACES:
@@ -193,8 +305,6 @@ def build_one(name, ref_spec=""):
                 extra = build_ref_rows(mod, ref_spec)
             except ValueError as e:
                 sys.exit("[FAIL] %s --ref-spec %s" % (name, e))
-            keys = [k for k, _ in mod.HEADERS]
-            type_i = keys.index("case_type")
             kept = [r for r in rows
                     if not (isinstance(r, (list, tuple)) and len(r) == len(keys)
                             and str(r[type_i]) == "normal")]
@@ -207,8 +317,7 @@ def build_one(name, ref_spec=""):
     out = os.path.join(DATA_DIR, "%s.xlsx" % mod.NAME)
     write_excel(mod, rows, out)
     from collections import Counter
-    cnt = Counter(str(r[[k for k, _ in mod.HEADERS].index("case_type")]).strip()
-                  for r in rows)
+    cnt = Counter(str(r[type_i]).strip() for r in rows)
     print("[OK] %s -> %s  共 %d 条  %s" % (name, out, len(rows), dict(cnt)))
     return out
 
@@ -221,6 +330,19 @@ def main():
                     help="仅 modify/remove：把 normal 段替换为按单号区间生成的引用行。"
                          "格式：起始[,条数] 或 起始-结束（可填完整单号或纯序号）。"
                          "例：7,100 或 20260904000001-20260904000100")
+    ap.add_argument("--bulk-normal", type=int, default=0,
+                    help="把 normal 段替换为 N 行【不同账号】的正常数据（压测用、不循环）。"
+                         "目前 create / account 已实现。例：--bulk-normal 10000")
+    ap.add_argument("--bulk-start", type=int, default=0,
+                    help="批量账号的 6 位序号起点，默认 11301（紧邻真实账号 010100011300）")
+    ap.add_argument("--ref-seq", type=int, default=1,
+                    help="仅 modify/remove：批量行引用的【当天全局起始单号】。"
+                         "默认 1（配合 create --bulk-normal 的默认号段）。"
+                         "若当天已经建过 N 张单，要填 N+1，否则会引用到不存在的单号。")
+    ap.add_argument("--ref-map", default="",
+                    help="★推荐：用 send_test 发 create 时自动落盘的 refs.json 回填【真实单号】。"
+                         "比 --ref-seq 靠行序猜可靠得多（单号来自平台回包）。"
+                         "例：--bulk-normal 10000 --ref-map out/performance/create_xxx_refs.json")
     ap.add_argument("--list", action="store_true", help="只列出各接口用例数，不生成")
     args = ap.parse_args()
 
@@ -242,10 +364,20 @@ def main():
         total = sum(len(load_interface(n).ROWS) for n in names)
         print("-" * 76)
         print("%-12s %-38s %8s" % ("合计", "", total))
+        print()
+        print("注：上表是【接口定义里写死】的规模。五个接口都可用 --bulk-normal N")
+        print("    把 normal 段扩成 N 行不同账号的压测数据（详见 README §5.2），例如：")
+        print("      python make_excel.py --interface account   --bulk-normal 10000")
+        print("      python make_excel.py --interface create    --bulk-normal 10000")
+        print("      python make_excel.py --interface modify    --bulk-normal 10000")
+        print("      python make_excel.py --interface remove    --bulk-normal 10000")
+        print("      python make_excel.py --interface pwdUpdate --bulk-normal 10000")
+        print("    账号号段一致；modify/remove 的单号靠行序对齐 create，须按 create 先发。")
         return
 
     for n in names:
-        build_one(n, args.ref_spec)
+        build_one(n, args.ref_spec, args.bulk_normal, args.bulk_start,
+                  args.ref_seq, args.ref_map)
 
 
 if __name__ == "__main__":

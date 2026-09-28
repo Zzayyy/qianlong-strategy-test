@@ -16,7 +16,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (ZH, REAL_ACCOUNT, REAL_UNIQUE_ACCOUNT, collect, is_blank,
-                     put, to_typed, gen_fuzz, add_cases)
+                     put, to_typed, gen_fuzz, add_cases,
+                     fmt_account, unique_account, ACCOUNT_START)
 
 NAME = "remove"
 TITLE = "删除条件单 (remove, MsgType=8)"
@@ -116,6 +117,57 @@ _BULK += add_cases(HEADERS, _BASE, [
 ], type_tag="destroy", start=400, prefix=_PREFIX)
 
 ROWS = ROWS + _BULK
+
+
+# ==================== 批量 normal（--bulk-normal）====================
+def build_bulk_rows(count, start=0, ref_seq=1):
+    """生成 count 行 normal：每行一个不同账号 + 引用一个【当天已存在的单号】。
+
+    ★ 与 modify 同一套约定：第 i 行引用 __REF{ref_seq+i-1}__，
+      需要 create 按行顺序先发一遍，这些单号才真实存在。
+    ★ 注意顺序：删除不可逆。若要同时测 modify + remove，
+      正确顺序是 create -> modify -> remove（见 README §5.2）。
+
+    参数含义同 modify.build_bulk_rows。
+    """
+    count = int(count)
+    if count <= 0:
+        raise ValueError("条数必须 > 0")
+    start = int(start) or ACCOUNT_START
+    ref_seq = max(1, int(ref_seq))
+    if start + count - 1 > 999999:
+        raise ValueError("账号序号 %d 超出 6 位上限 999999" % (start + count - 1))
+
+    keys = list(_KEYS)
+    idx = {k: i for i, k in enumerate(keys)}
+    template = None
+    for r in ROWS:
+        if (isinstance(r, (list, tuple)) and len(r) == len(keys)
+                and str(r[idx["case_type"]]) == "normal"):
+            template = list(r)
+            break
+    if template is None:
+        raise ValueError("ROWS 中没有 normal 模板行")
+
+    at = REAL_ACCOUNT["AccountType"]
+    aa = REAL_ACCOUNT["AccAtt"]
+    out = []
+    for i in range(count):
+        seq = start + i
+        facct = fmt_account(seq)
+        r = list(template)
+        r[idx["case_no"]] = "RB%05d" % (i + 1)
+        r[idx["case_type"]] = "normal"
+        r[idx["case_desc"]] = ("账号%s 删除当日第 %d 号单（需先 create）"
+                               % (facct, ref_seq + i))
+        r[idx["Account_Model"]] = REAL_ACCOUNT["Model"]
+        r[idx["Account_AccountType"]] = at
+        r[idx["Account_AccAtt"]] = aa
+        r[idx["Account_FAccount"]] = facct
+        r[idx["UniqueAccount"]] = unique_account(facct, at, aa)
+        r[idx["Ref"]] = "__REF%d__" % (ref_seq + i)
+        out.append(tuple(r))
+    return out
 
 
 def build_payload(row):
