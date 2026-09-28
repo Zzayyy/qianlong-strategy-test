@@ -260,6 +260,11 @@ class PerfCollector(object):
         with self.pending_lock:
             return len(self.pending)
 
+    def pending_ids(self):
+        """当前还在等回包的 request_id 列表（用于"到底哪几条挂了"）。"""
+        with self.pending_lock:
+            return list(self.pending.keys())
+
     # ------------------------------------------------------------ 报告
     def snapshot(self):
         with self.lock:

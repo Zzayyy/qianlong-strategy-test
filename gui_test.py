@@ -805,7 +805,9 @@ class MainWindow(QWidget):
         self.spin_workers = spin(1, 256, int(ini_get(cp, "test", "workers", "4") or 4), 90,
                                  "并发发送线程数")
         self.spin_max = spin(0, 100000000, int(ini_get(cp, "test", "max", "0") or 0), 110,
-                             "发送总条数；超过用例数会循环复用。0=每种用例发一次")
+                             "发送总条数；超过用例数会循环复用。\n"
+                             "★ 0 = 不限：会一直循环发同一批用例，直到点「停止」。\n"
+                             "  （不是「每种发一次」—— 早先文案写错了，会误发海量数据）")
         self.spin_seconds = spin(0, 86400, 0, 90,
                                  "按时间跑：跑够这么多秒就停（优先于总条数）。0=不用")
         self.spin_rate = spin(0, 1000000, int(ini_get(cp, "test", "rate", "0") or 0), 100,
@@ -849,7 +851,7 @@ class MainWindow(QWidget):
         # 记住标签引用：按秒跑时要连标签一起置灰（和 datahub_test 一样）
         self.lbl_max = flabel(
             "总条数", "--max",
-            "发送总条数；超过用例数会循环复用。0=每种用例发一次。\n"
+            "发送总条数；超过用例数会循环复用。★ 0 = 不限（循环发到手动停止）。\n"
             "命令行：--max N\n"
             "【按秒跑 > 0 时本项失效】send_test.py 会把 max 强制设为 0，\n"
             "改由「按秒跑」的秒数决定何时停。")
@@ -910,7 +912,7 @@ class MainWindow(QWidget):
                 % self.spin_seconds.value())
         else:
             self.spin_max.setToolTip(
-                "发送总条数；超过用例数会循环复用。0=每种用例发一次。\n"
+                "发送总条数；超过用例数会循环复用。★ 0 = 不限（循环发到手动停止）。\n"
                 "命令行：--max N\n"
                 "【按秒跑 > 0 时本项失效】send_test.py 会把 max 强制设为 0，\n"
                 "改由「按秒跑」的秒数决定何时停。")
@@ -1135,7 +1137,11 @@ class MainWindow(QWidget):
         self.btn_send.setFont(f)
 
         self.btn_preview.clicked.connect(self.on_preview)
-        self.btn_send.clicked.connect(lambda: self.on_send("normal"))
+        # ★ 必须读「用例类型」下拉框，不能写死 normal：
+        # 早先这里是 on_send("normal")，而下拉框只被「预览」读，
+        # 于是「选了 destroy 点开始发送」实际发的是 normal（踩过，白发了 5 万条）。
+        self.btn_send.clicked.connect(
+            lambda: self.on_send(self.combo_type.currentText()))
         self.btn_stop.clicked.connect(self.on_stop)
 
         row.addWidget(self.btn_preview)
@@ -1411,6 +1417,8 @@ class MainWindow(QWidget):
                 "先生成：python make_excel.py --interface all"
                 % ",".join(missing))
             return
+        if not self._confirm_unlimited(names, type_tag):
+            return
         self._batch_start = time.time()
         if self.chk_autoclear.isChecked():
             self.clear_log("[提示] 日志已自动清空（勾了「每次发送前自动清空」）")
@@ -1422,6 +1430,28 @@ class MainWindow(QWidget):
         self.append_log("#" * 60)
         cmds = [self._send_argv(n, type_tag) for n in names]
         self._run(cmds)
+
+    def _confirm_unlimited(self, names, type_tag):
+        """「总条数=0 且没按秒跑」= 不限量，发到手动停止。
+
+        早先界面把 0 写成「每种用例发一次」，实际 send_test.py 里
+        total=0 会让 _producer 的 break 永不触发 —— 循环复用用例狂发。
+        踩过一次：想发 96 条 destroy，结果库表里 10000 条 normal 被反复
+        发到 5 万条才手动停。这里必须拦一道。
+        """
+        if self.spin_max.value() or self.spin_seconds.value() > 0:
+            return True
+        # 注意：这里【不读 Excel】统计条数 —— 和 _update_case_count 一样，
+        # 大表（万行）在 Qt 主线程上读一遍要几十秒，会把界面冻住。
+        return self._ask(
+            "⚠ 总条数=0 = 不限量",
+            "「总条数」是 0，而且没有填「按秒跑」。\n\n"
+            "这时 send_test.py 会【不限量循环发送】：把用例表反复发下去，\n"
+            "直到你点「停止」为止。\n"
+            "  注意：这不是「每种用例发一次」——旧版界面文案写错了。\n\n"
+            "典型后果：只想发百来条 destroy，实际把上万条 normal 发了出去。\n\n"
+            "要限量就把「总条数」填成具体数字（如 1000），"
+            "或用「按秒跑」定时间。\n\n仍要按不限量发送吗？")
 
     def _confirm_conn(self):
         """发送前确认连接。两台机器上都可能有真平台，靠流名区分（见 _confirm_force_live）。"""

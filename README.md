@@ -53,7 +53,7 @@ cd strategy_test
 | 控件 | 作用 |
 |---|---|
 | **清空日志** | 只清空窗口里的显示，**不动** `out/logs/` 下的文件；任务运行中会先确认一次 |
-| **每次发送前自动清空** | 勾上后，点「开始发送 / 破坏测试 / 预览」会先清空，每次只看本次输出（该偏好记在 `config.ini`） |
+| **每次发送前自动清空** | 勾上后，点「开始发送 / 预览」会先清空，每次只看本次输出（该偏好记在 `config.ini`） |
 
 > 日志缓冲区有上限（`MAX_LOG_LINES`），超了会自动丢最旧的；完整日志始终在
 > `out/logs/{label}.log` 里，所以「清空」不会丢任何东西。
@@ -89,9 +89,12 @@ python send_test.py --interface create --cases C001 --no-send --dump out/payload
 | 按钮 | 作用 |
 |---|---|
 | 预览报文（不发） | 只打印将要 XADD 的内容，不写 Redis |
-| 开始发送 | 按当前筛选发送（normal） |
-| 破坏测试 | 同「开始发送」，但用 destroy 用例（畸形报文） |
+| 开始发送 | 按「用例类型」下拉框 + 当前筛选发送（normal / error / destroy / all） |
 | 停止 | 中止正在跑的发送任务 |
+
+> **类型由谁决定**：「开始发送」和「预览报文」都读左栏「3. 测试数据 → 用例类型」
+> 下拉框。想发破坏用例就把下拉框选成 `destroy` 再点「开始发送」——
+> 旧版这里有个独立的「破坏测试」按钮，已于 `7d2a015` 移除。
 
 「**统计汇总**」标签页上方还有两个按钮（就在它们的用武之地）：
 
@@ -212,7 +215,7 @@ out/performance/quickstart.xlsx              # 汇总 + 按秒 + 错误（3 个 
 
 ### 0.3 破坏测试
 
-图形界面：类型选 `destroy` 后点「破坏测试」。
+图形界面：左栏「用例类型」选 `destroy`，再点底部「开始发送」。
 命令行：
 
 ```powershell
@@ -618,6 +621,12 @@ ST-50  -> XADD * request_id STTEST_1790232971097_1 task {"create":{...},"MsgType
           {"Ref":"20260924000001","Errmsg":"insert success","ErrID":0}
 ```
 
+> ⚠ **不要改 `request_id` 的格式**。策略平台会**解析**它，真 DataHub 发的是
+> `ST_<ip>_<epoch>_<n>`（下划线分隔、后两段是数字）。2026-09-28 曾把用例编号
+> 塞进去试过（`STTEST_C201#1`），结果平台读到**第 1 条就再也不动了**：
+> `ST-51 entries-read=1 lag=95`、`ST-55 entries-read=1 lag=96`。
+> 想关联用例，用本地映射（见 §2.2），别动报文里的这个字段。
+
 > **modify / remove 的 Ref 必须真实存在**。`__REF1__` 展开成
 > `20260924000001`，正好是当天 create 造出来的单号，所以顺序不能乱：
 > **先 create，再 modify / remove**。用别的日期造的单会得到 `ref not exist`。
@@ -689,23 +698,57 @@ mock_datahub.py       ──PUBLISH───────┘
 > 早先 `mock_datahub` 还有个 `--push`（持续推报文）功能，因与 `send_test.py` 完全重复
 > 且没有统计能力，**已删除**。
 
-### 2.1 `tests/` 里的两个工具
+### 2.1 `tests/` 里的日常工具
 
-只有两个，都是**日常可能用到**的，从项目根执行：
+从项目根执行：
 
 | 文件 | 说明 |
 |---|---|
 | `_show_stream.py` | **看实际发出去的报文**：从 Redis 流里读回（`--json` 格式化 / `--full` 不截断 / `--out` 导出）。`out/logs/` 里**不含**报文内容，只有它能看到 |
 | `_verify_bulk.py` | **复核批量数据**：账号唯一性、`UniqueAccount` 是否跟随、`Ref` 是否唯一、号段是否对齐、`Pwd` 能否解回 |
+| `_ack_gap.py` | **平台卡在哪一条**：对着服务端 PEL 列出「已 ACK / 未 ACK」的分界，未 ACK 的就是平台读了但没处理完的 |
 
 ```bash
 python tests/_show_stream.py --stream ST-50 -n 5      # 最近 5 条
 python tests/_verify_bulk.py                          # 复核 data/*.xlsx
+python tests/_ack_gap.py --stream ST-50               # 平台卡在哪条
 ```
 
 > 早先这里还有一套 GUI 自测（`_gui_*`、`_e2e_*`、`_run_suites` 等 18 个），
 > **已全部删除** —— 它们只在开发期用来防回归，日常用不到，
 > 与 `datahub_test` 的结构保持一致（那边也没有测试目录）。
+
+### 2.2 平台挂了，怎么知道是哪条请求挂的
+
+**用例编号取自本地映射，不写进报文。** `send_test.py` 内存里有
+`rid -> (用例编号, 账号)`（`_rid_meta`，回包抓 Ref 也靠它），
+所以排查走本地 + 服务端两边对照，**不需要**动 `request_id`
+（它的格式不能改，原因见 §1.7 的警告）。
+
+发起一次发送后，结尾会自动打一段核对：
+
+```
+★ 未回包 96 条，涉及 96 个用例：A201 A202 A203 A204 ...
+  服务端：ST-55 组 user_group  已读=1 未ACK=1 lag=95
+  未ACK 前 20 条的用例编号：A201
+  （? = 该条不是本次运行发的，本地没有它的用例映射）
+```
+
+看这两行就能区分三种情况：
+
+| 本地未回包 | 服务端 PEL | 结论 |
+|---|---|---|
+| 有 | **有** | 平台**收到了但卡住/崩了** —— 最像"挂了"，未 ACK 的那几条就是元凶 |
+| 有 | 没有 | 平台**压根没读**（消费者不在 / 流名不对 / 编号错了） |
+| 没有 | — | 平台正常 |
+
+只想看一眼当前状态（不发送）：
+`python tests/_ack_gap.py --stream ST-50`
+
+> **为什么不用 request_id 传用例编号**：试过了，会让平台卡死（见下）。
+> 本地映射够用 —— 前提是**在同一次运行的输出里看**；进程退出后映射就没了。
+> 跨进程追查只能用 `_ack_gap.py` 看 entry_id，或用 `_show_stream.py`
+> 看报文内容来人工判断。
 
 ---
 
@@ -829,7 +872,7 @@ python send_test.py --cases C201,C203-C210 --assign-id 1  # 再发
 | `--assign-id` | 配置(1) | 目标流 = `ST-<id>` |
 | `--stream` | 空 | 直接指定流名，覆盖 `--assign-id` |
 | `--workers` | 配置(4) | 并发线程数 |
-| `--max` | 配置(0) | 发送总条数；超过用例数会循环复用 |
+| `--max` | 配置(0) | 发送总条数；超过用例数会循环复用。**0 = 不限**（一直循环发到手动停止，见下面警告） |
 | `--seconds` | 0 | 按时间跑（优先于 `--max`） |
 | `--rate` | 0 | 全局限速 条/秒，0=不限 |
 | `--wait` | 配置(5) | 发完等回包秒数（收齐或稳定后提前结束） |
@@ -843,6 +886,16 @@ python send_test.py --cases C201,C203-C210 --assign-id 1  # 再发
 | `--dump` | 空 | 预览时把报文写 jsonl |
 | `--quiet` | 1 | 1=安静 |
 | `--no-stats` / `--stats-out` / `--stats-interval` | 开/`out/performance`/1.0 | 统计开关、输出目录、采样间隔 |
+
+> ⚠ **`--max 0` 是「不限量」，不是「每种用例发一次」**
+>
+> 配置里 `max` 的默认值就是 `0`，此时 `send_test.py` 会把用例表**反复循环发送**，
+> 直到你手动停止（或 `--seconds` 到点）。早先 GUI 和 CLI 的文案误写成
+> 「0=每种用例发一次」，曾导致：本想发 96 条 `destroy`，结果把 10000 条
+> `normal` 循环发到 5 万条才被手动停下。
+>
+> 想限量请显式填 `--max 1000`，或用 `--seconds` 定时间。
+> 现在 GUI 在「总条数=0 且未按秒跑」时会弹确认框，`send_test.py` 也会在日志里打提示。
 
 ### make_excel.py
 
@@ -1105,6 +1158,9 @@ python tests/_show_stream.py --stream ST-50 --out dump.jsonl
 
 # 复核批量数据（账号唯一 / UniqueAccount 跟随 / Ref 唯一 / 号段对齐 / Pwd 可解）
 python tests/_verify_bulk.py
+
+# 平台卡在哪一条（服务端 PEL 里已 ACK / 未 ACK 的分界）
+python tests/_ack_gap.py --stream ST-50
 ```
 
 > 早先这里有一套 GUI 自测（18 个脚本，含 `_run_suites.py` 回归入口），**已全部删除** ——

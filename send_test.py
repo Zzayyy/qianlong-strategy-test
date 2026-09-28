@@ -132,6 +132,16 @@ class Sender(object):
 
     # ------------------------------------------------------------ 工具
     def _next_req_id(self):
+        """请求号 = STTEST_<epoch毫秒>_<序号>。
+
+        ★★ 不要改这个格式 ★★
+        策略平台会【解析】request_id。真 DataHub 发的是 ST_<ip>_<epoch>_<n>
+        （见 protocol.py），即"下划线分隔、后两段是数字"。
+        曾把用例编号塞进来（STTEST_C201#1），结果平台读到第 1 条就再也不动了：
+            ST-51  entries-read=1  lag=95
+            ST-55  entries-read=1  lag=96
+        想关联用例，用本地 _rid_meta（rid -> 用例编号），别动这个字段。
+        """
         with self._req_lock:
             self.req_seq += 1
             return "STTEST_%d_%d" % (int(time.time() * 1000), self.req_seq)
@@ -415,6 +425,91 @@ class Sender(object):
         return self.perf
 
 
+# ================================================================ 未回包归因
+def report_unreplied(sender, logger, stream="", kw=None):
+    """把「发了但没等到回包」的请求按用例编号汇总打印。
+
+    用例编号从【本地】_rid_meta（rid -> 用例编号）里取，不靠 request_id 的内容。
+    ★ 这是刻意的：request_id 的形态不能动（平台会解析它，见 _next_req_id），
+      所以"rid 对应哪条用例"只能在本进程里记，不能写进报文。
+
+    同时读服务端 PEL（平台读了但没 XACK），两边一对照就能区分：
+      本地没回包 + PEL 里有   -> 平台收到了但卡住/崩了（最像"挂了"）
+      本地没回包 + PEL 里没有 -> 平台压根没读（消费者不在/流名不对）
+      全都回了               -> 平台正常
+    """
+    pend = sender.perf.pending_ids() if hasattr(sender.perf, "pending_ids") else []
+    with sender._rid_meta_lock:
+        meta = dict(sender._rid_meta)
+    cases = [str(meta[r][0]) for r in pend if r in meta]
+    unknown = len(pend) - len(cases)
+    uniq = sorted(set(cases))
+
+    logger.write("-" * 60, force=True)
+    if not pend:
+        logger.write("★ 回包核对：没有未回包的请求（发出的都收到了回包）",
+                     force=True)
+    else:
+        from collections import Counter
+        cnt = Counter(cases)
+        detail = " ".join("%s×%d" % (c, n) if n > 1 else c
+                          for c, n in cnt.most_common(40))
+        logger.write("★ 未回包 %d 条，涉及 %d 个用例：%s"
+                     % (len(pend), len(uniq),
+                        detail or "（用例编号未知）"), force=True)
+        if len(cnt) > 40:
+            logger.write("  （只列了前 40 个）", force=True)
+        if unknown:
+            logger.write("  （其中 %d 条查不到用例编号）" % unknown, force=True)
+        logger.write("  说明：这些用例发出去后没等到回包，"
+                     "很可能就是让平台卡住的那几条。", force=True)
+
+    # ---- 服务端视角：目标流 PEL 里还有多少没被 XACK ----
+    if kw and stream:
+        try:
+            c = RespClient(kw["host"], kw["port"], kw["password"],
+                           kw["db"]).connect()
+            try:
+                g = next((x for x in c.xinfo_groups(stream)
+                          if x.get("name") == P.GROUP), None)
+                if not g:
+                    logger.write("  服务端：%s 上没有消费者组 %s —— "
+                                 "平台可能根本没在消费这条流" % (stream, P.GROUP),
+                                 force=True)
+                else:
+                    logger.write("  服务端：%s 组 %s  已读=%s 未ACK=%s lag=%s"
+                                 % (stream, P.GROUP, g.get("entries-read"),
+                                    int(g.get("pending") or 0), g.get("lag")),
+                                 force=True)
+                    # 未 ACK 的条目逆查本地 meta，给出用例编号
+                    ids = c.cmd("XPENDING", stream, P.GROUP, "-", "+",
+                                "20") or []
+                    got = []
+                    for row in ids:
+                        eid = row[0]
+                        try:
+                            ent = c.xrange(stream, eid, eid, 1)
+                            if not ent:
+                                continue
+                            rid = dict(ent[0][1]).get("request_id", "")
+                            got.append(str(meta[rid][0]) if rid in meta
+                                       else "?")
+                        except Exception:
+                            pass
+                    if got:
+                        logger.write("  未ACK 前 %d 条的用例编号：%s"
+                                     % (len(got), " ".join(got)), force=True)
+                        if "?" in got:
+                            logger.write("  （? = 该条不是本次运行发的，"
+                                         "本地没有它的用例映射）", force=True)
+            finally:
+                c.close()
+        except Exception as e:
+            logger.write("  服务端核对失败（不影响结论）：%s" % e, force=True)
+    logger.write("-" * 60, force=True)
+    return uniq
+
+
 # ================================================================ 同步 RTT 探测
 def probe_sync_latency(kw, stream, reply_stream, cases, n=30, logger=None,
                        quiet=False, timeout=5.0):
@@ -527,7 +622,8 @@ def build_parser(cp):
 
     # 压测参数
     ap.add_argument("--workers", type=int, default=None, help="并发线程数")
-    ap.add_argument("--max", type=int, default=None, help="发送总条数，0=每种一次")
+    ap.add_argument("--max", type=int, default=None,
+                    help="发送总条数；0=不限（循环复用用例直到手动停止或 --seconds 到点）")
     ap.add_argument("--rate", type=float, default=None, help="全局限速 条/秒，0=不限")
     ap.add_argument("--wait", type=float, default=None, help="发完等回包秒数")
     ap.add_argument("--seconds", type=float, default=0,
@@ -656,8 +752,12 @@ def main():
     logger.write("用例: type=%s interface=%s cases=%r  共 %d 条"
                  % (type_tag, interface, a.cases, len(pool)), force=True)
     logger.write("并发=%d  总数=%s  限速=%s 条/秒  等回包=%.1fs  seconds=%.1f"
-                 % (workers, max_count or "每种一次", rate or "不限", wait, a.seconds),
+                 % (workers, max_count or "不限(循环发到停止)", rate or "不限",
+                    wait, a.seconds),
                  force=True)
+    if not max_count and not (a.seconds and a.seconds > 0):
+        logger.write("★ 提示：--max 0 且未设 --seconds = 不限量，会一直循环发送，"
+                     "直到手动停止（不是「每种发一次」）。", force=True)
 
     # 确保流和消费组存在（策略平台 Mock 会建；这里兜底，且保证 XLEN 可查）
     try:
@@ -731,6 +831,10 @@ def main():
             c.close()
         except Exception:
             pass
+
+    # ---- 「到底哪几条没回包」：按用例编号汇总（用例编号取自本地映射）----
+    if not a.no_reply:
+        report_unreplied(sender, logger, stream, kw)
 
     # ---- 回填文件：create 造完单，把 (账号, Ref) 落盘 ----
     # 有了它，modify/remove 就能用【真实存在的单号】生成用例（--ref-map），
