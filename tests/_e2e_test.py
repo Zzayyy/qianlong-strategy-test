@@ -19,7 +19,8 @@ import subprocess
 import sys
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = ROOT   # 本脚本在 tests/ 下，项目根是上一层
 PY = sys.executable
 HOST, DB = "192.168.1.137", 0
 ASSIGN = 91      # 用高位号段：137 上 ST-0/ST-1 可能被真实策略平台占用

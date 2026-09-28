@@ -48,6 +48,16 @@ cd strategy_test
 
 实时日志在下方「运行日志」，跑完自动切到「统计汇总」页，可一键导出 Excel。
 
+日志页上方有一条小工具条：
+
+| 控件 | 作用 |
+|---|---|
+| **清空日志** | 只清空窗口里的显示，**不动** `out/logs/` 下的文件；任务运行中会先确认一次 |
+| **每次发送前自动清空** | 勾上后，点「开始发送 / 破坏测试 / 预览」会先清空，每次只看本次输出（该偏好记在 `config.ini`） |
+
+> 日志缓冲区有上限（`MAX_LOG_LINES`），超了会自动丢最旧的；完整日志始终在
+> `out/logs/{label}.log` 里，所以「清空」不会丢任何东西。
+
 其它几个按钮：
 
 | 按钮 | 作用 |
@@ -55,7 +65,7 @@ cd strategy_test
 | 预览报文（不发） | 只打印将要 XADD 的内容，不写 Redis |
 | 破坏测试 | 同「开始发送」，但用 destroy 用例（畸形报文） |
 | 停止 | 中止正在跑的发送任务 |
-| 一键自测 | 自动起停 Mock 并跑端到端（`_e2e_test.py` / `_e2e_destroy.py`） |
+| 一键自测 | 自动起停 Mock 并跑端到端（`tests/_e2e_test.py` / `tests/_e2e_destroy.py`） |
 | 刷新统计汇总 / 导出汇总 Excel | 扫 `out/performance/*_stats.json` 汇总成表 |
 
 界面参数会记忆到 `config.ini`，下次打开还在。
@@ -148,8 +158,8 @@ out/performance/quickstart.xlsx              # 汇总 + 按秒 + 错误（3 个 
 ### 0.4 不用手开两个终端：一键自测
 
 ```powershell
-..\venv\Scripts\python.exe _e2e_test.py      # 5 发 5 回，核对 request_id 与回包
-..\venv\Scripts\python.exe _e2e_destroy.py   # normal 2000 + destroy 1500
+..\venv\Scripts\python.exe tests\_e2e_test.py      # 5 发 5 回，核对 request_id 与回包
+..\venv\Scripts\python.exe tests\_e2e_destroy.py   # normal 2000 + destroy 1500
 ```
 
 这两个脚本会自己把 mock 拉起来、跑完自己收掉。
@@ -408,7 +418,7 @@ Redis Streams 同组是负载均衡不是广播 —— 真平台的单子会莫�
 > `stop` 传播之前就注册成了消费者 —— 实测在 136 的 `ST-0` 上真的多出了
 > `ST-0-w1/w2/w3` 三个消费者。现已改为在 `_ensure_streams()` 里**同步**判定，
 > 所有 worker 等结论（`_guard_ok`）后才开始 `XREADGROUP`。
-> 万一又出现误污染，用 `_cleanup_my_consumers.py` 清理（它会先检查
+> 万一又出现误污染，用 `tests/_cleanup_my_consumers.py` 清理（它会先检查
 > `pending=0` 才删，避免丢消息）。
 
 ### 怎么区分"真平台"和"我的 mock"
@@ -569,8 +579,8 @@ ST-50  -> XADD * request_id STTEST_1790232971097_1 task {"create":{...},"MsgType
 真平台的 `ST-1` / `ST-50` 一个都不能碰）：
 
 ```bash
-python _cleanup_my_consumers.py --host 192.168.1.137 --stream ST-50          # 预览
-python _cleanup_my_consumers.py --host 192.168.1.137 --stream ST-50 --apply  # 执行
+python tests/_cleanup_my_consumers.py --host 192.168.1.137 --stream ST-50          # 预览
+python tests/_cleanup_my_consumers.py --host 192.168.1.137 --stream ST-50 --apply  # 执行
 ```
 
 ---
@@ -595,6 +605,7 @@ python _cleanup_my_consumers.py --host 192.168.1.137 --stream ST-50 --apply  # �
 | `mock_datahub.py` | ○**可选** — 模拟数据中台。**默认流程用不到**，仅在「测完整上线握手」或「观察真中台」时需要，见 3.2 |
 | `config.py` `config.ini` | 共享配置（CLI 参数优先） |
 | `out/logs/` `out/performance/` | 运行日志、性能统计输出 |
+| **`tests/`** | **自测脚本（开发/回归用，跑产品不需要）**，见下表 |
 
 **为什么 `mock_datahub` 是可选的**：`send_test.py` 直接往 `ST-N` 写报文，
 它本身就在承担"数据中台发报文"这个角色；而"数据中台分配编号"这件事，
@@ -614,14 +625,34 @@ mock_datahub.py       ──PUBLISH───────┘
 
 > 早先 `mock_datahub` 还有个 `--push`（持续推报文）功能，因与 `send_test.py` 完全重复
 > 且没有统计能力，**已删除**。
-| `_e2e_test.py` `_e2e_destroy.py` `_lat_test.py` | 自测脚本（Windows 侧联调验证） |
-| `_gui_smoke.py` | GUI 冒烟测试（offscreen 起窗口，验控件/命令拼装/汇总/导出） |
-| `_gui_integration.py` | GUI 集成测试（真起 Mock、真发报文、核对回包） |
-| `_gui_paths.py` | 验证「预览」不写库、「破坏测试」真写库 |
-| `_gui_shot.py` | 把界面截成 PNG（目视检查布局用） |
-| `_plugin_e2e.py` | 自测脚本（SSH 驱动 136 上真插件，跑完自动还原 `DataHub.ini`） |
-| `check_env.py` | **只读环境体检**（不是测试脚本，是连真环境前必跑的工具） |
+
+### 2.1 `tests/` 里的自测脚本
+
+跑产品**不需要**这些，它们是开发/回归时用的。全部可以**从项目根**执行，
+例如 `python tests/_run_suites.py`。
+
+| 文件 | 说明 |
+|---|---|
+| `_run_suites.py` | **回归入口**：带 200s 硬超时跑下面 7 套 GUI 测试，卡住会自动强杀 |
+| `_gui_smoke.py` | GUI 冒烟（offscreen 起窗口，验控件/命令拼装/汇总/导出） |
+| `_gui_noread.py` | 验「勾选接口不读 Excel」（3000 行表点一下要 13s 的回归防线） |
+| `_gui_clearlog.py` | 验「清空日志」：按钮生效、**不影响** `out/logs/`、偏好可存 |
+| `_gui_forcelive.py` | 验「允许打真平台」开关：argv 拼装、真平台探测、弹窗行为 |
+| `_gui_dhflow.py` | 验「Mock 数据中台」面板可见性与**自动同步分配编号** |
+| `_gui_paths.py` | 验「预览」不写库、「破坏测试」真写库 |
+| `_gui_integration.py` | GUI 集成（真起 Mock、真发报文、核对回包与 pending） |
+| `_gui_headless.py` | **基础设施**：把 `QMessageBox` 换成「记录+自动回答」，防 offscreen 模态框卡死 |
+| `_gui_shot.py` | 把界面截成 `out/_shot_*.png`（目视检查布局） |
+| `_e2e_test.py` | 端到端 5 发 5 回（GUI「一键自测」按钮调用） |
+| `_e2e_destroy.py` | 端到端破坏用例 + 压测（GUI 按钮调用） |
+| `_plugin_e2e.py` | SSH 驱动 136 上**真 `.so`** 复核协议（GUI 按钮调用，跑完自动还原 `DataHub.ini`） |
+| `_lat_test.py` | 量化"响应时间"是链路真实 RTT 还是读取线程攒批导致的 |
+| `_crosscheck_cpp.py` | 用 136 上真 `pwdEncode.cpp` 双向交叉验证 `pwd_encode.py` |
+| `_test_pwd17.py` | 定位 pwdUpdate 明文/密文差异（就是它发现"明文被静默吞掉"） |
 | `_cleanup_my_consumers.py` | 误测后在真平台流上留下的 `-wN` 消费者清理（先查 pending=0 才删） |
+
+> **GUI 里有 3 个按钮会调用 `tests/` 下的脚本**（一键自测 ×2、真插件复核），
+> 所以删 `tests/` 会让这几个按钮失效。
 
 ---
 
@@ -701,7 +732,7 @@ python mock_datahub.py --host 192.168.1.137 --db 0 --alloc-start 1
 一键验证（自动改 `DataHub.ini`、跑完**自动还原**）：
 
 ```bash
-python _plugin_e2e.py
+python tests/_plugin_e2e.py
 ```
 
 ### 3.4 观察真数据中台发什么（只收不回）
@@ -845,33 +876,49 @@ token 机制与 `datahub_test/interfaces/_common.py` 一致：配置里存占位
 
 ## 7. 自测
 
+> 全部自测脚本都在 **`tests/`** 下，从项目根执行即可。
+
 ### 7.1 命令行工具
 
 ```bash
 # 端到端闭环：Mock中台 + Mock策略 + 发 5 条，核对 request_id 与回包
-python _e2e_test.py
+python tests/_e2e_test.py
 
 # 压测 + 破坏测试（normal 2000 条 + destroy 1500 条）
-python _e2e_destroy.py
+python tests/_e2e_destroy.py
 
 # 单条真实 RTT 对照
-python _lat_test.py
+python tests/_lat_test.py
 
 # 真插件当"标准答案"复核协议（SSH 到 136，跑完自动还原 DataHub.ini）
-python _plugin_e2e.py
+python tests/_plugin_e2e.py
 ```
 
-### 7.2 图形界面
+### 7.2 图形界面（推荐：一条命令跑全套）
 
 ```bash
-python _gui_smoke.py        # 冒烟：起窗口、验控件/命令拼装/汇总加载/Excel 导出
-python _gui_integration.py  # 集成：真起 Mock、真发 30 条、核对回包与 pending
-python _gui_paths.py        # 验「预览」不写库、「破坏测试」真写库
-python _gui_shot.py         # 把界面截成 out/_shot_*.png，可目视检查布局
+# ★ 回归入口：带 200s 硬超时跑下面全部 7 套，卡住会自动强杀并汇总
+python tests/_run_suites.py
 ```
 
-三个 GUI 测试都用 `QT_QPA_PLATFORM=offscreen`，**不需要人盯着屏幕**，
+单独跑其中一套：
+
+```bash
+python tests/_gui_smoke.py        # 冒烟：起窗口、验控件/命令拼装/汇总加载/Excel 导出
+python tests/_gui_noread.py       # 验「勾选接口不读 Excel」（防 3 万行表卡死回归）
+python tests/_gui_clearlog.py     # 验「清空日志」不影响 out/logs/
+python tests/_gui_forcelive.py    # 验「允许打真平台」开关与真平台探测
+python tests/_gui_dhflow.py       # 验 Mock 数据中台面板与自动同步编号
+python tests/_gui_integration.py  # 集成：真起 Mock、真发 30 条、核对回包与 pending
+python tests/_gui_paths.py        # 验「预览」不写库、「破坏测试」真写库
+python tests/_gui_shot.py         # 把界面截成 out/_shot_*.png，可目视检查布局
+```
+
+所有 GUI 测试都用 `QT_QPA_PLATFORM=offscreen`，**不需要人盯着屏幕**，
 可以直接在 CI 或无人值守下跑，全绿会打印「结果: 全部通过」。
+
+> **写新 GUI 测试时务必 `import _gui_headless` 并 `install()`**：offscreen 下
+> `QMessageBox` 是模态的，没人点按钮会**永久阻塞**（踩过，见 §1.5 的说明）。
 
 实测结果（2026-09-24，目标 192.168.1.137:6379 db0）：
 

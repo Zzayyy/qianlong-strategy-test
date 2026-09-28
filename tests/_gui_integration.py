@@ -22,7 +22,8 @@ import time
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts.warning=false")
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = ROOT   # 本脚本在 tests/ 下，项目根是上一层
 sys.path.insert(0, HERE)
 
 from PySide6.QtWidgets import QApplication

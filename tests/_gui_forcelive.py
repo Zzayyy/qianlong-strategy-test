@@ -10,7 +10,8 @@ import os
 import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = ROOT   # 本脚本在 tests/ 下，项目根是上一层
 sys.path.insert(0, HERE)
 os.chdir(HERE)
 

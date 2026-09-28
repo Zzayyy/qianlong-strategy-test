@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """手动发 pwdUpdate(MsgType=17)，对比 明文Pwd / 加密Pwd 两种情况，看真平台回不回。"""
+import os
 import sys, time, json
-sys.path.insert(0, r"D:\Code\Python\多线程\strategy_test")
+# 本脚本在 tests/ 下，项目根是上一层
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from resp_min import RespClient
 from pwd_encode import encode_pwd
 

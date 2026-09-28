@@ -1,7 +1,27 @@
-# 运行输出
+# 运行输出（都可由脚本重新生成，不进版本库）
 out/logs/
 out/performance/
 out/*.jsonl
+
+# 自测 / 截图产物
+#   _shot_*.png      <- _gui_shot.py 生成的界面截图（目视检查布局用）
+#   _smoke_export.xlsx <- _gui_smoke.py 的导出测试产物
+#   *_stats.json / *.xlsx 等一律看 out/ 下
+out/_shot_*.png
+out/_smoke_export.xlsx
+out/_shot_panel*.png
+
+# 临时调试脚本产物（--dump 忘了给路径时会写成文件名为参数值，如 "1"）
+/1
+/dump.txt
+*.jsonl
+
+# Excel 打开时的锁文件
+~$*.xlsx
+
+# 用例表：由 make_excel.py 从 interfaces/ 生成，可随时重建
+#   （如果你希望把生成的用例一起入库，删掉下面这行即可）
+# data/*.xlsx
 
 # Python
 __pycache__/

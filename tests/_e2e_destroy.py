@@ -9,7 +9,8 @@ import sys
 import threading
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = ROOT   # 本脚本在 tests/ 下，项目根是上一层
 sys.path.insert(0, HERE)
 from resp_min import RespClient
 import protocol as P

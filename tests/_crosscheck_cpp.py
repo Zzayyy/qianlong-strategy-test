@@ -16,7 +16,8 @@ import paramiko
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 HOST, PORT, USER, PWD = "192.168.1.136", 22, "yangsh", "qianlong@135246"
-HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = ROOT   # 本脚本在 tests/ 下，项目根是上一层
 TMP = "/tmp/pwdcheck_yangsh"
 
 MAIN = r'''

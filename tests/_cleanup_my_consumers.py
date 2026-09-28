@@ -9,9 +9,11 @@ _cleanup_my_consumers.py —— 清理我误测时在 136 ST-0 上留下的消�
 用法：python _cleanup_my_consumers.py --apply     # 不带 --apply 只预览
 """
 import argparse
+import os
 import sys
 
-sys.path.insert(0, r"D:\Code\Python\多线程\strategy_test")
+# 本脚本在 tests/ 下，项目根是上一层
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from resp_min import RespClient
 
 a = argparse.ArgumentParser()

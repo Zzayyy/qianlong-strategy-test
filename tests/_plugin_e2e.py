@@ -15,18 +15,21 @@ import sys
 
 HOST, PORT, USER, PWD = "192.168.1.136", 22, "yangsh", "qianlong@135246"
 
+# 本脚本在 tests/ 下，项目根是上一层
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 REMOTE_DIR = "/home/yangsh/so_test/strategy"
 
 UPLOAD = {
-    r"D:\Code\Python\多线程\strategy_test\resp_min.py": REMOTE_DIR + "/resp_min.py",
-    r"D:\Code\Python\多线程\strategy_test\protocol.py": REMOTE_DIR + "/protocol.py",
-    r"D:\Code\Python\多线程\strategy_test\config.py": REMOTE_DIR + "/config.py",
-    r"D:\Code\Python\多线程\strategy_test\config.ini": REMOTE_DIR + "/config.ini",
+    os.path.join(ROOT, "resp_min.py"): REMOTE_DIR + "/resp_min.py",
+    os.path.join(ROOT, "protocol.py"): REMOTE_DIR + "/protocol.py",
+    os.path.join(ROOT, "config.py"): REMOTE_DIR + "/config.py",
+    os.path.join(ROOT, "config.ini"): REMOTE_DIR + "/config.ini",
 }
 
 # 推上 136 后要用到的用例文件（interfaces/create.py 依赖 _common.py）
 UPLOAD_DIRS = [
-    (r"D:\Code\Python\多线程\strategy_test\interfaces", REMOTE_DIR + "/interfaces"),
+    (os.path.join(ROOT, "interfaces"), REMOTE_DIR + "/interfaces"),
 ]
 
 

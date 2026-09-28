@@ -413,6 +413,9 @@ class MainWindow(QWidget):
             if not self.cp.has_section("gui"):
                 self.cp.add_section("gui")
             self.cp.set("gui", "stats_out", self.edit_stats_out.text().strip())
+            # 「每次发送前自动清空日志」记住用户的选择（纯偏好，无风险）
+            self.cp.set("gui", "autoclear_log",
+                        "1" if self.chk_autoclear.isChecked() else "0")
         except Exception:
             pass
 
@@ -789,13 +792,13 @@ class MainWindow(QWidget):
         grp3 = QGroupBox("快捷操作")
         g3 = QVBoxLayout(grp3)
         b1 = QPushButton("一键自测：5 发 5 回（自动起停 Mock）")
-        b1.clicked.connect(lambda: self._run_e2e("_e2e_test.py"))
+        b1.clicked.connect(lambda: self._run_e2e("tests/_e2e_test.py"))
         b2 = QPushButton("一键自测：normal 2000 + destroy 1500")
-        b2.clicked.connect(lambda: self._run_e2e("_e2e_destroy.py"))
+        b2.clicked.connect(lambda: self._run_e2e("tests/_e2e_destroy.py"))
         b3 = QPushButton("用 U 盘真插件复核协议（SSH 到 136）")
-        b3.setToolTip("python _plugin_e2e.py：拿真 .so 当标准答案验证 Mock。\n"
+        b3.setToolTip("python tests/_plugin_e2e.py：拿真 .so 当标准答案验证 Mock。\n"
                       "会自动改 136 的 DataHub.ini，跑完自动还原。")
-        b3.clicked.connect(lambda: self._run_e2e("_plugin_e2e.py"))
+        b3.clicked.connect(lambda: self._run_e2e("tests/_plugin_e2e.py"))
         b4 = QPushButton("刷新统计汇总")
         b4.clicked.connect(self._refresh_summary)
         self.btn_summary_export = QPushButton("导出汇总 Excel")
@@ -818,11 +821,42 @@ class MainWindow(QWidget):
     def _build_bottom(self):
         self.tabs = QTabWidget()
 
+        # 日志页 = 一条小工具条 + 日志正文
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+
+        bar = QHBoxLayout()
+        bar.setContentsMargins(4, 2, 4, 0)
+        self.btn_clear_log = QPushButton("清空日志")
+        self.btn_clear_log.setToolTip(
+            "只清空这个窗口里的显示内容，不影响 out/logs/ 下的日志文件。\n"
+            "任务运行中清空会弹一次确认，免得把正在看的关键输出抹掉。")
+        self.btn_clear_log.clicked.connect(self.on_clear_log)
+        self.chk_autoclear = QCheckBox("每次发送前自动清空")
+        self.chk_autoclear.setToolTip(
+            "勾上后，每次点「开始发送 / 破坏测试 / 预览」会先清空日志，\n"
+            "这样每次只看本次输出，不用手动清。")
+        self.chk_autoclear.setChecked(
+            ini_get(self.cp, "gui", "autoclear_log", "0") == "1")
+        self.lbl_logstat = QLabel("")
+        self.lbl_logstat.setStyleSheet("color:#888;")
+        bar.addWidget(self.btn_clear_log)
+        bar.addWidget(self.chk_autoclear)
+        bar.addStretch(1)
+        bar.addWidget(self.lbl_logstat)
+        v.addLayout(bar)
+
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(QFont("Consolas", 9))
         self.log.document().setMaximumBlockCount(MAX_LOG_LINES)
-        self.tabs.addTab(self.log, "运行日志")
+        # 文本变化时刷新"已清空/行数"提示
+        self.log.textChanged.connect(self._update_logstat)
+        v.addWidget(self.log)
+
+        self.tabs.addTab(page, "运行日志")
 
         self.tbl = QTableWidget(0, 15)
         self.tbl.setHorizontalHeaderLabels([
@@ -837,6 +871,29 @@ class MainWindow(QWidget):
         self.tabs.addTab(self.tbl, "统计汇总")
 
         return self.tabs
+
+    # ---- 日志清空 ----
+    def _update_logstat(self):
+        # 别用 blockCount()-1 估算：QTextEdit 首次 append 不会多出空块，
+        # 会算出比实际少 1 的行数（踩过）。直接数非空行最准。
+        txt = self.log.toPlainText()
+        n = sum(1 for line in txt.splitlines() if line.strip())
+        self.lbl_logstat.setText("" if n == 0 else "%d 行" % n)
+
+    def clear_log(self, note=None):
+        """清空日志显示（不删 out/logs/ 下的文件）。"""
+        self.log.clear()
+        if note:
+            self.append_log(note)
+
+    def on_clear_log(self):
+        if self.worker and self.worker.isRunning():
+            if not self._ask("确认", "任务正在运行，清空后本次已输出的日志就看不到了"
+                                     "（文件里还有）。\n\n确定清空？"):
+                return
+            self.clear_log("[提示] 日志已清空（任务仍在运行；完整日志见 out/logs/）")
+        else:
+            self.clear_log("[提示] 日志已清空（out/logs/ 下的文件不受影响）")
 
     # ---- 底部按钮 ----
     def _build_actions(self):
@@ -1104,6 +1161,8 @@ class MainWindow(QWidget):
         if not names:
             QMessageBox.warning(self, "提示", "请先勾选至少一个接口")
             return
+        if self.chk_autoclear.isChecked():
+            self.clear_log("[提示] 日志已自动清空（勾了「每次发送前自动清空」）")
         t = self.combo_type.currentText()
         cmds = [self._send_argv(n, t, preview=True) for n in names]
         if len(cmds) > 1:
@@ -1131,6 +1190,8 @@ class MainWindow(QWidget):
                 % ",".join(missing))
             return
         self._batch_start = time.time()
+        if self.chk_autoclear.isChecked():
+            self.clear_log("[提示] 日志已自动清空（勾了「每次发送前自动清空」）")
         self.append_log("")
         self.append_log("#" * 60)
         self.append_log("# 开始%s：接口=[%s] 类型=%s 目标流=%s"

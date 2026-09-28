@@ -4,8 +4,10 @@ _lat_test.py —— 验证"响应时间"到底是链路真实 RTT 还是读取�
 做法：直接用一条连接发一条、然后立刻读回包，测真实 RTT（单条 syn).
 再对比 send_test 的批量结果。
 """
+import os
 import sys, time, json
-sys.path.insert(0, r"D:\Code\Python\多线程\strategy_test")
+# 本脚本在 tests/ 下，项目根是上一层
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from resp_min import RespClient
 import protocol as P
 import excel_loader as XL
