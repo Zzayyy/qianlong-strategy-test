@@ -78,7 +78,13 @@ protocol.py —— 「数据中台 → 策略平台」协议常量与报文构�
       ("MsgType","create")  37426 条   <- 注意 task 里 create 在前、MsgType 在后
       ("Account","MsgType")   141 条   <- MsgType=18
     MsgType:
-        4  = create   插入条件单（95%+ 是 CondType=2/5 的批量拆单）
+        4  = create   插入条件单
+            * CondType 实测【现场全是 1】：2026-09-28 扫 136 ST-0 的 3269 条
+              create，CondType=1 占 3262 条（99.8%），每条都带全套 Cond* 块
+              （CondPrice/CondPercent/CondTime/CondLoss/CondTargetLoss/
+                CondProfit/CondTargetProfit）。
+            * 早先 2026-09-24 扫 37567 条历史数据时写的是「95%+ 是 CondType=2/5」，
+              与当前实时流量不符 —— 现场条件单类型变了，以【实时】为准。
         18 = Account  用户信息（实测 Account.Pwd 是 base64 密文）
     文档另列（这批数据里没出现，但协议有）：
         8  = remove    删除条件单

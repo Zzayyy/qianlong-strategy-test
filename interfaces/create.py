@@ -2,17 +2,21 @@
 """
 interfaces/create.py —— 接口定义：create（数据中台 → 策略平台，插入条件单）
 ==========================================================================
-字段来源：从 136 db0 的真实 ST-0 流（37567 条）里扒出来的结构 + 文档样本。
+字段来源：从 136 db0 的真实 ST-0 流里扒出来的结构 + 文档样本。
 
 报文形态（实测真实流量）：
     {"create":{
         "Account":{"Model":0,"FAccount":"010100011300","AccountType":7,"AccAtt":6},
-        "CondType":2, "CondName":"name1", "CondDesc":"desc1",
+        "CondType":1, "CondName":"name1", "CondDesc":"desc1",
         "ValidDate":"2026-10-24", "UniqueAccount":"010100011300_7_6",
         "Ref":"20260924000136", "Validity":0,
         "Entrust":{...}, "CfgExceedPrice":{...}, ... "CondTargetProfit":{...},
         "RunCount":0, "Mode":1, ...},
      "MsgType":4}
+
+★ CondType 实测【现场全是 1】：2026-09-28 扫 136 ST-0 的 3269 条 create，
+  CondType=1 占 3262 条（99.8%），且每条都带全套 Cond* 块。
+  早先写的 2 已按实时流量纠正为 1。
 
 列名约定（同 datahub_test）：
     Account_FAccount / Entrust_EntrustPrice / CondPrice_TriggerPrice ...
@@ -90,7 +94,7 @@ def _real_row():
         "Account_AccountType": REAL_ACCOUNT["AccountType"],
         "Account_AccAtt": REAL_ACCOUNT["AccAtt"],
         "Account_FAccount": REAL_ACCOUNT["FAccount"],
-        "CondType": 2,
+        "CondType": 1,
         "CondName": "name1",
         "CondDesc": "desc1",
         "ValidDate": "__TODAY_D30__",
@@ -127,13 +131,13 @@ def _rows_to_tuples(items):
 
 ROWS = _rows_to_tuples([
     # ---------- normal ----------
-    ("C001", "normal", "完整真实样本（照抄 ST-0 真实流量）", {},
+    ("C001", "normal", "完整真实样本（照抄 ST-0 实时流量，CondType=1）", {},
      "模板行，字段值勿改"),
-    ("C002", "normal", "CondType=1 价格条件（仅保留 CondPrice 块）",
+    ("C002", "normal", "CondType=1 且只保留 CondPrice（其余条件块都不带）",
      dict({k: "" for k in _KEYS if k.startswith(
          ("Cfg", "CondPercent", "CondTime", "CondLoss", "CondTarget",
           "CondProfit"))}, CondType=1),
-     "价格条件单，其余条件块不带"),
+     "看平台是否接受'只声明一个条件块'"),
     ("C003", "normal", "精简字段（只留 Entrust + CondPrice）",
      {k: "" for k in _KEYS if k.startswith(("Cfg", "CondTarget"))
       and not k.startswith("CondPrice")},
