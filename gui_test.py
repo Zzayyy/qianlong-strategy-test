@@ -7,14 +7,14 @@ gui_test.py —— 策略平台测试 GUI（PySide6）
     send_test.py      手动 XADD 发送器（normal / destroy）
     mock_strategy.py  模拟策略平台（收 ST-N、回 DataHub_reply_stream、上线+心跳）
     mock_datahub.py   模拟数据中台（策略方向：应答上线、分配编号、发心跳）
-    _e2e_test.py      一键自测（5 发 5 回）
+    make_excel.py     生成/扩充用例 Excel
 
 界面结构（参照 datahub_test/gui_test.py 的布局习惯）：
     顶栏        标题 + 当前连接摘要
-    左栏(可滚动) 1 连接设置 → 2 策略平台身份 → 3 测试数据 → 4 发送参数 → 5 其它
-    右栏        服务管理（起/停 Mock 策略平台 / Mock 数据中台）+ 快捷操作
-    下栏标签页   运行日志 | 统计汇总
-    底部按钮    预览报文 | 开始发送 | 破坏测试 | 一键自测 | 停止
+    左栏(可滚动) 1 连接设置 → 2 策略平台身份 → 3 测试数据 → 4 发送参数 → 5 输出
+    右栏        服务管理（起/停 Mock 策略平台 / Mock 数据中台）
+    下栏标签页   运行日志 | 统计汇总（各带一条工具条）
+    底部按钮    预览报文 | 开始发送 | 破坏测试 | 停止
 
 依赖：venv 已装 PySide6 + openpyxl。
 运行：venv/Scripts/python.exe gui_test.py
@@ -972,33 +972,6 @@ class MainWindow(QWidget):
         g2.addWidget(self.spin_dh_alloc, 2, 1)
         g2.addWidget(hint, 3, 0, 1, 2)
         lay.addWidget(box2)
-
-        # 快捷操作
-        grp3 = QGroupBox("快捷操作")
-        g3 = QVBoxLayout(grp3)
-        b1 = QPushButton("一键自测：5 发 5 回（自动起停 Mock）")
-        b1.clicked.connect(lambda: self._run_e2e("tests/_e2e_test.py"))
-        b2 = QPushButton("一键自测：normal 2000 + destroy 1500")
-        b2.clicked.connect(lambda: self._run_e2e("tests/_e2e_destroy.py"))
-        b3 = QPushButton("用 U 盘真插件复核协议（SSH 到 136）")
-        b3.setToolTip("python tests/_plugin_e2e.py：拿真 .so 当标准答案验证 Mock。\n"
-                      "会自动改 136 的 DataHub.ini，跑完自动还原。")
-        b3.clicked.connect(lambda: self._run_e2e("tests/_plugin_e2e.py"))
-        b4 = QPushButton("刷新统计汇总")
-        b4.clicked.connect(self._refresh_summary)
-        self.btn_summary_export = QPushButton("导出汇总 Excel")
-        self.btn_summary_export.clicked.connect(self._export_summary)
-        b5 = QPushButton("环境体检（只读，连真环境前先跑）")
-        b5.setToolTip(
-            "python check_env.py：只读扫描，告诉你\n"
-            "  · 真策略平台在哪台机器、编号是几（=> 下发流 ST-<编号>）\n"
-            "  · 这套环境活不活（traderserver 心跳新不新鲜）\n"
-            "  · 有没有真进程在订阅频道\n"
-            "只有读操作，可以安全地在生产环境上跑。")
-        b5.clicked.connect(lambda: self._run_env_check())
-        for b in (b1, b2, b3, b4, self.btn_summary_export, b5):
-            g3.addWidget(b)
-        lay.addWidget(grp3)
         lay.addStretch(1)
         return w
 
@@ -1043,6 +1016,31 @@ class MainWindow(QWidget):
 
         self.tabs.addTab(page, "运行日志")
 
+        # 统计页 = 一条工具条 + 表格（与日志页对称）
+        spage = QWidget()
+        sv = QVBoxLayout(spage)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(2)
+
+        sbar = QHBoxLayout()
+        sbar.setContentsMargins(4, 2, 4, 0)
+        self.btn_summary_refresh = QPushButton("刷新统计汇总")
+        self.btn_summary_refresh.setToolTip(
+            "重新扫描 out/performance/*_stats.json，把每次运行的指标汇总到下表。\n"
+            "统计文件是 send_test.py 落盘的，这个按钮只是重新读一遍。")
+        self.btn_summary_refresh.clicked.connect(self._refresh_summary)
+        self.btn_summary_export = QPushButton("导出汇总 Excel")
+        self.btn_summary_export.setToolTip(
+            "把下表里的所有行导出成一个 Excel（含汇总/按秒/错误三个 sheet）。")
+        self.btn_summary_export.clicked.connect(self._export_summary)
+        self.lbl_summary_stat = QLabel("")
+        self.lbl_summary_stat.setStyleSheet("color:#888;")
+        sbar.addWidget(self.btn_summary_refresh)
+        sbar.addWidget(self.btn_summary_export)
+        sbar.addStretch(1)
+        sbar.addWidget(self.lbl_summary_stat)
+        sv.addLayout(sbar)
+
         self.tbl = QTableWidget(0, 15)
         self.tbl.setHorizontalHeaderLabels([
             "标签", "时间", "时长s", "发送", "回包", "失败", "超时",
@@ -1053,7 +1051,8 @@ class MainWindow(QWidget):
             0, QHeaderView.ResizeMode.Interactive)
         self.tbl.setColumnWidth(0, 190)
         self.tbl.setAlternatingRowColors(True)
-        self.tabs.addTab(self.tbl, "统计汇总")
+        sv.addWidget(self.tbl)
+        self.tabs.addTab(spage, "统计汇总")
 
         return self.tabs
 
@@ -1398,7 +1397,8 @@ class MainWindow(QWidget):
                 "   strategysrv-0 已登记，ST-0 有消费者 ST-0 在实时处理，\n"
                 "   回包里带真实订单号（OrderNo）。\n"
                 "   往那里发数据可能触发真实交易！\n\n"
-                "   建议先点「环境体检（只读）」确认。\n\n继续？" % (host, db))
+                "   想先确认环境可跑：python check_env.py（只读，不写任何数据）\n\n继续？"
+                % (host, db))
             return r == QMessageBox.StandardButton.Yes
         if host not in ("192.168.1.137",):
             r = QMessageBox.question(
@@ -1577,31 +1577,6 @@ class MainWindow(QWidget):
         if not ok:
             QMessageBox.warning(self, "启动失败", err)
 
-    def _run_e2e(self, script):
-        if self.worker and self.worker.isRunning():
-            QMessageBox.information(self, "提示", "已有任务在跑，先停止或等它结束")
-            return
-        self.append_log("")
-        self.append_log("#" * 60)
-        self.append_log("# 运行 %s" % script)
-        self.append_log("#" * 60)
-        self._batch_start = time.time()
-        self._run([self._base_cmd(script)])
-
-    def _run_env_check(self):
-        """只读环境体检：扫本机默认的两台（136 与 137）。"""
-        if self.worker and self.worker.isRunning():
-            QMessageBox.information(self, "提示", "已有任务在跑，先停止或等它结束")
-            return
-        self.append_log("")
-        self.append_log("#" * 60)
-        self.append_log("# 只读环境体检（不会写入任何数据）")
-        self.append_log("#" * 60)
-        argv = self._base_cmd("check_env.py")
-        argv += ["--port", str(self.spin_port.value()),
-                 "--pwd", self.edit_pwd.text()]
-        self._run([argv])
-
     # ---------------- 统计汇总 ----------------
     def _refresh_summary(self):
         d = self.edit_stats_out.text().strip() or PERF_DIR
@@ -1639,6 +1614,13 @@ class MainWindow(QWidget):
                                         Qt.AlignmentFlag.AlignVCenter)
                 self.tbl.setItem(r, c, it)
         self.tabs.setTabText(1, "统计汇总 (%d)" % len(rows))
+        # 顺手显示"上次刷新时间 + 从哪个目录读的"，避免看成空表时不知道是不是没扫对目录
+        try:
+            d = self.edit_stats_out.text().strip() or PERF_DIR
+            self.lbl_summary_stat.setText(
+                "%d 条 ｜ %s ｜ %s" % (len(rows), time.strftime("%H:%M:%S"), d))
+        except Exception:
+            pass
         if err:
             self.append_log("[汇总] %s" % err)
 
