@@ -636,6 +636,12 @@ class MainWindow(QWidget):
             self.guard.install(s)
             return s
 
+        def flabel(zh, flag, tip=""):
+            """中文名 + 灰色 CLI 参数名，方便界面和命令行互相对照。"""
+            l = QLabel('%s <span style="color:#888;">%s</span>' % (zh, flag))
+            l.setToolTip(tip or ("命令行对应参数：<b>%s</b>" % flag))
+            return l
+
         cp = self.cp
         self.spin_workers = spin(1, 256, int(ini_get(cp, "test", "workers", "4") or 4), 90,
                                  "并发发送线程数")
@@ -654,8 +660,12 @@ class MainWindow(QWidget):
                               "它们不计入上面的「发送/回包」统计。填 0 关闭。")
         self.edit_reply_stream = QLineEdit("")
         self.edit_reply_stream.setPlaceholderText("留空=DataHub_reply_stream")
-        self.chk_no_reply = QCheckBox("只发不收（不读回包）")
-        self.chk_quiet = QCheckBox("安静模式（少打印）")
+        self.chk_no_reply = QCheckBox("只发不收（--no-reply）")
+        self.chk_no_reply.setToolTip("勾上=不读回包，纯发压测。命令行对应：<b>--no-reply</b>")
+        self.chk_quiet = QCheckBox("安静模式（--quiet 1）")
+        self.chk_quiet.setToolTip("少打印。只影响日志器的常规输出，"
+                                  "【不影响「预览报文」】，也不会让报文消失。\n"
+                                  "命令行对应：<b>--quiet 1</b>（默认）/ 0=啰嗦")
         self.chk_quiet.setChecked(True)
         # 打真平台：默认关。目标流上存在外来消费者（真平台）时，send_test.py 会被
         # 安全闸拦下（退出码 2）；勾上这个才会加 --force-live 放行。
@@ -670,19 +680,31 @@ class MainWindow(QWidget):
         self.chk_force_live.setChecked(False)
 
         g = QGridLayout(box.content)
-        g.addWidget(QLabel("并发线程"), 0, 0)
+        g.addWidget(flabel("并发线程", "--workers", "并发发送线程数。命令行：--workers N"),
+                   0, 0)
         g.addWidget(self.spin_workers, 0, 1)
-        g.addWidget(QLabel("总条数"), 0, 2)
+        g.addWidget(flabel("总条数", "--max",
+                           "发送总条数；超过用例数会循环复用。0=每种用例发一次。\n"
+                           "命令行：--max N"), 0, 2)
         g.addWidget(self.spin_max, 0, 3)
-        g.addWidget(QLabel("按秒跑"), 1, 0)
+        g.addWidget(flabel("按秒跑", "--seconds",
+                           "跑够这么多秒就停（优先于总条数）。0=不用。\n"
+                           "命令行：--seconds S"), 1, 0)
         g.addWidget(self.spin_seconds, 1, 1)
-        g.addWidget(QLabel("限速/秒"), 1, 2)
+        g.addWidget(flabel("限速/秒", "--rate",
+                           "全局限速 条/秒。0=不限速。命令行：--rate R"), 1, 2)
         g.addWidget(self.spin_rate, 1, 3)
-        g.addWidget(QLabel("等回包 s"), 2, 0)
+        g.addWidget(flabel("等回包 s", "--wait",
+                           "发完等回包的秒数。命令行：--wait S"), 2, 0)
         g.addWidget(self.spin_wait, 2, 1)
-        g.addWidget(QLabel("RTT 探测"), 2, 2)
+        g.addWidget(flabel("RTT 探测", "--sync-probe",
+                           "压测后单发单收 N 次测真实 RTT。\n"
+                           "★ 这 N 条是【额外真实报文】，不计入统计；\n"
+                           "没回包时每条干等 5 秒（填 20 = 最多白等 100 秒）。\n"
+                           "命令行：--sync-probe N"), 2, 2)
         g.addWidget(self.spin_sync, 2, 3)
-        g.addWidget(QLabel("回包流"), 3, 0)
+        g.addWidget(flabel("回包流", "--reply-stream",
+                           "留空=DataHub_reply_stream。命令行：--reply-stream NAME"), 3, 0)
         g.addWidget(self.edit_reply_stream, 3, 1, 1, 3)
         g.addWidget(self.chk_no_reply, 4, 0, 1, 2)
         g.addWidget(self.chk_quiet, 4, 2, 1, 2)
