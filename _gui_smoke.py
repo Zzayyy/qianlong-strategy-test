@@ -58,7 +58,7 @@ def main():
 
     print()
     print("=" * 72)
-    print("2) 用例计数与连接摘要")
+    print("2) 用例选择提示（★ 不在勾选时读表）")
     print("=" * 72)
     w.edit_cases.setText("")
     w.combo_type.setCurrentText("normal")
@@ -66,13 +66,18 @@ def main():
         c.setChecked(n == "create")
     app.processEvents()
     txt = w.lbl_cases.text()
-    check("用例计数有内容", bool(txt), txt)
-    check("normal create 计数为 5（Excel 里 5 条 normal）",
-          "create=5" in txt, txt)
-    w.combo_type.setCurrentText("destroy")
-    app.processEvents()
-    check("destroy 计数 >200", "create=2" in w.lbl_cases.text()
-          or "create=3" in w.lbl_cases.text(), w.lbl_cases.text())
+    check("提示有内容", bool(txt), txt)
+    # 【改过】原来这里会读 Excel 统计条数（3000 行要 3 秒，3 万行 160 秒，
+    # 且跑在主线程上直接卡死界面）。现在只显示选择，不读表。
+    check("提示里含已选接口名", "create" in txt, txt)
+    check("提示里写明条数延后统计", "统计" in txt, txt)
+    check("★ 不再显示读表算出的条数", "create=5" not in txt
+          and "全库" not in txt, txt)
+
+    # 读表统计仍然可用，只是改到点发送时才做（走 _count_pool）
+    cnt, det, err = w._estimate_count()
+    check("需要时仍能统计出条数（create normal=5）",
+          "create=5" in det, "%s / %s" % (det, err))
     w.combo_type.setCurrentText("normal")
     app.processEvents()
 

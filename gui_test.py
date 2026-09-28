@@ -588,6 +588,7 @@ class MainWindow(QWidget):
         for i, n in enumerate(names):
             chk = QCheckBox(n)
             chk.setChecked(n == "create")
+            # 【不做读表统计】勾选只更新一行文字提示，不碰 Excel（见 _update_case_count）
             chk.toggled.connect(self._update_case_count)
             self.chk_ifaces[n] = chk
             g.addWidget(chk, i // 3, i % 3)
@@ -601,6 +602,8 @@ class MainWindow(QWidget):
         self.edit_cases.setToolTip(
             "按用例编号筛选，支持区间。写了这里会自动把类型放宽为 all，\n"
             "否则 --cases C201（destroy 用例）会被 normal 过滤成 0 条。")
+        # 改筛选条件也要刷新提示（只是拼字符串，不读表）
+        self.edit_cases.textChanged.connect(self._update_case_count)
 
         g.addWidget(QLabel("用例类型"), len(names) // 3 + 1, 0)
         g.addWidget(self.combo_type, len(names) // 3 + 1, 1)
@@ -956,42 +959,49 @@ class MainWindow(QWidget):
             return 0, "%s" % e
 
     def _update_case_count(self):
-        if not CASES:
-            self.lbl_cases.setText("")
+        """只显示【当前选择】，不读 Excel。
+
+        【为什么改成不读表】原来每次勾选接口/切类型都会去读 Excel 统计条数，
+        而且是 本次 1 遍 + 全库 3 遍 = 4 遍完整扫描。实测 openpyxl 读表很慢：
+            3000 行  -> 3.2 s/遍   => 点一下要等 13 秒
+            30000 行 -> 32  s/遍   => 点一下要等 160 秒（界面直接卡死）
+        而它跑在 Qt 主线程上，会冻住整个窗口。
+        现在这里只拼一行文字（零成本），真正的读表推迟到「点击开始发送」时，
+        由 send_test.py 在【子进程】里做（界面不会卡）。
+        """
+        names = self.selected_interfaces()
+        t = self.combo_type.currentText()
+        spec = self.edit_cases.text().strip()
+        if not names:
+            self.lbl_cases.setText("未勾选接口")
+            self.lbl_cases.setStyleSheet("color:#c00;")
             return
-        try:
-            names = self.selected_interfaces()
-            t = self.combo_type.currentText()
-            spec = self.edit_cases.text().strip()
-            total = 0
-            detail = []
-            errs = []
-            for n in names:
-                c, err = self._count_pool(n, t, spec)
-                total += c
-                detail.append("%s=%d" % (n, c))
-                if err:
-                    errs.append("%s:%s" % (n, err.splitlines()[0][:40]))
-            if not names:
-                self.lbl_cases.setText("未勾选接口")
-            elif total == 0:
-                self.lbl_cases.setText("⚠ 匹配到 0 条用例；" + ("; ".join(errs) or
-                                                          "检查类型/接口/编号"))
-                self.lbl_cases.setStyleSheet("color:#c00;")
-            else:
-                # 全库统计（normal/error/destroy 各多少）
-                full = []
-                for tag in ("normal", "error", "destroy"):
-                    c, _ = self._count_pool("create", tag, "")
-                    full.append("%s %d" % (tag, c))
-                self.lbl_cases.setText(
-                    "本次共 %d 条（%s）｜create 全库: %s"
-                    % (total, " ".join(detail), " / ".join(full)))
-                self.lbl_cases.setStyleSheet("color:#555;" + ("background:#fff3cd;" if errs else ""))
-                if errs:
-                    self.lbl_cases.setText(self.lbl_cases.text() + "  ⚠" + "; ".join(errs))
-        except Exception as e:
-            self.lbl_cases.setText("计数失败: %s" % e)
+        detail = " ".join("%s" % n for n in names)
+        txt = "已选接口: %s ｜ 类型: %s" % (detail, t)
+        if spec:
+            txt += " ｜ 指定用例: %s" % spec
+        txt += "　（条数在点「开始发送」时统计）"
+        self.lbl_cases.setText(txt)
+        self.lbl_cases.setStyleSheet("color:#555;")
+
+    def _estimate_count(self):
+        """点「开始发送」后真正读表统计（会阻塞，放在子线程里做）。
+
+        返回 (总数, 明细文本, 错误文本)。读不到就返回 (0, "", 原因)。
+        """
+        names = self.selected_interfaces()
+        t = self.combo_type.currentText()
+        spec = self.edit_cases.text().strip()
+        total = 0
+        detail = []
+        errs = []
+        for n in names:
+            c, err = self._count_pool(n, t, spec)
+            total += c
+            detail.append("%s=%d" % (n, c))
+            if err:
+                errs.append("%s:%s" % (n, err.splitlines()[0][:40]))
+        return total, " ".join(detail), "; ".join(errs)
 
     def selected_interfaces(self):
         return [n for n, c in self.chk_ifaces.items() if c.isChecked()]
@@ -1107,30 +1117,25 @@ class MainWindow(QWidget):
             return
         if not self._confirm_conn():
             return
-        total = 0
-        if CASES:
-            for n in names:
-                c, _ = self._count_pool(n, type_tag, self.edit_cases.text().strip())
-                total += c
-        if total == 0:
-            QMessageBox.warning(self, "提示",
-                                "按当前筛选条件匹配到 0 条用例。\n"
-                                "检查「用例类型 / 接口 / 指定用例」。")
-            return
-        if total > 200000:
-            if QMessageBox.question(
-                    self, "确认",
-                    "本次将发送约 %d 条，量很大。继续？" % total) != \
-                    QMessageBox.StandardButton.Yes:
-                return
         if not self._confirm_force_live():
+            return
+        # 便宜的预检：只看 Excel 文件在不在（不读内容，零成本）。
+        # 真正的条数统计交给 send_test.py 在子进程里做，界面不会卡。
+        missing = [n for n in names
+                   if CASES and not os.path.exists(CASES.default_excel(n))]
+        if missing:
+            QMessageBox.warning(
+                self, "缺少用例表",
+                "这些接口的 Excel 还不存在：%s\n\n"
+                "先生成：python make_excel.py --interface all"
+                % ",".join(missing))
             return
         self._batch_start = time.time()
         self.append_log("")
         self.append_log("#" * 60)
-        self.append_log("# 开始%s：接口=[%s] 类型=%s 目标流=%s 预计 %d 条"
+        self.append_log("# 开始%s：接口=[%s] 类型=%s 目标流=%s"
                         % ("破坏测试" if type_tag == "destroy" else "发送",
-                           ",".join(names), type_tag, self._stream_name(), total))
+                           ",".join(names), type_tag, self._stream_name()))
         self.append_log("#" * 60)
         cmds = [self._send_argv(n, type_tag) for n in names]
         self._run(cmds)
