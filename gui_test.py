@@ -14,7 +14,7 @@ gui_test.py —— 策略平台测试 GUI（PySide6）
     左栏(可滚动) 1 连接设置 → 2 策略平台身份 → 3 测试数据 → 4 发送参数 → 5 输出
     右栏        服务管理（起/停 Mock 策略平台 / Mock 数据中台）
     下栏标签页   运行日志 | 统计汇总（各带一条工具条）
-    底部按钮    预览报文 | 开始发送 | 破坏测试 | 停止
+    底部按钮    预览报文 | 开始发送 | 停止
 
 依赖：venv 已装 PySide6 + openpyxl。
 运行：venv/Scripts/python.exe gui_test.py
@@ -846,13 +846,21 @@ class MainWindow(QWidget):
         g.addWidget(flabel("并发线程", "--workers", "并发发送线程数。命令行：--workers N"),
                    0, 0)
         g.addWidget(self.spin_workers, 0, 1)
-        g.addWidget(flabel("总条数", "--max",
-                           "发送总条数；超过用例数会循环复用。0=每种用例发一次。\n"
-                           "命令行：--max N"), 0, 2)
+        # 记住标签引用：按秒跑时要连标签一起置灰（和 datahub_test 一样）
+        self.lbl_max = flabel(
+            "总条数", "--max",
+            "发送总条数；超过用例数会循环复用。0=每种用例发一次。\n"
+            "命令行：--max N\n"
+            "【按秒跑 > 0 时本项失效】send_test.py 会把 max 强制设为 0，\n"
+            "改由「按秒跑」的秒数决定何时停。")
+        g.addWidget(self.lbl_max, 0, 2)
         g.addWidget(self.spin_max, 0, 3)
-        g.addWidget(flabel("按秒跑", "--seconds",
-                           "跑够这么多秒就停（优先于总条数）。0=不用。\n"
-                           "命令行：--seconds S"), 1, 0)
+        self.lbl_seconds = flabel(
+            "按秒跑", "--seconds",
+            "跑够这么多秒就停。0=不用（默认按「总条数」跑）。\n"
+            "命令行：--seconds S\n"
+            "★ 填了它就忽略「总条数」，用例会循环续发到时间用完。")
+        g.addWidget(self.lbl_seconds, 1, 0)
         g.addWidget(self.spin_seconds, 1, 1)
         g.addWidget(flabel("限速/秒", "--rate",
                            "全局限速 条/秒。0=不限速。命令行：--rate R"), 1, 2)
@@ -872,7 +880,40 @@ class MainWindow(QWidget):
         g.addWidget(self.chk_no_reply, 4, 0, 1, 2)
         g.addWidget(self.chk_quiet, 4, 2, 1, 2)
         g.addWidget(self.chk_force_live, 5, 0, 1, 4)
+
+        # 「按秒跑」> 0 时「总条数」失效（send_test.py 会把 max 强制设 0），
+        # 所以联动置灰，避免填了个没用的值还以为生效。做法同 datahub_test。
+        self.spin_seconds.valueChanged.connect(self._sync_end_mode)
+        self._sync_end_mode()
         return box
+
+    def _sync_end_mode(self):
+        """按「按秒跑」是否启用，置灰/启用「总条数」。
+
+        send_test.py 里：
+            if seconds > 0:
+                sender.max_count = 0      # max 被丢弃
+                Timer(seconds, stop)
+        即两者互斥，同时填只有秒数算数。所以这里把用不上的那个灰掉。
+        """
+        by_time = self.spin_seconds.value() > 0
+        ok = not by_time
+        for w in (self.spin_max, getattr(self, "lbl_max", None)):
+            if w is not None:
+                w.setEnabled(ok)
+        # 置灰时明确说清"为什么灰"，而不是让人猜
+        if by_time:
+            self.spin_max.setToolTip(
+                "【当前被禁用】因为「按秒跑」填了 %s 秒 —— send_test.py 在按时间模式下\n"
+                "会把总条数强制设为 0（不限），改由秒数决定何时停。\n"
+                "想让总条数生效，请把「按秒跑」改成 0。"
+                % self.spin_seconds.value())
+        else:
+            self.spin_max.setToolTip(
+                "发送总条数；超过用例数会循环复用。0=每种用例发一次。\n"
+                "命令行：--max N\n"
+                "【按秒跑 > 0 时本项失效】send_test.py 会把 max 强制设为 0，\n"
+                "改由「按秒跑」的秒数决定何时停。")
 
     def _box_misc(self):
         box = CollapsibleBox("5. 输出")
@@ -994,7 +1035,7 @@ class MainWindow(QWidget):
         self.btn_clear_log.clicked.connect(self.on_clear_log)
         self.chk_autoclear = QCheckBox("每次发送前自动清空")
         self.chk_autoclear.setToolTip(
-            "勾上后，每次点「开始发送 / 破坏测试 / 预览」会先清空日志，\n"
+            "勾上后，每次点「开始发送 / 预览」会先清空日志，\n"
             "这样每次只看本次输出，不用手动清。")
         self.chk_autoclear.setChecked(
             ini_get(self.cp, "gui", "autoclear_log", "0") == "1")
@@ -1084,10 +1125,9 @@ class MainWindow(QWidget):
         row = QHBoxLayout()
         self.btn_preview = QPushButton("预览报文（不发）")
         self.btn_send = QPushButton("开始发送")
-        self.btn_destroy = QPushButton("破坏测试")
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setEnabled(False)
-        for b in (self.btn_preview, self.btn_send, self.btn_destroy):
+        for b in (self.btn_preview, self.btn_send):
             b.setMinimumHeight(30)
         self.btn_send.setMinimumHeight(34)
         f = self.btn_send.font()
@@ -1096,13 +1136,11 @@ class MainWindow(QWidget):
 
         self.btn_preview.clicked.connect(self.on_preview)
         self.btn_send.clicked.connect(lambda: self.on_send("normal"))
-        self.btn_destroy.clicked.connect(lambda: self.on_send("destroy"))
         self.btn_stop.clicked.connect(self.on_stop)
 
         row.addWidget(self.btn_preview)
         row.addStretch(1)
         row.addWidget(self.btn_send)
-        row.addWidget(self.btn_destroy)
         row.addStretch(1)
         row.addWidget(self.btn_stop)
         return row
@@ -1313,7 +1351,7 @@ class MainWindow(QWidget):
 
     # ---------------- 运行控制 ----------------
     def _set_running(self, running):
-        for b in (self.btn_preview, self.btn_send, self.btn_destroy):
+        for b in (self.btn_preview, self.btn_send):
             b.setEnabled(not running)
         self.btn_stop.setEnabled(running)
         self.btn_summary_export.setEnabled(not running)
@@ -1531,10 +1569,7 @@ class MainWindow(QWidget):
         except Exception:
             return ""
 
-    # ---------------- 弹窗（集中在这里，便于测试时整体替换） ----------------
-    # 【踩过的坑】offscreen 下 QMessageBox 是模态的，测试里没人点按钮就会
-    # 永久阻塞。所有弹窗都走这两个方法，测试可以 instance 级替换掉它们
-    # （或直接用 _gui_headless.install() 换掉 QMessageBox 静态方法）。
+    # ---------------- 弹窗（集中在这里） ----------------
     def _warn(self, title, text):
         """告警框（只有一个"确定"）。返回 None。"""
         QMessageBox.warning(self, title, text)

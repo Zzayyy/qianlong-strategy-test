@@ -101,8 +101,8 @@ python send_test.py --interface create --cases C001 --no-send --dump out/payload
 | 导出汇总 Excel | 把汇总表导出成 Excel |
 
 > 早先这几个按钮放在右栏的「快捷操作」里，还混着「一键自测 / 真插件复核 / 环境体检」。
-> 现已精简：**右栏只留服务管理**，其余三个改成命令行工具
-> （`python tests/_e2e_test.py` / `tests/_plugin_e2e.py` / `check_env.py`，见 §7）。
+> 现已精简：**右栏只留服务管理**。那三个已随自测脚本一起删除，
+> 需要只读体检时直接跑 `python check_env.py`。
 
 界面参数会记忆到 `config.ini`，下次打开还在。
 
@@ -224,22 +224,13 @@ out/performance/quickstart.xlsx              # 汇总 + 按秒 + 错误（3 个 
     --type destroy --workers 8 --max 1000 --wait 8
 ```
 
-### 0.4 不用手开两个终端：一键自测
-
-```powershell
-..\venv\Scripts\python.exe tests\_e2e_test.py      # 5 发 5 回，核对 request_id 与回包
-..\venv\Scripts\python.exe tests\_e2e_destroy.py   # normal 2000 + destroy 1500
-```
-
-这两个脚本会自己把 mock 拉起来、跑完自己收掉。
-
-### 0.5 常用变体
+### 0.4 常用变体
 
 ```powershell
 # 只发不收回包（纯压发送端）
 ... send_test.py --assign-id 1 --no-reply --workers 8 --seconds 10
 
-# 按时间跑 10 秒
+# 按时间跑 10 秒（注意：填了它「总条数」会被忽略，GUI 里会自动置灰）
 ... send_test.py --assign-id 1 --seconds 10 --workers 8
 
 # 限速 100 条/秒
@@ -487,8 +478,8 @@ Redis Streams 同组是负载均衡不是广播 —— 真平台的单子会莫�
 > `stop` 传播之前就注册成了消费者 —— 实测在 136 的 `ST-0` 上真的多出了
 > `ST-0-w1/w2/w3` 三个消费者。现已改为在 `_ensure_streams()` 里**同步**判定，
 > 所有 worker 等结论（`_guard_ok`）后才开始 `XREADGROUP`。
-> 万一又出现误污染，用 `tests/_cleanup_my_consumers.py` 清理（它会先检查
-> `pending=0` 才删，避免丢消息）。
+> 万一又出现误污染，可用 `XINFO CONSUMERS` 找到 `-wN` 的消费者，
+> 确认 `pending=0`（没扣住消息）后再 `XGROUP CREATECONSUMER` 的反向操作删除。
 
 ### 怎么区分"真平台"和"我的 mock"
 
@@ -644,12 +635,15 @@ ST-50  -> XADD * request_id STTEST_1790232971097_1 task {"create":{...},"MsgType
 
 ### 收尾清理
 
-测试完记得清掉自己造的高位号段流（**只删 consumer 名带 `-wN` 的**，
-真平台的 `ST-1` / `ST-50` 一个都不能碰）：
+测试完记得清掉自己造的号段流（**真平台在用的那条一个都不能碰**）。
+先确认上面没有真实消费者，再删：
 
 ```bash
-python tests/_cleanup_my_consumers.py --host 192.168.1.137 --stream ST-50          # 预览
-python tests/_cleanup_my_consumers.py --host 192.168.1.137 --stream ST-50 --apply  # 执行
+# 看某条流上有哪些消费者（mock 的名字带 -wN 后缀）
+redis-cli -h 192.168.1.137 -a 'QianLong@2026&' XINFO CONSUMERS ST-50 user_group
+
+# 确认是空壳（XLEN=0 且没有 pending）后再删
+redis-cli -h 192.168.1.137 -a 'QianLong@2026&' DEL ST-50 ST-50-reply
 ```
 
 ---
@@ -674,7 +668,7 @@ python tests/_cleanup_my_consumers.py --host 192.168.1.137 --stream ST-50 --appl
 | `mock_datahub.py` | ○**可选** — 模拟数据中台。**默认流程用不到**，仅在「测完整上线握手」或「观察真中台」时需要，见 3.2 |
 | `config.py` `config.ini` | 共享配置（CLI 参数优先） |
 | `out/logs/` `out/performance/` | 运行日志、性能统计输出 |
-| **`tests/`** | **自测脚本（开发/回归用，跑产品不需要）**，见下表 |
+| `tests/` | 两个**日常工具**（不是测试），见下 |
 
 **为什么 `mock_datahub` 是可选的**：`send_test.py` 直接往 `ST-N` 写报文，
 它本身就在承担"数据中台发报文"这个角色；而"数据中台分配编号"这件事，
@@ -695,35 +689,23 @@ mock_datahub.py       ──PUBLISH───────┘
 > 早先 `mock_datahub` 还有个 `--push`（持续推报文）功能，因与 `send_test.py` 完全重复
 > 且没有统计能力，**已删除**。
 
-### 2.1 `tests/` 里的自测脚本
+### 2.1 `tests/` 里的两个工具
 
-跑产品**不需要**这些，它们是开发/回归时用的。全部可以**从项目根**执行，
-例如 `python tests/_run_suites.py`。
+只有两个，都是**日常可能用到**的，从项目根执行：
 
 | 文件 | 说明 |
 |---|---|
-| `_run_suites.py` | **回归入口**：带 200s 硬超时跑下面 7 套 GUI 测试，卡住会自动强杀 |
-| `_gui_smoke.py` | GUI 冒烟（offscreen 起窗口，验控件/命令拼装/汇总/导出） |
-| `_gui_noread.py` | 验「勾选接口不读 Excel」（3000 行表点一下要 13s 的回归防线） |
-| `_gui_clearlog.py` | 验「清空日志」：按钮生效、**不影响** `out/logs/`、偏好可存 |
-| `_gui_forcelive.py` | 验「允许打真平台」开关：argv 拼装、真平台探测、弹窗行为 |
-| `_gui_dhflow.py` | 验「Mock 数据中台」面板可见性与**自动同步分配编号** |
-| `_gui_gen.py` | 验「生成压测数据」：argv 拼装、一致性校验、ref 回填真生效 |
-| `_gui_paths.py` | 验「预览」不写库、「破坏测试」真写库 |
-| `_gui_integration.py` | GUI 集成（真起 Mock、真发报文、核对回包与 pending） |
-| `_gui_headless.py` | **基础设施**：把 `QMessageBox` 换成「记录+自动回答」，防 offscreen 模态框卡死 |
-| `_gui_shot.py` | 把界面截成 `out/_shot_*.png`（目视检查布局） |
-| `_e2e_test.py` | 端到端 5 发 5 回（命令行跑，见 §7） |
-| `_e2e_destroy.py` | 端到端破坏用例 + 压测 |
-| `_plugin_e2e.py` | SSH 驱动 136 上**真 `.so`** 复核协议（跑完自动还原 `DataHub.ini`） |
-| `_lat_test.py` | 量化"响应时间"是链路真实 RTT 还是读取线程攒批导致的 |
-| `_crosscheck_cpp.py` | 用 136 上真 `pwdEncode.cpp` 双向交叉验证 `pwd_encode.py` |
-| `_test_pwd17.py` | 定位 pwdUpdate 明文/密文差异（就是它发现"明文被静默吞掉"） |
-| `_cleanup_my_consumers.py` | 误测后在真平台流上留下的 `-wN` 消费者清理（先查 pending=0 才删） |
-| `_show_stream.py` | **看实际发出去的报文**：从 Redis 流里读回（`--json` 格式化 / `--full` 不截断 / `--out` 导出） |
+| `_show_stream.py` | **看实际发出去的报文**：从 Redis 流里读回（`--json` 格式化 / `--full` 不截断 / `--out` 导出）。`out/logs/` 里**不含**报文内容，只有它能看到 |
+| `_verify_bulk.py` | **复核批量数据**：账号唯一性、`UniqueAccount` 是否跟随、`Ref` 是否唯一、号段是否对齐、`Pwd` 能否解回 |
 
-> 这些脚本都是**从命令行跑**的（`python tests/xxx.py`）。GUI 只负责
-> 「生成数据 / 发送 / 看统计」三件事，自测类脚本不再挂在界面上。
+```bash
+python tests/_show_stream.py --stream ST-50 -n 5      # 最近 5 条
+python tests/_verify_bulk.py                          # 复核 data/*.xlsx
+```
+
+> 早先这里还有一套 GUI 自测（`_gui_*`、`_e2e_*`、`_run_suites` 等 18 个），
+> **已全部删除** —— 它们只在开发期用来防回归，日常用不到，
+> 与 `datahub_test` 的结构保持一致（那边也没有测试目录）。
 
 ---
 
@@ -802,9 +784,9 @@ python mock_datahub.py --host 192.168.1.137 --db 0 --alloc-start 1
 
 一键验证（自动改 `DataHub.ini`、跑完**自动还原**）：
 
-```bash
-python tests/_plugin_e2e.py
-```
+> 早先有个自动化脚本 `tests/_plugin_e2e.py` 做这件事，**已随自测脚本删除**。
+> 现在按上面的手工步骤跑即可（改 `DataHub.ini` → 起插件 → 本机起 `mock_datahub`
+> 分配编号 → 观察 `ST-N` 是否被创建、回包是否落在 `DataHub_reply_stream`）。
 
 ### 3.4 观察真数据中台发什么（只收不回）
 
@@ -1110,63 +1092,30 @@ token 机制与 `datahub_test/interfaces/_common.py` 一致：配置里存占位
 
 ---
 
-## 7. 自测
+## 7. 工具与实测结果
 
-> 全部自测脚本都在 **`tests/`** 下，从项目根执行即可。
-
-### 7.1 命令行工具
+### 7.1 `tests/` 下的两个日常工具
 
 ```bash
-# 端到端闭环：Mock中台 + Mock策略 + 发 5 条，核对 request_id 与回包
-python tests/_e2e_test.py
+# 看实际发出去的报文（out/logs 里没有报文内容，只有它能看）
+python tests/_show_stream.py --stream ST-50 -n 5
+python tests/_show_stream.py --stream ST-50 -n 1 --json
+python tests/_show_stream.py --stream ST-50 --full
+python tests/_show_stream.py --stream ST-50 --out dump.jsonl
 
-# 压测 + 破坏测试（normal 2000 条 + destroy 1500 条）
-python tests/_e2e_destroy.py
-
-# 单条真实 RTT 对照
-python tests/_lat_test.py
-
-# 真插件当"标准答案"复核协议（SSH 到 136，跑完自动还原 DataHub.ini）
-python tests/_plugin_e2e.py
+# 复核批量数据（账号唯一 / UniqueAccount 跟随 / Ref 唯一 / 号段对齐 / Pwd 可解）
+python tests/_verify_bulk.py
 ```
 
-### 7.2 图形界面（推荐：一条命令跑全套）
+> 早先这里有一套 GUI 自测（18 个脚本，含 `_run_suites.py` 回归入口），**已全部删除** ——
+> 它们只在开发期防回归用，日常不需要，与 `datahub_test` 的结构保持一致。
 
-```bash
-# ★ 回归入口：带 200s 硬超时跑下面全部 7 套，卡住会自动强杀并汇总
-python tests/_run_suites.py
-```
-
-单独跑其中一套：
-
-```bash
-python tests/_gui_smoke.py        # 冒烟：起窗口、验控件/命令拼装/汇总加载/Excel 导出
-python tests/_gui_noread.py       # 验「勾选接口不读 Excel」（防 3 万行表卡死回归）
-python tests/_gui_clearlog.py     # 验「清空日志」不影响 out/logs/
-python tests/_gui_forcelive.py    # 验「允许打真平台」开关与真平台探测
-python tests/_gui_dhflow.py       # 验 Mock 数据中台面板与自动同步编号
-python tests/_gui_integration.py  # 集成：真起 Mock、真发 30 条、核对回包与 pending
-python tests/_gui_paths.py        # 验「预览」不写库、「破坏测试」真写库
-python tests/_gui_shot.py         # 把界面截成 out/_shot_*.png，可目视检查布局
-```
-
-所有 GUI 测试都用 `QT_QPA_PLATFORM=offscreen`，**不需要人盯着屏幕**，
-可以直接在 CI 或无人值守下跑，全绿会打印「结果: 全部通过」。
-
-> **写新 GUI 测试时务必 `import _gui_headless` 并 `install()`**：offscreen 下
-> `QMessageBox` 是模态的，没人点按钮会**永久阻塞**（踩过，见 §1.5 的说明）。
-
-实测结果（2026-09-24，目标 192.168.1.137:6379 db0）：
+### 7.2 实测结果（2026-09-24，目标 192.168.1.137:6379 db0）
 
 ```
-命令行：
 normal 3000 条 / 8 线程 : 1704 条/秒，回包 3000/3000，失败 0，在途 0
                           批量口径 平均 5.17 ms；同步口径 平均 0.84 ms
 destroy 1500 条 / 8 线程: 1260 条/秒，回包 1500/1500，失败 0，在途 0
-
-GUI：
-冒烟 40 项全过；集成 30/30 回包、request_id 30 条全匹配、pending=0；
-预览确认不写库；破坏测试 50 条畸形报文全部被消费回包
 ```
 
 ---

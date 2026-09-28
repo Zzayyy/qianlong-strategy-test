@@ -174,9 +174,25 @@ def write_excel(mod, rows, out_path):
     try:
         os.replace(tmp, out_path)
     except PermissionError:
+        # 目标被别的程序占着（最常见：Excel/WPS 正开着这个 xlsx）。
+        # 这时【原文件没有被更新】—— 必须说清楚，否则会以为生成成功了，
+        # 实际发出去的还是旧表（踩过：数据没变，排查半天）。
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
         alt = out_path.replace(".xlsx", "_v2.xlsx")
         wb.save(alt)
-        print("[WARN] %s 被占用(Excel 可能开着)，已存到 %s" % (out_path, alt))
+        print("")
+        print("!" * 74)
+        print("[WARN] %s" % out_path)
+        print("       被其它程序占用（Excel / WPS 正开着它？），【原文件没有更新】！")
+        print("       新内容已另存到：%s" % alt)
+        print("       要生效请二选一：")
+        print("         1) 关掉打开该 xlsx 的 Excel/WPS，重新生成；")
+        print("         2) 直接用那个 _v2 文件。")
+        print("!" * 74)
+        print("")
         return alt
     return out_path
 
@@ -315,11 +331,14 @@ def build_one(name, ref_spec="", bulk_normal=0, bulk_start=0, ref_seq=1,
 
     os.makedirs(DATA_DIR, exist_ok=True)
     out = os.path.join(DATA_DIR, "%s.xlsx" % mod.NAME)
-    write_excel(mod, rows, out)
+    actual = write_excel(mod, rows, out)
     from collections import Counter
     cnt = Counter(str(r[type_i]).strip() for r in rows)
-    print("[OK] %s -> %s  共 %d 条  %s" % (name, out, len(rows), dict(cnt)))
-    return out
+    # 注意：被占用时 write_excel 会写到 _v2，这里报【实际写入的路径】，
+    # 免得看到"[OK]"却以为原表更新了。
+    print("[OK] %s -> %s  共 %d 条  %s"
+          % (name, actual or out, len(rows), dict(cnt)))
+    return actual or out
 
 
 def main():
@@ -332,7 +351,7 @@ def main():
                          "例：7,100 或 20260904000001-20260904000100")
     ap.add_argument("--bulk-normal", type=int, default=0,
                     help="把 normal 段替换为 N 行【不同账号】的正常数据（压测用、不循环）。"
-                         "目前 create / account 已实现。例：--bulk-normal 10000")
+                         "五个接口都已实现。例：--bulk-normal 10000")
     ap.add_argument("--bulk-start", type=int, default=0,
                     help="批量账号的 6 位序号起点，默认 11301（紧邻真实账号 010100011300）")
     ap.add_argument("--ref-seq", type=int, default=1,
