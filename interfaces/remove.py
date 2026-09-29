@@ -126,7 +126,7 @@ def build_bulk_rows(count, start=0, ref_seq=1):
     ★ 与 modify 同一套约定：第 i 行引用 __REF{ref_seq+i-1}__，
       需要 create 按行顺序先发一遍，这些单号才真实存在。
     ★ 注意顺序：删除不可逆。若要同时测 modify + remove，
-      正确顺序是 create -> modify -> remove（见 README §5.2）。
+      正确顺序是 create -> modify -> remove（见 docs/guide.md 第 6 节）。
 
     参数含义同 modify.build_bulk_rows。
     """

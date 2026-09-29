@@ -385,7 +385,8 @@ def main():
         print("%-12s %-38s %8s" % ("合计", "", total))
         print()
         print("注：上表是【接口定义里写死】的规模。五个接口都可用 --bulk-normal N")
-        print("    把 normal 段扩成 N 行不同账号的压测数据（详见 README §5.2），例如：")
+        print("    把 normal 段扩成 N 行不同账号的压测数据"
+              "（详见 docs/guide.md 第 6 节），例如：")
         print("      python make_excel.py --interface account   --bulk-normal 10000")
         print("      python make_excel.py --interface create    --bulk-normal 10000")
         print("      python make_excel.py --interface modify    --bulk-normal 10000")

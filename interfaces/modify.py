@@ -177,7 +177,7 @@ def build_bulk_rows(count, start=0, ref_seq=1):
                 这样本表第 i 行引用的就是 __REF{ref_seq+i-1}__。
                 ⚠ 若 create 用的是默认（从 1 开始），这里保持 1 即可。
 
-    发送顺序：create 全部 -> 再发本表（见 README §5.2）。
+    发送顺序：create 全部 -> 再发本表（见 docs/guide.md 第 6 节）。
     """
     count = int(count)
     if count <= 0:

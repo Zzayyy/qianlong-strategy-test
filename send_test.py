@@ -872,7 +872,7 @@ def main():
 
     # ---- 回填文件：create 造完单，把 (账号, Ref) 落盘 ----
     # 有了它，modify/remove 就能用【真实存在的单号】生成用例（--ref-map），
-    # 而不是靠行序猜。见 README §5.2。
+    # 而不是靠行序猜。见 docs/guide.md 第 6 节。
     if not a.no_refs_out and not a.no_reply and sender.refs:
         rp = a.refs_out or os.path.join(a.stats_out,
                                         "%s_refs.json" % label)
