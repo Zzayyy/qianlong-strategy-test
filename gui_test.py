@@ -605,9 +605,14 @@ class MainWindow(QWidget):
         self.combo_type.currentTextChanged.connect(self._update_case_count)
 
         self.edit_cases = QLineEdit("")
-        self.edit_cases.setPlaceholderText("留空=全部；如 C201,C203-C210（C=create M=modify R=remove P=pwdUpdate A=account）")
+        self.edit_cases.setPlaceholderText("留空=全部；如 C201,C203-C210 或 5-20（行号）")
         self.edit_cases.setToolTip(
-            "按用例编号筛选，支持区间。写了这里会自动把类型放宽为 all，\n"
+            "按用例编号筛选，支持区间。分隔符可用 , ; 和空格，可混用。\n"
+            "  带字母 = 按「用例编号」列匹配（忽略大小写与前导零）：C201 / CB00001\n"
+            "  纯数字 = 按 Excel 数据行号（1 起始）：5 / 5-20\n"
+            "编号前缀=接口首字母：C=create M=modify R=remove P=pwdUpdate A=account\n\n"
+            "★ 写错会直接报错并停止发送，不会退化成「发全表」。\n"
+            "命令行下若没显式给 --type，写这里会自动把类型放宽为 all，\n"
             "否则 --cases C201（destroy 用例）会被 normal 过滤成 0 条。")
         # 改筛选条件也要刷新提示（只是拼字符串，不读表）
         self.edit_cases.textChanged.connect(self._update_case_count)

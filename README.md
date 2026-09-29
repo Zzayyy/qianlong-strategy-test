@@ -858,6 +858,16 @@ python send_test.py --cases C201,C203-C210 --no-send      # 先预览
 python send_test.py --cases C201,C203-C210 --assign-id 1  # 再发
 ```
 
+> **`--cases` 的错误处理（2026-09-28 对齐 `datahub_test`）**
+>
+> 表达式写错（`xyz`、`C201-`、`C201-A205` 前缀不一致）或**一条都没匹配到**时，
+> 直接报错退出，**不再静默忽略**。以前静默忽略会让筛选条件整体失效，
+> 结果变成"发全表"—— 打错一个字就发上万条。现在宁可报错。
+>
+> 同时补齐了 `datahub_test` 的便利写法：`;` 和空格也能当分隔符、
+> 编号忽略大小写与前导零（`a201`/`A0201` 都能命中 `A201`）、
+> 支持任意位数编号（`CB00001-CB00003` 这种 5 位批量编号以前会解析错）。
+
 ---
 
 ## 4. 常用参数
@@ -868,7 +878,7 @@ python send_test.py --cases C201,C203-C210 --assign-id 1  # 再发
 |---|---|---|
 | `--interface` | 配置(create) | `create` `modify` `remove` `pwdUpdate` `account` `all` |
 | `--type` | 配置(normal) | `normal` `destroy` `all` |
-| `--cases` | 空 | 按编号筛选，如 `C201,C203-C210`（写它自动放宽 `--type`）。编号前缀=接口首字母：C=create M=modify R=remove P=pwdUpdate A=account |
+| `--cases` | 空 | 按编号/行号筛选（与 `datahub_test` 同口径）。分隔符 `,` `;` 空格可混用；带字母按「用例编号」列匹配（忽略大小写与前导零，如 `C201`/`CB00001`），纯数字按数据行号（1 起始）。写它自动放宽 `--type`。**写错会报错退出，不会退化成发全表** |
 | `--assign-id` | 配置(1) | 目标流 = `ST-<id>` |
 | `--stream` | 空 | 直接指定流名，覆盖 `--assign-id` |
 | `--workers` | 配置(4) | 并发线程数 |
