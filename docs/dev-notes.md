@@ -284,6 +284,39 @@ make_ref(n) = "YYYYMMDD" + "%06d" % n     # 如 20260929000001
 **写自动化测试时注意**：用离屏（`QT_QPA_PLATFORM=offscreen`）
 构造 `MainWindow` 会真实改写 `config.ini`，测完要 `git checkout` 还原。
 
+### 3.6 稳定性测试跑远程 Linux（ssh_runner.py）
+
+**为什么**：长稳跑几小时甚至过夜，Windows 会休眠/断网/被锁屏影响；
+而且现场环境是 Linux（`datahub_test` 的 `.so` 同样只能在 Linux 上跑）。
+实现参考 `datahub_test/gui_test.py` 的 `SshWorker`，抽成独立模块
+[../ssh_runner.py](../ssh_runner.py)（便于复用与单测）。
+
+**三个必须记住的点**（都踩过）：
+
+1. **shell 转义**：Redis 密码是 `QianLong@2026&`，而 `&` 在 shell 里是
+   **后台执行符**。远端命令必须对每个参数 `shlex.quote`，否则
+   `--pwd QianLong@2026& --db 0 ...` 会被切成两条命令，`&` 之后的参数全丢。
+   实施位置：`gui_test._build_remote_cmd`。
+
+2. **nohup 要断开三个 fd**：只写 `nohup ... &` 不够 —— SSH 通道会因为
+   "还有进程持有 stdout/stderr"而不释放。要 `setsid nohup CMD > LOG 2>&1
+   < /dev/null & disown`。实测这样 0.7 秒就返回，后台进程照跑。
+   实施位置：`ssh_runner.build_nohup_cmd`。
+
+3. **主动取结果不能用"只下新增"逻辑**：`run(cmd, download=...)` 会在执行前
+   记快照、执行后只下新增文件（避免拉一堆历史）。但"跑完后再点下载结果"
+   这个场景**快照是空的**，走同一逻辑会把刚产出的文件当成历史文件跳过。
+   所以另有 `download_all()` 无条件下载。实施位置：`ssh_runner._download`
+   的 `only_new` 参数 + `download_all`。
+
+**远端依赖**：只需 Python 3.8+ 与 `openpyxl`（缺了退化成 CSV）。
+**不需要 `redis-py`** —— 本目录一律用纯 socket 的 `resp_min.py`（§见 requirements
+的说明），所以 Linux 3.9 上不用装任何 Redis 客户端。
+
+⚠ **上传会覆盖远端同名文件**：GUI 默认用独立目录
+`/home/yangsh/so_test/strategy_soak`。别把远端目录指到现场在用的目录
+（那边有 `send_test.py` / `soak_test.py`，会被本项目的版本覆盖）。
+
 ---
 
 ## 4. 安全闸的实现细节

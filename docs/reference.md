@@ -184,7 +184,41 @@ python mock_datahub.py --host 192.168.1.137 --db 0 --alloc-start 1
 
 ---
 
-## 7. 文件结构
+## 7. ssh_runner.py（远程 Linux 执行）
+
+稳定性测试跑在远端时用它。GUI 的「远程 Linux」面板已封装好，
+这里是直接调用时的接口（也便于以后接命令行）。
+
+| 函数 / 方法 | 说明 |
+|---|---|
+| `check_remote(host, port, user, pwd, remote_dir)` | 只读体检：连通性 + python3 + openpyxl + 目录状态。返回 `(ok, 文本)` |
+| `run_remote(host, port, user, pwd, remote_dir, cmd, uploads, download, on_line)` | 一次性：连接 → 上传 → 执行 → 下载 → 关闭。返回退出码 |
+| `build_nohup_cmd(cmd, name, ts)` | 包成 `setsid + nohup + 三 fd 断开` 的后台形式，返回 `(命令, 日志路径)` |
+| `SshSession(...)` | 会话对象：`.connect()` / `.upload(files)` / `.run(cmd, download)` / `.download_all(cfg)` / `.close()` |
+
+**上传的 `files`** 是 `[(本地路径, 远端路径), ...]`，**只传本地比远端新的**（对比 mtime），
+所以重复运行几乎不耗时。
+
+**下载的 `download`** 结构：
+
+```python
+{"dirs": [{"remote": "<远端目录>/out/soak",
+           "local":  "out/soak",
+           "patterns": ["*_trend.csv", "*_summary.json", "*_soak.log"]}]}
+```
+
+* `.run(cmd, download=...)`：执行前后做快照，**只下载本次新增/更新的**（避免拉历史）
+* `.download_all(cfg)`：**无条件全部下载** —— 用在"跑完后再取结果"的场景。
+  ⚠ 这种场景必须用 `download_all`：那时快照是空的，走"只下新增"会把刚产出的文件
+  误判成历史文件而跳过（踩过）。
+
+> **shell 转义**：Redis 密码形如 `QianLong@2026&`，`&` 在 shell 里是后台执行符。
+> GUI 构造远端命令时对每个参数做 `shlex.quote`，否则命令会被截断。
+> 直接调用 `run_remote` 时请自己保证这一点。
+
+---
+
+## 8. 文件结构
 
 | 文件 | 说明 |
 |---|---|
@@ -202,6 +236,7 @@ python mock_datahub.py --host 192.168.1.137 --db 0 --alloc-start 1
 | `safety.py` | 安全闸判据（`send_test` / `mock_strategy` 共用） |
 | `resp_min.py` | 纯 socket 的 Redis RESP 客户端（不依赖 redis-py，Linux 3.9 也能跑） |
 | `check_env.py` | 只读环境体检（连之前先跑它） |
+| `ssh_runner.py` | **SSH 远程执行**：连接/上传/执行/回传/下载（稳定性测试跑 Linux 用，见第 7 节） |
 | `mock_datahub.py` | ○**可选** — 模拟数据中台，仅在「测完整上线握手」或「观察真中台」时需要 |
 | `config.py` `config.ini` | 共享配置（CLI 参数优先） |
 | `tests/` | 辅助工具（不是测试） |
@@ -210,7 +245,7 @@ python mock_datahub.py --host 192.168.1.137 --db 0 --alloc-start 1
 
 ---
 
-## 8. 输出与指标口径
+## 9. 输出与指标口径
 
 | 产物 | 内容 |
 |---|---|

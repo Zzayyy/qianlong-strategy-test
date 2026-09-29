@@ -399,6 +399,10 @@ python make_excel.py --interface remove --bulk-normal 10000 --ref-seq 501
 > `datahub_test` 那边只跑 query 查询接口，所以是"单接口循环"；
 > 策略方向这条链路是 **增加/修改/删除**，所以要按业务顺序成组跑。
 
+> 📖 **业务流 + 跑 Linux 的逐步教程见
+> [flow-soak-tutorial.md](flow-soak-tutorial.md)**（含 GUI 截图级步骤、nohup 长稳、
+> 排查表、收尾清理）。下面这节是速查。
+
 ### 7.1 业务流模式（`--flow`）——推荐
 
 一组 = **1w 个 create → 1w 个 modify → 1w 个 remove**（数量由 `--batch` 定），
@@ -477,7 +481,48 @@ python soak_test.py --assign-id 50 --interface account --type normal \
     --max-outstanding 100 --max-timeout-reply 100
 ```
 
-### 7.3 输出与判据
+### 7.3 跑在 Linux 上（推荐做长稳）
+
+稳定性测试**建议跑在 Linux 上**（长稳不受 Windows 休眠/断网影响，也与现场一致）。
+
+**GUI**：右栏「**远程 Linux**」面板 →
+
+1. 勾「启用远程执行」
+2. 填 主机 / 端口 / 用户 / 密码 / 远端目录
+3. 点「**测试连接**」确认环境可用（会打印远端 python3、openpyxl 版本）
+4. 回到「运行稳定性测试」
+
+勾上后 GUI 会自动：**上传脚本与数据表**（只传比远端新的）→ **远端执行** →
+**实时回传输出** → 跑完**自动下载** `trend.csv` / `summary.json` / `soak.log` 到本地 `out/soak/`。
+
+> **远端目录用独立的**（默认 `/home/yangsh/so_test/strategy_soak`）。
+> 别直接写现场在用的目录 —— 上传会覆盖同名文件（`send_test.py` 等）。
+> 第一次运行会自动创建。
+
+**后台模式（长稳强烈推荐）**：勾「后台运行(nohup)」
+
+* 命令以 `setsid + nohup` 提交后**立即返回**（实测 0.7 秒），不占住 SSH
+* **关掉 GUI / 断开网络，远端照样继续跑**
+* 远端日志：`<远端目录>/out/soak/soak_<名>_<时间>_nohup.log`
+* ⚠ 后台模式**不会自动下载结果**（启动瞬间还没有结果）——
+  跑完后再点「**下载远端结果**」取回
+* 要提前停：点「**停止远端**」（远端执行 `pkill -INT -f soak_test.py`，
+  优雅停止并保留 `summary.json`；**别用 `-9`**，会丢汇总）
+
+**命令行等价写法**：直接把同样的命令 `scp` 上去跑即可，例如
+
+```bash
+scp -r strategy_test user@192.168.1.136:/home/user/strategy_soak
+ssh user@192.168.1.136
+cd /home/user/strategy_soak
+setsid nohup python3 soak_test.py --assign-id 94 --flow --batch 10000 \
+    --hours 8 --workers 8 --wait 30 > out/soak/nohup.log 2>&1 < /dev/null &
+```
+
+> 远端**不需要** `redis-py`（本工具用纯 socket 的 `resp_min.py`），
+> 只需 Python 3.8+ 和 `openpyxl`（缺了会退化成 CSV，不影响跑）。
+
+### 7.4 输出与判据
 
 输出（`out/soak/`）：
 

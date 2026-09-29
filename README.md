@@ -72,7 +72,8 @@ cd strategy_test
 
 | 文档 | 内容 |
 |---|---|
-| **[docs/guide.md](docs/guide.md)** | 怎么用：GUI 逐项操作、命令行变体、看报文、打真平台、Pwd 加密、用例与批量数据、稳定性测试、异常排查 |
+| **[docs/flow-soak-tutorial.md](docs/flow-soak-tutorial.md)** | 🆕 **业务流稳定性测试完整教程**（create→modify→remove 全流程 + 跑 Linux/nohup） |
+| **[docs/guide.md](docs/guide.md)** | 怎么用：GUI 逐项操作、命令行变体、看报文、打真平台、Pwd 加密、用例与批量数据、稳定性测试（含**跑 Linux**）、异常排查 |
 | **[docs/reference.md](docs/reference.md)** | 查参数：四个脚本的全部参数、文件结构、输出指标口径 |
 | **[docs/dev-notes.md](docs/dev-notes.md)** | 改代码前必读：硬约束、踩坑记录、判据由来、协议验证证据 |
 
@@ -84,6 +85,7 @@ cd strategy_test
 | `send_test.py` | ★**必起** — 手动 XADD 发送器 + 性能统计 |
 | `mock_strategy.py` | ★**必起** — 模拟策略平台（收 `ST-N`、回包、上线+心跳） |
 | `soak_test.py` | 稳定性测试编排（连续跑几小时看指标劣化） |
+| `ssh_runner.py` | SSH 远程执行（稳定性测试跑 Linux 用：上传/执行/回传/下载） |
 | `make_excel.py` | **用例生成器**：按 `interfaces/` 定义生成 `data/{接口}.xlsx` |
 | `interfaces/` | **接口定义**（五个接口）+ `_common.py` |
 | `check_env.py` | **只读**环境体检（连之前先跑它） |

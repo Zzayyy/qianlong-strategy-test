@@ -1,5 +1,6 @@
 # 通用/远程
-paramiko>=3.0.0       # 可选：SSH 远程执行（参考 datahub_test/gui_test.py 的用法）
+paramiko>=3.0.0       # 稳定性测试跑远程 Linux 时用（ssh_runner.py）
+                      # 只影响「远程 Linux」功能；本地跑不需要
 
 # 测试数据 / 统计输出
 openpyxl>=3.1.0       # perf_stats.write_excel 写 xlsx；缺失时自动退化成 CSV

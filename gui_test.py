@@ -140,6 +140,64 @@ def ini_get(cp, sec, key, default=""):
 
 
 # ==================== 子进程：一次性命令 ====================
+class SshSoakWorker(QThread):
+    """在远程 Linux 上跑稳定性测试（连接 → 上传 → 执行 → 下载），实时回传输出。
+
+    为什么稳定性测试要跑在 Linux 上：长时间不受 Windows 休眠/断网影响，
+    且与现场环境一致（datahub_test 那边的 .so 也必须在 Linux 上跑）。
+    """
+
+    line = Signal(str)
+    finished_rc = Signal(int)
+
+    def __init__(self, host, port, user, pwd, remote_dir, jobs,
+                 uploads=None, downloads=None, on_line=None, parent=None):
+        """jobs = [(label, shell_cmd), ...] 顺序执行；downloads = [cfg, ...] 与之一一对应。"""
+        super().__init__(parent)
+        self.host = host
+        self.port = port
+        self.user = user
+        self.pwd = pwd
+        self.remote_dir = remote_dir
+        self.jobs = list(jobs)
+        self.uploads = list(uploads or [])
+        self.downloads = list(downloads or [])
+        self._stop = False
+        self._session = None
+
+    def run(self):
+        import ssh_runner as SR
+        rc_last = 0
+        try:
+            self._session = SR.SshSession(
+                self.host, self.port, self.user, self.pwd, self.remote_dir,
+                on_line=self.line.emit)
+            self._session.connect()
+            if self.uploads:
+                self.line.emit("[SSH] 同步脚本与数据（只传比远程新的）...")
+                self._session.upload(self.uploads)
+            for i, (label, cmd) in enumerate(self.jobs):
+                if self._stop:
+                    break
+                if len(self.jobs) > 1:
+                    self.line.emit("─" * 60)
+                    self.line.emit("[SSH] (%d/%d) %s" % (i + 1, len(self.jobs), label))
+                dl = self.downloads[i] if i < len(self.downloads) else None
+                rc_last = self._session.run(cmd, download=dl)
+                if rc_last != 0 or self._stop:
+                    break
+        except Exception as e:
+            self.line.emit("[SSH][ERROR] %s" % e)
+            rc_last = -1
+        finally:
+            if self._session:
+                self._session.close()
+        self.finished_rc.emit(rc_last)
+
+    def stop(self):
+        self._stop = True
+
+
 class Worker(QThread):
     """跑一次性命令（预览/发送/自测），实时回传输出。支持多条命令顺序执行。"""
 
@@ -420,6 +478,17 @@ class MainWindow(QWidget):
             if hasattr(self, "chk_svc_refecho"):
                 self.cp.set("gui", "svc_refecho",
                             "1" if self.chk_svc_refecho.isChecked() else "0")
+            # 远程 Linux（稳定性测试跑在远端）
+            if hasattr(self, "chk_remote"):
+                self.cp.set("gui", "remote",
+                            "1" if self.chk_remote.isChecked() else "0")
+                self.cp.set("gui", "ssh_host", self.edit_ssh_host.text().strip())
+                self.cp.set("gui", "ssh_port", str(self.spin_ssh_port.value()))
+                self.cp.set("gui", "ssh_user", self.edit_ssh_user.text().strip())
+                self.cp.set("gui", "ssh_pass", self.edit_ssh_pass.text())
+                self.cp.set("gui", "ssh_dir", self.edit_ssh_dir.text().strip())
+                self.cp.set("gui", "ssh_nohup",
+                            "1" if self.chk_ssh_nohup.isChecked() else "0")
             # 「每次发送前自动清空日志」记住用户的选择（纯偏好，无风险）
             self.cp.set("gui", "autoclear_log",
                         "1" if self.chk_autoclear.isChecked() else "0")
@@ -1299,6 +1368,190 @@ class MainWindow(QWidget):
     def _soak_by_rounds(self):
         return (self.combo_soak_mode.currentData() or "hours") == "rounds"
 
+    def _box_remote(self):
+        """远程 Linux：稳定性测试跑在远端（长时间不受 Windows 休眠/断网影响）。"""
+        box = CollapsibleBox("远程 Linux（稳定性测试跑在远端）")
+        box.setExpanded(ini_get(self.cp, "gui", "box_remote", "0") == "1")
+        g = QGridLayout(box.content)
+
+        self.chk_remote = QCheckBox("启用远程执行（稳定性测试在 Linux 上跑）")
+        self.chk_remote.setChecked(
+            ini_get(self.cp, "gui", "remote", "0") == "1")
+        self.chk_remote.setToolTip(
+            "勾上后，「运行稳定性测试」会通过 SSH 在远程 Linux 上执行：\n"
+            "  · 自动上传脚本与数据表（只传比远程新的，不会每次全量）\n"
+            "  · 实时把远端输出回传到下面日志框\n"
+            "  · 跑完自动下载 trend.csv / summary.json / soak.log 到本地\n\n"
+            "★ 为什么建议跑 Linux：长时间长稳不受 Windows 休眠/断网影响，\n"
+            "  也和现场环境一致（datahub_test 的 .so 同样只能在 Linux 上跑）。\n\n"
+            "不勾 = 在本地 Windows 上跑（也能用，但长稳容易被系统干扰）。")
+
+        self.edit_ssh_host = QLineEdit(ini_get(self.cp, "gui", "ssh_host", "192.168.1.136"))
+        self.spin_ssh_port = QSpinBox()
+        self.spin_ssh_port.setRange(1, 65535)
+        self.spin_ssh_port.setValue(
+            int(float(ini_get(self.cp, "gui", "ssh_port", "22") or 22)))
+        self.spin_ssh_port.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_ssh_port.setMaximumWidth(80)
+        self.edit_ssh_user = QLineEdit(ini_get(self.cp, "gui", "ssh_user", "yangsh"))
+        self.edit_ssh_pass = QLineEdit(ini_get(self.cp, "gui", "ssh_pass", ""))
+        self.edit_ssh_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_ssh_dir = QLineEdit(
+            ini_get(self.cp, "gui", "ssh_dir", "/home/yangsh/so_test/strategy_soak"))
+        self.edit_ssh_dir.setToolTip(
+            "远端存放脚本与数据的目录。\n"
+            "★ 建议用【独立目录】，别直接写现场在用的目录 —— 上传会覆盖同名文件。\n"
+            "第一次运行会自动创建。")
+        self.chk_ssh_nohup = QCheckBox("后台运行(nohup)：启动后立即返回，断开也不停")
+        self.chk_ssh_nohup.setChecked(
+            ini_get(self.cp, "gui", "ssh_nohup", "0") == "1")
+        self.chk_ssh_nohup.setToolTip(
+            "把稳定性测试放到远端后台执行（setsid + nohup）后立即返回，不占住 SSH：\n"
+            "  · 关掉 GUI / 断开网络，远端照样继续跑（长稳推荐）\n"
+            "  · 远端日志：<目录>/out/soak/soak_<名>_<时间>_nohup.log\n"
+            "  · 停止：ssh 上去 pkill -INT -f soak_test.py（别用 -9，会丢 summary.json）\n\n"
+            "★ 后台模式【不会自动下载结果】（启动瞬间还没有结果）——\n"
+            "  跑完后再点「下载远端结果」取回。")
+
+        btn_test = QPushButton("测试连接")
+        btn_test.clicked.connect(self.on_test_ssh)
+        btn_dl = QPushButton("下载远端结果")
+        btn_dl.setToolTip("把远端 out/soak 下的 trend.csv / summary.json / soak.log 取回本地")
+        btn_dl.clicked.connect(self.on_download_remote)
+        btn_ssh_stop = QPushButton("停止远端")
+        btn_ssh_stop.setToolTip("在远端执行 pkill -INT -f soak_test.py（优雅停止，保留 summary.json）")
+        btn_ssh_stop.clicked.connect(self.on_stop_remote)
+
+        self.lbl_remote = QLabel("")
+        self.lbl_remote.setWordWrap(True)
+        self.lbl_remote.setStyleSheet("color:#666;")
+
+        g.addWidget(self.chk_remote, 0, 0, 1, 4)
+        g.addWidget(QLabel("主机"), 1, 0)
+        g.addWidget(self.edit_ssh_host, 1, 1)
+        g.addWidget(QLabel("端口"), 1, 2)
+        g.addWidget(self.spin_ssh_port, 1, 3)
+        g.addWidget(QLabel("用户"), 2, 0)
+        g.addWidget(self.edit_ssh_user, 2, 1)
+        g.addWidget(QLabel("密码"), 2, 2)
+        g.addWidget(self.edit_ssh_pass, 2, 3)
+        g.addWidget(QLabel("远端目录"), 3, 0)
+        g.addWidget(self.edit_ssh_dir, 3, 1, 1, 3)
+        g.addWidget(self.chk_ssh_nohup, 4, 0, 1, 4)
+        g.addWidget(btn_test, 5, 0)
+        g.addWidget(btn_dl, 5, 1)
+        g.addWidget(btn_ssh_stop, 5, 2, 1, 2)
+        g.addWidget(self.lbl_remote, 6, 0, 1, 4)
+
+        self.guard.install(self.edit_ssh_host, self.spin_ssh_port,
+                           self.edit_ssh_user, self.edit_ssh_pass,
+                           self.edit_ssh_dir)
+        for w in (self.edit_ssh_host, self.edit_ssh_user, self.edit_ssh_dir,
+                  self.edit_ssh_pass):
+            w.textChanged.connect(self._update_remote_hint)
+        self.spin_ssh_port.valueChanged.connect(self._update_remote_hint)
+        self.chk_remote.toggled.connect(self._update_remote_hint)
+        self._update_remote_hint()
+        return box
+
+    def _remote_dir(self):
+        return self.edit_ssh_dir.text().strip().rstrip("/")
+
+    def _remote_on(self):
+        return hasattr(self, "chk_remote") and self.chk_remote.isChecked()
+
+    def _update_remote_hint(self):
+        try:
+            if self._remote_on():
+                self.lbl_remote.setText(
+                    "目标: %s@%s:%d  →  %s"
+                    % (self.edit_ssh_user.text().strip(),
+                       self.edit_ssh_host.text().strip(),
+                       self.spin_ssh_port.value(), self._remote_dir()))
+                self.lbl_remote.setStyleSheet("color:#0a5;")
+            else:
+                self.lbl_remote.setText("未启用：稳定性测试在本地 Windows 上跑")
+                self.lbl_remote.setStyleSheet("color:#888;")
+        except Exception:
+            pass
+
+    def _remote_session_kw(self):
+        return dict(host=self.edit_ssh_host.text().strip(),
+                    port=self.spin_ssh_port.value(),
+                    user=self.edit_ssh_user.text().strip(),
+                    pwd=self.edit_ssh_pass.text(),
+                    remote_dir=self._remote_dir())
+
+    def on_test_ssh(self):
+        """只读体检远端环境（不跑任何测试）。"""
+        kw = self._remote_session_kw()
+        self.append_log("")
+        self.append_log("[SSH] 测试连接 %s@%s:%d ..."
+                        % (kw["user"], kw["host"], kw["port"]))
+        try:
+            import ssh_runner as SR
+        except Exception as e:
+            self.append_log("[SSH][ERROR] 载入 ssh_runner 失败: %s" % e)
+            return
+        ok, txt = SR.check_remote(kw["host"], kw["port"], kw["user"], kw["pwd"],
+                                  kw["remote_dir"])
+        for ln in txt.splitlines():
+            self.append_log("  " + ln)
+        self.append_log("[SSH] %s" % ("连接可用 ✓" if ok else "连接失败 ✗"))
+
+    def on_download_remote(self):
+        """把远端 out/soak 的结果文件下载回本地。"""
+        kw = self._remote_session_kw()
+        local = os.path.join(OUT_DIR, "soak")
+        self.append_log("[SSH] 下载远端结果 → %s" % local)
+        try:
+            import ssh_runner as SR
+        except Exception as e:
+            self.append_log("[SSH][ERROR] %s" % e)
+            return
+        dl = {"dirs": [{
+            "remote": kw["remote_dir"] + "/out/soak",
+            "local": local,
+            "patterns": ["*_trend.csv", "*_summary.json", "*_soak.log",
+                         "*_nohup.log", "*.json"],
+        }]}
+        try:
+            s = SR.SshSession(kw["host"], kw["port"], kw["user"], kw["pwd"],
+                              kw["remote_dir"], on_line=self.append_log)
+            s.connect()
+            try:
+                # ★ 用 download_all：主动取结果时不做"只下新增"过滤，
+                #   否则刚跑完的文件会被当成历史文件跳过。
+                s.download_all(dl)
+            finally:
+                s.close()
+        except Exception as e:
+            self.append_log("[SSH][ERROR] %s" % e)
+
+    def on_stop_remote(self):
+        """在远端优雅停止 soak（保留 summary.json）。
+
+        ★ 检测存活必须用 `[s]oak_test.py` 这种方括号写法：
+          直接写 `pgrep -f soak_test.py` 会匹配到【执行这条命令的 shell 自己】
+          （它的命令行里含这个字符串），于是永远报"仍在运行"。
+          实测踩过：没有 soak 进程时也输出"仍在运行"。
+        """
+        kw = self._remote_session_kw()
+        if not self._ask("确认停止", "在远端执行 pkill -INT -f soak_test.py？\n"
+                                    "（优雅停止，会写出 summary.json）"):
+            return
+        self.append_log("[SSH] 远端停止 ...")
+        try:
+            import ssh_runner as SR
+            rc = SR.run_remote(kw["host"], kw["port"], kw["user"], kw["pwd"],
+                               kw["remote_dir"],
+                               "pkill -INT -f soak_test.py; sleep 1; "
+                               "pgrep -f '[s]oak_test.py' >/dev/null "
+                               "&& echo 仍在运行 || echo 已停止",
+                               on_line=self.append_log)
+        except Exception as e:
+            self.append_log("[SSH][ERROR] %s" % e)
+
     def _sync_soak_visibility(self):
         on = self.chk_soak.isChecked()
         self.soak_params.setVisible(on)
@@ -1575,12 +1828,102 @@ class MainWindow(QWidget):
                                rounds_txt, self.spin_soak_batch.value(),
                                self._stream_name()))
         self.append_log("#" * 60)
-        self.append_log("[提示] soak 在子进程里跑；进度可直接看上面的输出，"
-                        "或 out/soak/soak_*_soak.log")
         self._soak_running = True
         self._sync_soak_button()
-        cmds = [self.build_soak_cmd(n) for n in names]
-        self._run(cmds, on_done=lambda rc: self._after_soak(rc, names))
+        if self._remote_on():
+            # ---- 远程 Linux：上传脚本+数据 → 远端执行 → 下载结果 ----
+            self._start_remote_soak(names, flow)
+        else:
+            self.append_log("[提示] soak 在子进程里跑；进度可直接看上面的输出，"
+                            "或 out/soak/soak_*_soak.log")
+            cmds = [self.build_soak_cmd(n) for n in names]
+            self._run(cmds, on_done=lambda rc: self._after_soak(rc, names))
+
+    # ---------------- 远程稳定性测试 ----------------
+    def _remote_uploads_for(self, flow):
+        """要同步到远端的文件：脚本 + 依赖模块 + 接口定义 + 数据表。
+
+        ★ 只传【比远端新的】，所以重复运行几乎不耗时。
+        ⚠ 不传 config.ini —— 远端的 Redis 地址由命令行的 --host/--db 决定，
+          免得覆盖掉远端现场配置。
+        """
+        rd = self._remote_dir()
+        up = [
+            ("soak_test.py", "soak_test.py"),
+            ("send_test.py", "send_test.py"),
+            ("perf_stats.py", "perf_stats.py"),
+            ("excel_loader.py", "excel_loader.py"),
+            ("protocol.py", "protocol.py"),
+            ("safety.py", "safety.py"),
+            ("resp_min.py", "resp_min.py"),
+            ("make_excel.py", "make_excel.py"),
+            ("config.py", "config.py"),
+            ("interfaces/_common.py", "interfaces/_common.py"),
+        ]
+        # 业务流模式要 create/modify/remove 三个接口定义 + 三张表
+        ifaces = ["create", "modify", "remove"] if flow else self.selected_interfaces()
+        for n in ifaces:
+            up.append(("interfaces/%s.py" % n, "interfaces/%s.py" % n))
+            up.append(("data/%s.xlsx" % n, "data/%s.xlsx" % n))
+        out = []
+        for rel, rrel in up:
+            local = os.path.join(BASE_DIR, rel.replace("/", os.sep))
+            if os.path.exists(local):
+                out.append((local, rd + "/" + rrel))
+        return out, ifaces
+
+    def _build_remote_cmd(self, name, flow):
+        """构造在远端执行的命令（python3 + 脚本 + 参数）。
+
+        ★ 参数必须做 shell 转义：Redis 密码形如 `QianLong@2026&`，
+          其中的 `&` 在 shell 里是【后台执行符】，不转义会把命令截断
+          （后半截变成独立命令，轻则参数丢失，重则误执行）。
+        """
+        import shlex
+        a = self.build_soak_cmd(name)
+        # 本地是 [PYTHON, 绝对路径/soak_test.py, 参数...]；远端要换成
+        # ["python3", "soak_test.py", 参数...]（相对远端目录）
+        args = [str(x) for x in a[2:]]
+        parts = ["python3", "soak_test.py"] + [shlex.quote(x) for x in args]
+        cmd = " ".join(parts)
+        if self.chk_ssh_nohup.isChecked():
+            import ssh_runner as SR
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            safe = "flow" if flow else name
+            cmd, logf = SR.build_nohup_cmd(cmd, safe, ts)
+            self.append_log("[SSH] 后台模式：远端日志 %s" % logf)
+        return cmd
+
+    def _start_remote_soak(self, names, flow):
+        kw = self._remote_session_kw()
+        uploads, ifaces = self._remote_uploads_for(flow)
+        jobs, dls = [], []
+        local_soak = os.path.join(OUT_DIR, "soak")
+        for n in names:
+            label = "业务流 create→modify→remove" if flow else n
+            jobs.append((label, self._build_remote_cmd(n, flow)))
+            if self.chk_ssh_nohup.isChecked():
+                dls.append(None)          # 后台模式：启动即返回，没有结果可下
+            else:
+                # 远端 soak 的输出按 <name> 匹配；业务流的实际前缀是
+                # soak_流create-modify-remove_*，所以用通配符兜住两种情况
+                pats = ["*_trend.csv", "*_summary.json", "*_soak.log", "*.json"]
+                dls.append({"dirs": [{
+                    "remote": kw["remote_dir"] + "/out/soak",
+                    "local": local_soak, "patterns": pats}]})
+        self.append_log("[SSH] 目标 %s@%s:%d  目录 %s"
+                        % (kw["user"], kw["host"], kw["port"], kw["remote_dir"]))
+        self.append_log("[SSH] 将同步 %d 个文件（只传比远端新的）" % len(uploads))
+        if self.chk_ssh_nohup.isChecked():
+            self.append_log("[SSH] 后台模式：启动后立即返回，结果不会自动下载；"
+                            "跑完点「下载远端结果」取回")
+        self.worker = SshSoakWorker(
+            kw["host"], kw["port"], kw["user"], kw["pwd"], kw["remote_dir"],
+            jobs, uploads=uploads, downloads=dls, parent=self)
+        self.worker.line.connect(self.append_log)
+        self.worker.finished_rc.connect(
+            lambda rc: self._on_done(rc, lambda r: self._after_soak(r, names)))
+        self.worker.start()
 
     def _after_soak(self, rc, names):
         self._soak_running = False
@@ -1695,6 +2038,7 @@ class MainWindow(QWidget):
         lay.addWidget(box2)
 
         # 连接 / 身份 / 输出（从原左栏搬过来）
+        lay.addWidget(self._box_remote())
         lay.addWidget(self._box_conn())
         lay.addWidget(self._box_identity())
         lay.addWidget(self._box_misc())
