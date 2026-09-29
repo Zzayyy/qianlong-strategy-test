@@ -11,10 +11,11 @@ gui_test.py —— 策略平台测试 GUI（PySide6）
 
 界面结构（参照 datahub_test/gui_test.py 的布局习惯）：
     顶栏        标题 + 当前连接摘要
-    左栏(可滚动) 1 连接设置 → 2 策略平台身份 → 3 测试数据 → 4 发送参数 → 5 输出
-    右栏        服务管理（起/停 Mock 策略平台 / Mock 数据中台）
+    左栏(可滚动) 1 测试数据 → 2 发送参数（含 稳定性测试 分区）
+    右栏(可滚动) 服务管理（起/停 Mock 策略平台/数据中台）
+                 + 连接设置 / 策略平台身份 / 输出
     下栏标签页   运行日志 | 统计汇总（各带一条工具条）
-    底部按钮    预览报文 | 开始发送 | 停止
+    底部按钮    预览报文 | 运行稳定性测试 | 开始发送 | 停止
 
 依赖：venv 已装 PySide6 + openpyxl。
 运行：venv/Scripts/python.exe gui_test.py
@@ -467,7 +468,7 @@ class MainWindow(QWidget):
         self.lbl_conn = QLabel("")
         self.lbl_conn.setStyleSheet("color: #666;")
         self.lbl_conn.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_conn.setToolTip("当前生效的 Redis 连接，可在左上「1 连接设置」修改")
+        self.lbl_conn.setToolTip("当前生效的 Redis 连接，可在右栏「连接设置」修改")
         root.addWidget(self.lbl_conn)
 
         self.vsplit = QSplitter(Qt.Orientation.Vertical)
@@ -484,8 +485,13 @@ class MainWindow(QWidget):
 
         root.addLayout(self._build_actions())
 
-    # ---- 左栏 ----
+    # ---- 左栏：只管「发什么」----
     def _build_left(self):
+        """左栏 = 1 测试数据 → 2 发送参数（含稳定性测试分区）。
+
+        布局参考 datahub_test/gui_test.py：连接/身份/输出/服务都搬到右栏，
+        让左栏专注「要发什么」，从上到下一条主流程走完。
+        """
         outer = QWidget()
         ol = QVBoxLayout(outer)
         ol.setContentsMargins(0, 0, 0, 0)
@@ -496,12 +502,8 @@ class MainWindow(QWidget):
         lay.setContentsMargins(0, 0, 4, 0)
         lay.setSpacing(6)
 
-        lay.addWidget(self._box_conn())
-        lay.addWidget(self._box_identity())
         lay.addWidget(self._box_data())
         lay.addWidget(self._box_send())
-        lay.addWidget(self._box_misc())
-        lay.addWidget(self._box_soak())
         lay.addStretch(1)
 
         scroll = QScrollArea()
@@ -513,7 +515,7 @@ class MainWindow(QWidget):
         return outer
 
     def _box_conn(self):
-        box = CollapsibleBox("1. 连接设置 (Redis)")
+        box = CollapsibleBox("连接设置 (Redis)")
         g = QGridLayout(box.content)
         self.edit_host = QLineEdit(ini_get(self.cp, "redis", "host", "192.168.1.137"))
         self.spin_port = QSpinBox()
@@ -553,7 +555,7 @@ class MainWindow(QWidget):
         return box
 
     def _box_identity(self):
-        box = CollapsibleBox("2. 策略平台身份 (决定下发流 ST-<编号>)")
+        box = CollapsibleBox("策略平台身份 (决定下发流 ST-<编号>)")
         g = QGridLayout(box.content)
         self.spin_assign = QSpinBox()
         self.spin_assign.setRange(0, 100000)
@@ -607,7 +609,8 @@ class MainWindow(QWidget):
         return box
 
     def _box_data(self):
-        box = CollapsibleBox("3. 测试数据 (Excel: data/*.xlsx)")
+        box = CollapsibleBox("1. 测试数据 (Excel: data/*.xlsx)")
+        box.setExpanded(True)
         g = QGridLayout(box.content)
         names = CASES.list_interfaces() if CASES else \
             ["create", "modify", "remove", "pwdUpdate", "account"]
@@ -805,7 +808,20 @@ class MainWindow(QWidget):
         self._update_case_count()
 
     def _box_send(self):
-        box = CollapsibleBox("4. 发送参数")
+        """2. 发送参数 —— 含「规模与速率 / 回复处理 / 稳定性测试」三个分区。
+
+        分区标题用下划线样式分隔（同 datahub_test），视觉上把参数分组，
+        避免一长串控件看不出层次。
+        """
+        box = CollapsibleBox("2. 发送参数")
+        box.setExpanded(True)
+
+        def section(text):
+            """分区标题：跨 4 列，带下划线分隔。"""
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color:#3a5a8c; font-weight:bold; padding-top:8px;"
+                              " border-bottom:1px solid #d8dee8;")
+            return lbl
 
         def spin(lo, hi, val, w=100, tip="", dbl=False):
             s = QDoubleSpinBox() if dbl else QSpinBox()
@@ -872,9 +888,17 @@ class MainWindow(QWidget):
         self.chk_force_live.setChecked(False)
 
         g = QGridLayout(box.content)
+        g.setColumnStretch(1, 1)
+        g.setColumnStretch(3, 1)
+        g.setVerticalSpacing(6)
+
+        # ==================== A. 规模与速率 ====================
+        r = 0
+        g.addWidget(section("规模与速率"), r, 0, 1, 4)
+        r += 1
         g.addWidget(flabel("并发线程", "--workers", "并发发送线程数。命令行：--workers N"),
-                   0, 0)
-        g.addWidget(self.spin_workers, 0, 1)
+                   r, 0)
+        g.addWidget(self.spin_workers, r, 1)
         # 记住标签引用：按秒跑时要连标签一起置灰（和 datahub_test 一样）
         self.lbl_max = flabel(
             "总条数", "--max",
@@ -882,33 +906,47 @@ class MainWindow(QWidget):
             "★ 0 = 全部：当前筛选出的用例各发一次。\n"
             "命令行：--max N\n"
             "【按秒跑 > 0 时本项失效】改由「按秒跑」的秒数决定何时停。")
-        g.addWidget(self.lbl_max, 0, 2)
-        g.addWidget(self.spin_max, 0, 3)
+        g.addWidget(self.lbl_max, r, 2)
+        g.addWidget(self.spin_max, r, 3)
+        r += 1
         self.lbl_seconds = flabel(
             "按秒跑", "--seconds",
             "跑够这么多秒就停。0=不用（默认按「总条数」跑）。\n"
             "命令行：--seconds S\n"
             "★ 填了它就忽略「总条数」，用例会循环续发到时间用完。")
-        g.addWidget(self.lbl_seconds, 1, 0)
-        g.addWidget(self.spin_seconds, 1, 1)
+        g.addWidget(self.lbl_seconds, r, 0)
+        g.addWidget(self.spin_seconds, r, 1)
         g.addWidget(flabel("限速/秒", "--rate",
-                           "全局限速 条/秒。0=不限速。命令行：--rate R"), 1, 2)
-        g.addWidget(self.spin_rate, 1, 3)
+                           "全局限速 条/秒。0=不限速。命令行：--rate R"), r, 2)
+        g.addWidget(self.spin_rate, r, 3)
+        r += 1
+
+        # ==================== B. 回复处理 ====================
+        g.addWidget(section("回复处理"), r, 0, 1, 4)
+        r += 1
         g.addWidget(flabel("等回包 s", "--wait",
-                           "发完等回包的秒数。命令行：--wait S"), 2, 0)
-        g.addWidget(self.spin_wait, 2, 1)
+                           "发完等回包的秒数。命令行：--wait S"), r, 0)
+        g.addWidget(self.spin_wait, r, 1)
         g.addWidget(flabel("RTT 探测", "--sync-probe",
                            "压测后单发单收 N 次测真实 RTT。\n"
                            "★ 这 N 条是【额外真实报文】，不计入统计；\n"
                            "没回包时每条干等 5 秒（填 20 = 最多白等 100 秒）。\n"
-                           "命令行：--sync-probe N"), 2, 2)
-        g.addWidget(self.spin_sync, 2, 3)
+                           "命令行：--sync-probe N"), r, 2)
+        g.addWidget(self.spin_sync, r, 3)
+        r += 1
         g.addWidget(flabel("回包流", "--reply-stream",
-                           "留空=DataHub_reply_stream。命令行：--reply-stream NAME"), 3, 0)
-        g.addWidget(self.edit_reply_stream, 3, 1, 1, 3)
-        g.addWidget(self.chk_no_reply, 4, 0, 1, 2)
-        g.addWidget(self.chk_quiet, 4, 2, 1, 2)
-        g.addWidget(self.chk_force_live, 5, 0, 1, 4)
+                           "留空=DataHub_reply_stream。命令行：--reply-stream NAME"),
+                   r, 0)
+        g.addWidget(self.edit_reply_stream, r, 1, 1, 3)
+        r += 1
+        g.addWidget(self.chk_no_reply, r, 0, 1, 2)
+        g.addWidget(self.chk_quiet, r, 2, 1, 2)
+        r += 1
+        g.addWidget(self.chk_force_live, r, 0, 1, 4)
+        r += 1
+
+        # ==================== C. 稳定性测试(Soak) ====================
+        r = self._build_soak_section(g, section, r)
 
         # 「按秒跑」> 0 时「总条数」失效（send_test.py 会把 max 强制设 0），
         # 所以联动置灰，避免填了个没用的值还以为生效。做法同 datahub_test。
@@ -916,61 +954,14 @@ class MainWindow(QWidget):
         self._sync_end_mode()
         return box
 
-    def _sync_end_mode(self):
-        """按「按秒跑」是否启用，置灰/启用「总条数」。
-
-        send_test.py 里：
-            if seconds > 0:
-                sender.max_count = 0      # max 被丢弃
-                Timer(seconds, stop)
-        即两者互斥，同时填只有秒数算数。所以这里把用不上的那个灰掉。
-        """
-        by_time = self.spin_seconds.value() > 0
-        ok = not by_time
-        for w in (self.spin_max, getattr(self, "lbl_max", None)):
-            if w is not None:
-                w.setEnabled(ok)
-        # 置灰时明确说清"为什么灰"，而不是让人猜
-        if by_time:
-            self.spin_max.setToolTip(
-                "【当前被禁用】因为「按秒跑」填了 %s 秒 —— send_test.py 在按时间模式下\n"
-                "会把总条数强制设为 0（不限），改由秒数决定何时停。\n"
-                "想让总条数生效，请把「按秒跑」改成 0。"
-                % self.spin_seconds.value())
-        else:
-            self.spin_max.setToolTip(
-                "最多处理多少条（在「用例类型」筛选之后计算）。\n"
-                "★ 0 = 全部：当前筛选出的用例各发一次。\n"
-                "命令行：--max N\n"
-                "【按秒跑 > 0 时本项失效】改由「按秒跑」的秒数决定何时停。")
-
-    def _box_misc(self):
-        box = CollapsibleBox("5. 输出")
-        g = QGridLayout(box.content)
-        self.edit_label = QLineEdit("")
-        self.edit_label.setPlaceholderText("留空=接口_类型_时间戳")
-        self.edit_stats_out = QLineEdit(ini_get(self.cp, "gui", "stats_out", PERF_DIR))
-        btn_pick = QPushButton("选择目录")
-        btn_pick.clicked.connect(self._pick_stats_dir)
-        btn_open = QPushButton("打开输出目录")
-        btn_open.clicked.connect(self._open_out_dir)
-
-        g.addWidget(QLabel("标签"), 0, 0)
-        g.addWidget(self.edit_label, 0, 1, 1, 3)
-        g.addWidget(QLabel("统计目录"), 1, 0)
-        g.addWidget(self.edit_stats_out, 1, 1)
-        g.addWidget(btn_pick, 1, 2)
-        g.addWidget(btn_open, 1, 3)
-        return box
-
-    def _box_soak(self):
-        """6. 稳定性测试（长时间连续跑 + 趋势汇总）。
+    def _build_soak_section(self, g, section, r):
+        """把「稳定性测试」作为发送参数里的一个分区铺进去。返回下一行行号。
 
         复用 send_test.py（按轮调用）而不是另写一套发送逻辑，
         这样「稳定性测试」和「开始发送」的报文完全一致，测的才是同一个东西。
         """
-        box = CollapsibleBox("6. 稳定性测试 (Soak)")
-        g = QGridLayout(box.content)
+        g.addWidget(section("稳定性测试 (Soak)"), r, 0, 1, 4)
+        r += 1
 
         self.chk_soak = QCheckBox("启用稳定性测试（长时间连续跑 + 趋势汇总）")
         self.chk_soak.setChecked(ini_get(self.cp, "gui", "soak", "0") == "1")
@@ -979,13 +970,16 @@ class MainWindow(QWidget):
             "· 按轮反复调用 send_test.py（报文与「开始发送」完全一致）\n"
             "· 结束条件可选：按时长（默认 8h）或按轮数（短测用，跑够 N 轮收尾）\n"
             "· 只产出 trend.csv / summary.json / soak.log（避免几千个日志/表格）\n\n"
-            "接口/类型/目标流沿用左栏「3. 测试数据」和「2. 策略平台身份」的选择。")
-        g.addWidget(self.chk_soak, 0, 0, 1, 4)
+            "接口/类型/目标流沿用左栏「1. 测试数据」与右栏「策略平台身份」的选择。")
+        g.addWidget(self.chk_soak, r, 0, 1, 4)
+        r += 1
 
         # ---- 参数区：随勾选显示/隐藏 ----
         self.soak_params = QWidget()
         sp = QGridLayout(self.soak_params)
         sp.setContentsMargins(14, 0, 0, 0)
+        sp.setColumnStretch(1, 1)
+        sp.setColumnStretch(3, 1)
         sp.setVerticalSpacing(6)
 
         self.combo_soak_mode = QComboBox()
@@ -1018,11 +1012,11 @@ class MainWindow(QWidget):
             int(float(ini_get(self.cp, "gui", "soak_batch", "500") or 500)))
         self.spin_soak_batch.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.spin_soak_batch.setToolTip(
-            "每一轮发多少条（soak 用它覆盖 --max，不影响「4. 发送参数」里的总条数）。\n\n"
+            "每一轮发多少条（soak 用它覆盖 --max，不影响上面的「总条数」）。\n\n"
             "⚠ 这不是限速：真实速率 = 每轮条数 ÷ 每轮耗时，\n"
             "而每轮耗时含【固定开销】（起子进程 + 读 Excel + 写汇总，约 1~3 秒）。\n"
             "条数越小，被固定开销拉低的平均速率越明显。\n"
-            "想要恒定速率请用「4. 发送参数」里的「限速/秒」。")
+            "想要恒定速率请用上面的「限速/秒」。")
 
         sp.addWidget(QLabel("结束条件"), 0, 0)
         sp.addWidget(self.combo_soak_mode, 0, 1)
@@ -1119,7 +1113,8 @@ class MainWindow(QWidget):
         self.lbl_soak_hint.setStyleSheet("color:#666;")
         sp.addWidget(self.lbl_soak_hint, 7, 0, 1, 4)
 
-        g.addWidget(self.soak_params, 1, 0, 1, 4)
+        g.addWidget(self.soak_params, r, 0, 1, 4)
+        r += 1
 
         for w in (self.spin_soak_batch, self.spin_soak_rounds, self.spin_soak_hours,
                   self.spin_soak_gap, self.spin_soak_maxlag, self.spin_soak_maxpend):
@@ -1130,6 +1125,53 @@ class MainWindow(QWidget):
         self._sync_soak_visibility()
         self._sync_soak_mode()
         self._update_soak_hint()
+        return r
+
+    def _sync_end_mode(self):
+        """按「按秒跑」是否启用，置灰/启用「总条数」。
+
+        send_test.py 里：
+            if seconds > 0:
+                sender.max_count = 0      # max 被丢弃
+                Timer(seconds, stop)
+        即两者互斥，同时填只有秒数算数。所以这里把用不上的那个灰掉。
+        """
+        by_time = self.spin_seconds.value() > 0
+        ok = not by_time
+        for w in (self.spin_max, getattr(self, "lbl_max", None)):
+            if w is not None:
+                w.setEnabled(ok)
+        # 置灰时明确说清"为什么灰"，而不是让人猜
+        if by_time:
+            self.spin_max.setToolTip(
+                "【当前被禁用】因为「按秒跑」填了 %s 秒 —— send_test.py 在按时间模式下\n"
+                "会把总条数强制设为 0（不限），改由秒数决定何时停。\n"
+                "想让总条数生效，请把「按秒跑」改成 0。"
+                % self.spin_seconds.value())
+        else:
+            self.spin_max.setToolTip(
+                "最多处理多少条（在「用例类型」筛选之后计算）。\n"
+                "★ 0 = 全部：当前筛选出的用例各发一次。\n"
+                "命令行：--max N\n"
+                "【按秒跑 > 0 时本项失效】改由「按秒跑」的秒数决定何时停。")
+
+    def _box_misc(self):
+        box = CollapsibleBox("输出")
+        g = QGridLayout(box.content)
+        self.edit_label = QLineEdit("")
+        self.edit_label.setPlaceholderText("留空=接口_类型_时间戳")
+        self.edit_stats_out = QLineEdit(ini_get(self.cp, "gui", "stats_out", PERF_DIR))
+        btn_pick = QPushButton("选择目录")
+        btn_pick.clicked.connect(self._pick_stats_dir)
+        btn_open = QPushButton("打开输出目录")
+        btn_open.clicked.connect(self._open_out_dir)
+
+        g.addWidget(QLabel("标签"), 0, 0)
+        g.addWidget(self.edit_label, 0, 1, 1, 3)
+        g.addWidget(QLabel("统计目录"), 1, 0)
+        g.addWidget(self.edit_stats_out, 1, 1)
+        g.addWidget(btn_pick, 1, 2)
+        g.addWidget(btn_open, 1, 3)
         return box
 
     def _soak_by_rounds(self):
@@ -1287,11 +1329,19 @@ class MainWindow(QWidget):
         self.append_log("       trend.csv=每轮趋势 / summary.json=汇总 "
                         "/ soak.log=编排日志 / *_rounds/=异常轮明细")
 
-    # ---- 右栏 ----
+    # ---- 右栏：连接/身份/输出 + 服务管理 ----
     def _build_right(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
+        """右栏 = 服务管理 + 连接设置/策略平台身份/输出。
+
+        布局参考 datahub_test：左边只管"发什么"，右边放"连哪儿、以谁的身份、
+        结果存哪"，以及起停 Mock 服务。这样左栏就是一条从选数据到开跑的主流程。
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(0, 0, 4, 0)
         lay.setSpacing(6)
 
         # 服务管理
@@ -1353,10 +1403,10 @@ class MainWindow(QWidget):
         self.spin_dh_alloc.setToolTip(
             "从这里开始往后找没被占用的编号分配。\n"
             "分配结果会打印在下面日志里（★ 新策略平台上线 … → 分配编号 N），\n"
-            "拿到 N 后要把「2. 策略平台身份 → 分配编号」也改成 N，否则收不到回包！")
+            "拿到 N 后要把「策略平台身份 → 分配编号」也改成 N，否则收不到回包！")
         self.guard.install(self.spin_dh_alloc)
         hint = QLabel("只负责「回应上线、分配编号」；发报文用 send_test 或底部按钮。\n"
-                      "★ 启动后看日志里的「分配编号 N」，把它填到「2. 策略平台身份」。")
+                      "★ 启动后看日志里的「分配编号 N」，把它填到「策略平台身份」。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#0a5;")
         g2.addWidget(self.lbl_dh_st, 0, 0, 1, 2)
@@ -1366,8 +1416,16 @@ class MainWindow(QWidget):
         g2.addWidget(self.spin_dh_alloc, 2, 1)
         g2.addWidget(hint, 3, 0, 1, 2)
         lay.addWidget(box2)
+
+        # 连接 / 身份 / 输出（从原左栏搬过来）
+        lay.addWidget(self._box_conn())
+        lay.addWidget(self._box_identity())
+        lay.addWidget(self._box_misc())
         lay.addStretch(1)
-        return w
+
+        scroll.setWidget(inner)
+        self.right_scroll = scroll
+        return scroll
 
     # ---- 下栏 ----
     def _build_bottom(self):
@@ -1501,7 +1559,7 @@ class MainWindow(QWidget):
         self.btn_soak.clicked.connect(self.on_soak)
         self.btn_soak.setToolTip(
             "对勾选的每个接口依次运行 soak_test.py（反复调用 send_test.py）。\n\n"
-            "需先在左栏「6. 稳定性测试」勾选启用并设好参数。\n"
+            "需先在左栏「2. 发送参数 → 稳定性测试」勾选启用并设好参数。\n"
             "结果在 out/soak/：trend.csv（每轮趋势）/ summary.json / *_rounds/（异常轮）。")
         self._sync_soak_button()
 
@@ -1552,7 +1610,7 @@ class MainWindow(QWidget):
             self.spin_assign.setValue(sid)
             self._update_conn_summary()
             self.append_log(
-                "★ 已自动把「2. 策略平台身份 → 分配编号」同步为 %d（下发流 %s）"
+                "★ 已自动把「策略平台身份 → 分配编号」同步为 %d（下发流 %s）"
                 % (sid, "ST-%d" % sid))
 
     def _on_svc_state(self, tag, running):
