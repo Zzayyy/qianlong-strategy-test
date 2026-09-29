@@ -59,13 +59,16 @@ def log(msg, quiet=False, force=False):
 
 
 class Logger(object):
-    """同时往控制台和文件写。"""
+    """同时往控制台和文件写。path=None 时只走控制台（--no-run-log，供 soak 用）。"""
 
-    def __init__(self, path, quiet=False, echo=True):
+    def __init__(self, path=None, quiet=False, echo=True):
         self.quiet = quiet
         self.echo = echo
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        self.f = open(path, "a", encoding="utf-8")
+        self.path = path
+        self.f = None
+        if path:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            self.f = open(path, "a", encoding="utf-8")
         self.lock = threading.Lock()
         self.write("=" * 78)
         self.write("运行开始 %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -74,15 +77,17 @@ class Logger(object):
     def write(self, msg, force=False):
         line = "[%s] %s" % (ts(), msg)
         with self.lock:
-            self.f.write(line + "\n")
-            self.f.flush()
+            if self.f:
+                self.f.write(line + "\n")
+                self.f.flush()
         if (not self.quiet or force) and self.echo:
             print(line, flush=True)
 
     def close(self):
         try:
             self.write("运行结束 %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
-            self.f.close()
+            if self.f:
+                self.f.close()
         except Exception:
             pass
 
@@ -656,6 +661,9 @@ def build_parser(cp):
     ap.add_argument("--dump", default="",
                     help="把生成的报文写到这个 jsonl（便于复核）")
     ap.add_argument("--label", default="", help="统计标签")
+    ap.add_argument("--no-run-log", action="store_true",
+                    help="不写单轮运行日志文件（供 soak_test.py 复用："
+                         "一晚上几千轮会堆出几千个日志）")
     ap.add_argument("--force-live", action="store_true",
                     help="关掉「目标流有外来消费者」的安全闸，强行发送（危险："
                          "可能给真实策略平台下假单。确认过 check_env.py 再用）")
@@ -745,8 +753,11 @@ def main():
 
     # ---- 真正发送 ----
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    label = a.label or ("%s_%s_%s" % (interface, type_tag, stamp))
-    logfile = os.path.join(LOG_DIR, "%s.log" % label)
+    # SEND_RUN_SUFFIX：soak 每轮传进来，避免同一秒的标签互相覆盖
+    _suffix = os.environ.get("SEND_RUN_SUFFIX", "")
+    label = a.label or ("%s_%s_%s%s" % (interface, type_tag, stamp, _suffix))
+    # --no-run-log：soak 模式下不写单轮日志（否则几千轮 = 几千个文件）
+    logfile = None if a.no_run_log else os.path.join(LOG_DIR, "%s.log" % label)
     logger = Logger(logfile, quiet=bool(a.quiet))
 
     # ---- 解析「总条数」语义（对齐 datahub_test：0 = 全部）----
@@ -879,7 +890,8 @@ def main():
         except Exception as e:
             logger.write("写 refs 失败: %s" % e, force=True)
 
-    logger.write("日志: %s" % logfile, force=True)
+    if logfile:
+        logger.write("日志: %s" % logfile, force=True)
     logger.close()
     return 0
 

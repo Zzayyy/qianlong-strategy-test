@@ -355,6 +355,7 @@ class MainWindow(QWidget):
         self.resize(*self._initial_size())
         self.cp = load_ini()
         self.worker = None
+        self._soak_running = False      # soak 是否在跑（决定「运行稳定性测试」可点性）
         self.summary_loader = None
         self._rows = []
         self._batch_start = 0.0
@@ -420,6 +421,24 @@ class MainWindow(QWidget):
             self.cp.set("gui", "bulk_accounts", str(self.spin_bulk_accounts.value()))
             self.cp.set("gui", "bulk_start", str(self.spin_bulk_start.value()))
             self.cp.set("gui", "ref_map", self.edit_ref_map.text().strip())
+            # 稳定性测试参数（纯偏好，不点「运行」不会发任何数据）
+            if hasattr(self, "chk_soak"):
+                self.cp.set("gui", "soak",
+                            "1" if self.chk_soak.isChecked() else "0")
+                self.cp.set("gui", "soak_mode",
+                            self.combo_soak_mode.currentData() or "rounds")
+                self.cp.set("gui", "soak_rounds", str(self.spin_soak_rounds.value()))
+                self.cp.set("gui", "soak_hours", str(self.spin_soak_hours.value()))
+                self.cp.set("gui", "soak_batch", str(self.spin_soak_batch.value()))
+                self.cp.set("gui", "soak_gap", str(self.spin_soak_gap.value()))
+                self.cp.set("gui", "soak_clean",
+                            self.combo_soak_clean.currentData() or "monitor")
+                self.cp.set("gui", "soak_rotate",
+                            "1" if self.chk_soak_rotate.isChecked() else "0")
+                self.cp.set("gui", "soak_keep",
+                            "1" if self.chk_soak_keep.isChecked() else "0")
+                self.cp.set("gui", "soak_maxlag", str(self.spin_soak_maxlag.value()))
+                self.cp.set("gui", "soak_maxpend", str(self.spin_soak_maxpend.value()))
         except Exception:
             pass
 
@@ -482,6 +501,7 @@ class MainWindow(QWidget):
         lay.addWidget(self._box_data())
         lay.addWidget(self._box_send())
         lay.addWidget(self._box_misc())
+        lay.addWidget(self._box_soak())
         lay.addStretch(1)
 
         scroll = QScrollArea()
@@ -943,6 +963,330 @@ class MainWindow(QWidget):
         g.addWidget(btn_open, 1, 3)
         return box
 
+    def _box_soak(self):
+        """6. 稳定性测试（长时间连续跑 + 趋势汇总）。
+
+        复用 send_test.py（按轮调用）而不是另写一套发送逻辑，
+        这样「稳定性测试」和「开始发送」的报文完全一致，测的才是同一个东西。
+        """
+        box = CollapsibleBox("6. 稳定性测试 (Soak)")
+        g = QGridLayout(box.content)
+
+        self.chk_soak = QCheckBox("启用稳定性测试（长时间连续跑 + 趋势汇总）")
+        self.chk_soak.setChecked(ini_get(self.cp, "gui", "soak", "0") == "1")
+        self.chk_soak.setToolTip(
+            "勾选后展开下方参数，再点底部「运行稳定性测试」：\n"
+            "· 按轮反复调用 send_test.py（报文与「开始发送」完全一致）\n"
+            "· 结束条件可选：按时长（默认 8h）或按轮数（短测用，跑够 N 轮收尾）\n"
+            "· 只产出 trend.csv / summary.json / soak.log（避免几千个日志/表格）\n\n"
+            "接口/类型/目标流沿用左栏「3. 测试数据」和「2. 策略平台身份」的选择。")
+        g.addWidget(self.chk_soak, 0, 0, 1, 4)
+
+        # ---- 参数区：随勾选显示/隐藏 ----
+        self.soak_params = QWidget()
+        sp = QGridLayout(self.soak_params)
+        sp.setContentsMargins(14, 0, 0, 0)
+        sp.setVerticalSpacing(6)
+
+        self.combo_soak_mode = QComboBox()
+        self.combo_soak_mode.addItem("按时长", "hours")
+        self.combo_soak_mode.addItem("按轮数", "rounds")
+        _i = self.combo_soak_mode.findData(ini_get(self.cp, "gui", "soak_mode", "rounds"))
+        self.combo_soak_mode.setCurrentIndex(_i if _i >= 0 else 1)
+        self.combo_soak_mode.setToolTip(
+            "按轮数：跑够 N 轮即正常收尾（便于短测，几十秒就能验证整套流程）\n"
+            "按时长：连续跑到设定小时数（长稳用）")
+
+        self.spin_soak_rounds = QSpinBox()
+        self.spin_soak_rounds.setRange(1, 100000)
+        self.spin_soak_rounds.setValue(
+            int(float(ini_get(self.cp, "gui", "soak_rounds", "5") or 5)))
+        self.spin_soak_rounds.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_soak_rounds.setToolTip("跑够这么多轮就正常结束（优先于时长）")
+
+        self.spin_soak_hours = QDoubleSpinBox()
+        self.spin_soak_hours.setRange(0.01, 240)
+        self.spin_soak_hours.setDecimals(2)
+        self.spin_soak_hours.setValue(
+            float(ini_get(self.cp, "gui", "soak_hours", "8") or 8))
+        self.spin_soak_hours.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_soak_hours.setToolTip("连续跑多少小时（长稳用）")
+
+        self.spin_soak_batch = QSpinBox()
+        self.spin_soak_batch.setRange(1, 1000000)
+        self.spin_soak_batch.setValue(
+            int(float(ini_get(self.cp, "gui", "soak_batch", "500") or 500)))
+        self.spin_soak_batch.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_soak_batch.setToolTip(
+            "每一轮发多少条（soak 用它覆盖 --max，不影响「4. 发送参数」里的总条数）。\n\n"
+            "⚠ 这不是限速：真实速率 = 每轮条数 ÷ 每轮耗时，\n"
+            "而每轮耗时含【固定开销】（起子进程 + 读 Excel + 写汇总，约 1~3 秒）。\n"
+            "条数越小，被固定开销拉低的平均速率越明显。\n"
+            "想要恒定速率请用「4. 发送参数」里的「限速/秒」。")
+
+        sp.addWidget(QLabel("结束条件"), 0, 0)
+        sp.addWidget(self.combo_soak_mode, 0, 1)
+        sp.addWidget(QLabel("每轮条数"), 0, 2)
+        sp.addWidget(self.spin_soak_batch, 0, 3)
+        sp.addWidget(QLabel("轮数"), 1, 0)
+        sp.addWidget(self.spin_soak_rounds, 1, 1)
+        sp.addWidget(QLabel("时长(小时)"), 1, 2)
+        sp.addWidget(self.spin_soak_hours, 1, 3)
+
+        self.spin_soak_gap = QDoubleSpinBox()
+        self.spin_soak_gap.setRange(0, 3600)
+        self.spin_soak_gap.setDecimals(1)
+        self.spin_soak_gap.setValue(
+            float(ini_get(self.cp, "gui", "soak_gap", "0") or 0))
+        self.spin_soak_gap.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_soak_gap.setToolTip("每轮之间的停顿秒数。停顿计入每轮耗时，会拉低平均速率")
+
+        self.combo_soak_clean = QComboBox()
+        self.combo_soak_clean.addItem("只监控不清理（推荐）", "monitor")
+        self.combo_soak_clean.addItem("每轮清理回包流", "per-round")
+        _c = self.combo_soak_clean.findData(ini_get(self.cp, "gui", "soak_clean", "monitor"))
+        self.combo_soak_clean.setCurrentIndex(_c if _c >= 0 else 0)
+        self.combo_soak_clean.setToolTip(
+            "monitor（默认，最安全）：只记录流的 XLEN / lag / 未ACK 趋势，不动数据。\n\n"
+            "per-round：每轮结束后清空【回包流 DataHub_reply_stream】。\n"
+            "⚠ 该流是多条 ST-* 共用的全局流（不同于 datahub 那边每条 WT 自己的回复流），"
+            "非独占环境清理会干扰别人。只有在确认这个 Redis 上只有你在用、"
+            "且回包流涨得太快时才开。\n"
+            "目标流 ST-<编号> 始终只监控、不清理（避免删掉平台还没读的报文）。")
+
+        sp.addWidget(QLabel("轮间隔(秒)"), 2, 0)
+        sp.addWidget(self.spin_soak_gap, 2, 1)
+        sp.addWidget(QLabel("流处理"), 2, 2)
+        sp.addWidget(self.combo_soak_clean, 2, 3)
+
+        self.chk_soak_rotate = QCheckBox("轮换用例（每轮换一批，避免重复发同一批数据）")
+        self.chk_soak_rotate.setChecked(ini_get(self.cp, "gui", "soak_rotate", "1") == "1")
+        self.chk_soak_rotate.setToolTip(
+            "每轮按【本类型真实存在的行号】取一段（末尾回绕），避免反复发同一批。\n\n"
+            "为什么要按类型取：本表行序是 normal(10000) → error → destroy(96)，\n"
+            "destroy 只在第 10008~10103 行。若按「总行数」切段，头几轮的区间\n"
+            "全是 normal，配 --type destroy 会一条都选不到，整场 soak 全变「跳过」。\n\n"
+            "· create 等有唯一性约束的接口【建议开启】\n"
+            "· 不开也能跑，但每轮都发同一批，数据代表性差")
+        sp.addWidget(self.chk_soak_rotate, 3, 0, 1, 4)
+
+        self.chk_soak_keep = QCheckBox("保留每轮明细（默认只留异常轮）")
+        self.chk_soak_keep.setChecked(
+            ini_get(self.cp, "gui", "soak_keep", "0") == "1")
+        self.chk_soak_keep.setToolTip(
+            "默认只保留【异常轮】的 stats JSON/Excel，正常轮的明细会被清掉，\n"
+            "避免跑一晚上堆出几千个文件。勾上则每轮都留（占空间，排查细粒度用）。")
+        sp.addWidget(self.chk_soak_keep, 4, 0, 1, 4)
+
+        # ---- 异常阈值（策略方向专用：看 lag/未ACK，不看回复率）----
+        note = QLabel(
+            "⚠ 判异常看的是【平台有没有卡住】，不是回复率：\n"
+            "destroy 用例本来就大量不回包（平台读了、ACK 了、故意不回），\n"
+            "拿回复率当判据会把正常跑 destroy 判成一堆假异常。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#a15c00; background:#fff8e6;"
+                           " border:1px solid #f0d9a0; border-radius:3px; padding:4px;")
+        sp.addWidget(note, 5, 0, 1, 4)
+
+        self.spin_soak_maxlag = QSpinBox()
+        self.spin_soak_maxlag.setRange(0, 100000000)
+        self.spin_soak_maxlag.setValue(
+            int(float(ini_get(self.cp, "gui", "soak_maxlag", "0") or 0)))
+        self.spin_soak_maxlag.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_soak_maxlag.setToolTip(
+            "目标流 lag（还没被平台读走的条数）超过它就算异常轮。\n"
+            "0 = 不判。长稳建议设成每轮条数的 1~3 倍。\n\n"
+            "lag 持续上涨 = 平台不伸手读了（可能挂了/编号变了）。")
+
+        self.spin_soak_maxpend = QSpinBox()
+        self.spin_soak_maxpend.setRange(0, 100000000)
+        self.spin_soak_maxpend.setValue(
+            int(float(ini_get(self.cp, "gui", "soak_maxpend", "0") or 0)))
+        self.spin_soak_maxpend.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_soak_maxpend.setToolTip(
+            "目标流「未ACK」（平台读了但没确认的条数）超过它就算异常轮。\n"
+            "0 = 不判。长稳建议设成每轮条数的 1~3 倍。\n\n"
+            "未ACK 持续上涨 = 平台读了却处理不完（卡住/线程池耗尽），\n"
+            "这是最可靠的「平台挂了」信号（每次卡死都留下这个特征）。")
+
+        sp.addWidget(QLabel("lag 上限"), 6, 0)
+        sp.addWidget(self.spin_soak_maxlag, 6, 1)
+        sp.addWidget(QLabel("未ACK 上限"), 6, 2)
+        sp.addWidget(self.spin_soak_maxpend, 6, 3)
+
+        self.lbl_soak_hint = QLabel("")
+        self.lbl_soak_hint.setWordWrap(True)
+        self.lbl_soak_hint.setStyleSheet("color:#666;")
+        sp.addWidget(self.lbl_soak_hint, 7, 0, 1, 4)
+
+        g.addWidget(self.soak_params, 1, 0, 1, 4)
+
+        for w in (self.spin_soak_batch, self.spin_soak_rounds, self.spin_soak_hours,
+                  self.spin_soak_gap, self.spin_soak_maxlag, self.spin_soak_maxpend):
+            self.guard.install(w)
+        self.combo_soak_mode.currentIndexChanged.connect(self._sync_soak_mode)
+        self.chk_soak.toggled.connect(self._sync_soak_visibility)
+        self.spin_soak_batch.valueChanged.connect(self._update_soak_hint)
+        self._sync_soak_visibility()
+        self._sync_soak_mode()
+        self._update_soak_hint()
+        return box
+
+    def _soak_by_rounds(self):
+        return (self.combo_soak_mode.currentData() or "hours") == "rounds"
+
+    def _sync_soak_visibility(self):
+        on = self.chk_soak.isChecked()
+        self.soak_params.setVisible(on)
+        self._sync_soak_button()
+
+    def _sync_soak_mode(self):
+        """按时长/按轮数二选一，把用不上的那个置灰（别让人填了以为生效）。"""
+        by_rounds = self._soak_by_rounds()
+        self.spin_soak_rounds.setEnabled(by_rounds)
+        self.spin_soak_hours.setEnabled(not by_rounds)
+
+    def _sync_soak_button(self, running=None):
+        """「运行稳定性测试」只在【勾选了 soak】且【空闲】时可点。
+
+        用显式标志 _soak_running 追踪：worker 在 set_running(True) 时会置位，
+        因为 GUI 立即返回（soak 在子进程里跑），不能只看 worker.isRunning()。
+        """
+        if not hasattr(self, "btn_soak"):
+            return
+        if running is not None:
+            self._soak_running = bool(running)
+        self.btn_soak.setEnabled(
+            self.chk_soak.isChecked() and not getattr(self, "_soak_running", False))
+
+    def _update_soak_hint(self):
+        """把当前配置换算成人话，避免误填。"""
+        try:
+            n = len(self.selected_interfaces())
+            b = self.spin_soak_batch.value()
+            if self._soak_by_rounds():
+                desc = "共 %d 轮 × %d 条 = 约 %d 条" % (
+                    self.spin_soak_rounds.value(), b,
+                    self.spin_soak_rounds.value() * b)
+            else:
+                # 按时长只能给个下限提示（真实轮数取决于每轮耗时）
+                desc = "时长 %.2fh，每轮 %d 条（轮数取决于每轮耗时）" % (
+                    self.spin_soak_hours.value(), b)
+            if n:
+                desc += "；%d 个接口依次各跑一场" % n
+            self.lbl_soak_hint.setText("将执行：" + desc)
+        except Exception:
+            pass
+
+    def build_soak_cmd(self, name):
+        """构造 soak_test.py 命令行（接口/类型/目标流沿用左栏选择）。"""
+        a = self._base_cmd("soak_test.py") + self._conn_args()
+        a += ["--assign-id", str(self.spin_assign.value())]
+        a += ["--interface", name]
+        t = self.combo_type.currentText()
+        if t:
+            a += ["--type", t]
+        if self._soak_by_rounds():
+            a += ["--rounds", str(self.spin_soak_rounds.value())]
+        else:
+            a += ["--hours", "%g" % self.spin_soak_hours.value()]
+        a += ["--batch", str(self.spin_soak_batch.value())]
+        a += ["--gap", "%g" % self.spin_soak_gap.value()]
+        a += ["--clean", self.combo_soak_clean.currentData() or "monitor"]
+        if self.chk_soak_rotate.isChecked():
+            a += ["--rotate"]
+        if self.chk_soak_keep.isChecked():
+            a += ["--keep-round-stats"]
+        if self.spin_soak_maxlag.value() > 0:
+            a += ["--max-lag", str(self.spin_soak_maxlag.value())]
+        if self.spin_soak_maxpend.value() > 0:
+            a += ["--max-pending", str(self.spin_soak_maxpend.value())]
+
+        # ---- 透传给 send_test.py 的发送参数（soak 原样转发）----
+        a += ["--workers", str(self.spin_workers.value())]
+        a += ["--wait", str(self.spin_wait.value())]
+        if self.spin_rate.value() > 0:
+            a += ["--rate", str(self.spin_rate.value())]
+        if self.spin_seconds.value() > 0:
+            a += ["--seconds", str(self.spin_seconds.value())]
+        if self.chk_no_reply.isChecked():
+            a += ["--no-reply"]
+        if self.edit_reply_stream.text().strip():
+            a += ["--reply-stream", self.edit_reply_stream.text().strip()]
+        if self.chk_quiet.isChecked():
+            a += ["--quiet", "1"]
+        if self.chk_force_live.isChecked():
+            a += ["--force-live"]
+        return a
+
+    def on_soak(self):
+        """运行稳定性测试：对勾选的每个接口依次跑 soak_test.py。"""
+        if not self.chk_soak.isChecked():
+            QMessageBox.information(self, "提示",
+                                    "请先勾选「启用稳定性测试」")
+            return
+        names = self.selected_interfaces()
+        if not names:
+            QMessageBox.warning(self, "提示", "请先勾选至少一个接口")
+            return
+        if not self._confirm_conn():
+            return
+        # 便宜的预检：只看 Excel 在不在（不读内容）
+        missing = [n for n in names
+                   if CASES and not os.path.exists(CASES.default_excel(n))]
+        if missing:
+            QMessageBox.warning(
+                self, "缺少用例表",
+                "这些接口的 Excel 还不存在：%s\n\n"
+                "先生成：python make_excel.py --interface all" % ",".join(missing))
+            return
+
+        # 长稳前确认：这是"要跑很久"的操作，且会持续往真流写数据
+        rounds_txt = ("%d 轮" % self.spin_soak_rounds.value()) if self._soak_by_rounds() \
+            else ("%.2f 小时" % self.spin_soak_hours.value())
+        clean = self.combo_soak_clean.currentData() or "monitor"
+        warn = ""
+        if clean == "per-round":
+            warn = ("\n⚠ 流处理选了「每轮清理回包流」：\n"
+                    "   DataHub_reply_stream 是多条 ST-* 共用的全局流，\n"
+                    "   非独占环境会清掉别人的回包。确认只有你在用再继续。\n")
+        if not self._ask(
+                "确认运行稳定性测试",
+                "即将对 [%s] 依次运行稳定性测试：\n\n"
+                "  类型      : %s\n"
+                "  结束条件  : %s\n"
+                "  每轮条数  : %d\n"
+                "  目标流    : %s\n"
+                "%s\n"
+                "它会持续往目标流写数据。确认继续？"
+                % (",".join(names), self.combo_type.currentText(), rounds_txt,
+                   self.spin_soak_batch.value(), self._stream_name(), warn)):
+            return
+
+        if self.chk_autoclear.isChecked():
+            self.clear_log("[提示] 日志已自动清空（勾了「每次发送前自动清空」）")
+        self.append_log("")
+        self.append_log("#" * 60)
+        self.append_log("# 开始稳定性测试：接口=[%s] 类型=%s %s 每轮=%d 目标流=%s"
+                        % (",".join(names), self.combo_type.currentText(),
+                           rounds_txt, self.spin_soak_batch.value(),
+                           self._stream_name()))
+        self.append_log("#" * 60)
+        self.append_log("[提示] soak 在子进程里跑；进度可直接看上面的输出，"
+                        "或 out/soak/soak_*_soak.log")
+        self._soak_running = True
+        self._sync_soak_button()
+        cmds = [self.build_soak_cmd(n) for n in names]
+        self._run(cmds, on_done=lambda rc: self._after_soak(rc, names))
+
+    def _after_soak(self, rc, names):
+        self._soak_running = False
+        self._sync_soak_button()
+        d = os.path.join(OUT_DIR, "soak")
+        self.append_log("[提示] 稳定性测试结果目录：%s" % d)
+        self.append_log("       trend.csv=每轮趋势 / summary.json=汇总 "
+                        "/ soak.log=编排日志 / *_rounds/=异常轮明细")
+
     # ---- 右栏 ----
     def _build_right(self):
         w = QWidget()
@@ -1151,7 +1495,19 @@ class MainWindow(QWidget):
             lambda: self.on_send(self.combo_type.currentText()))
         self.btn_stop.clicked.connect(self.on_stop)
 
+        # 稳定性测试按钮：只在勾选 soak 且空闲时可点（_sync_soak_button 裁决）
+        self.btn_soak = QPushButton("运行稳定性测试")
+        self.btn_soak.setMinimumHeight(30)
+        self.btn_soak.clicked.connect(self.on_soak)
+        self.btn_soak.setToolTip(
+            "对勾选的每个接口依次运行 soak_test.py（反复调用 send_test.py）。\n\n"
+            "需先在左栏「6. 稳定性测试」勾选启用并设好参数。\n"
+            "结果在 out/soak/：trend.csv（每轮趋势）/ summary.json / *_rounds/（异常轮）。")
+        self._sync_soak_button()
+
         row.addWidget(self.btn_preview)
+        row.addStretch(1)
+        row.addWidget(self.btn_soak)
         row.addStretch(1)
         row.addWidget(self.btn_send)
         row.addStretch(1)
@@ -1368,6 +1724,9 @@ class MainWindow(QWidget):
             b.setEnabled(not running)
         self.btn_stop.setEnabled(running)
         self.btn_summary_export.setEnabled(not running)
+        # soak 按钮由 _sync_soak_button 统一裁决（需勾选 soak 且空闲）
+        if hasattr(self, "btn_soak"):
+            self._sync_soak_button(running)
 
     def _run(self, cmds, on_done=None):
         self._set_running(True)

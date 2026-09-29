@@ -89,12 +89,13 @@ python send_test.py --interface create --cases C001 --no-send --dump out/payload
 | 按钮 | 作用 |
 |---|---|
 | 预览报文（不发） | 只打印将要 XADD 的内容，不写 Redis |
+| 运行稳定性测试 | 对勾选的接口依次跑 `soak_test.py`（长时间连续跑 + 趋势汇总）。需先在左栏「6. 稳定性测试」勾选启用；见 §6.1 |
 | 开始发送 | 按「用例类型」下拉框 + 当前筛选发送（normal / error / destroy / all） |
 | 停止 | 中止正在跑的发送任务 |
 
-> **类型由谁决定**：「开始发送」和「预览报文」都读左栏「3. 测试数据 → 用例类型」
-> 下拉框。想发破坏用例就把下拉框选成 `destroy` 再点「开始发送」——
-> 旧版这里有个独立的「破坏测试」按钮，已于 `7d2a015` 移除。
+> **类型由谁决定**：「开始发送」「预览报文」「运行稳定性测试」都读左栏
+> 「3. 测试数据 → 用例类型」下拉框。想发破坏用例就把下拉框选成 `destroy`
+> 再点「开始发送」——旧版这里有个独立的「破坏测试」按钮，已于 `7d2a015` 移除。
 
 「**统计汇总**」标签页上方还有两个按钮（就在它们的用武之地）：
 
@@ -673,6 +674,7 @@ redis-cli -h 192.168.1.137 -a 'QianLong@2026&' DEL ST-50 ST-50-reply
 | `data/` | **生成的 Excel 用例**（`make_excel.py --interface all` 产出，勿手改后忘记重生成） |
 | `mock_strategy.py` | ★**必起** — 模拟策略平台（收 ST-N、回 DataHub_reply_stream、上线+心跳） |
 | `send_test.py` | ★**必起** — 手动 XADD 发送器 + 性能统计（它自己就扮演了"数据中台发报文"） |
+| `soak_test.py` | **稳定性测试编排**：反复调用 `send_test.py` 跑几小时，按轮汇总趋势（见 §6.1） |
 | `perf_stats.py` | 吞吐 / 字节 / CPU / 延迟分位 / 落盘 JSON+Excel |
 | `mock_datahub.py` | ○**可选** — 模拟数据中台。**默认流程用不到**，仅在「测完整上线握手」或「观察真中台」时需要，见 3.2 |
 | `config.py` `config.ini` | 共享配置（CLI 参数优先） |
@@ -1210,6 +1212,85 @@ token 机制与 `datahub_test/interfaces/_common.py` 一致：配置里存占位
 
 指标口径：每秒发送/回包条数、请求/回包字节数（按秒）、客户端 CPU 利用率、
 平均响应时间（微秒）＋ P50/P90/P95/P99/Max、错误分布。
+
+### 6.1 稳定性测试（`soak_test.py`）
+
+不做一次性压测，而是**连续跑几小时**，看指标是否随时间劣化。
+做法与 `datahub_test` 一致：不改发送逻辑，靠"反复调用 `send_test.py` + 汇总"实现。
+
+**两种入口，等价：**
+
+1. **GUI（推荐）**：左栏展开 **「6. 稳定性测试」** → 勾选「启用稳定性测试」
+   → 设好结束条件/每轮条数 → 点底部 **「运行稳定性测试」**。
+   接口、用例类型、目标流自动沿用左栏既有选择（与「开始发送」完全一致）；
+   勾选的多个接口会依次各跑一场。
+2. **命令行**：见下面示例。
+
+```bash
+# 8 小时，每轮 500 条 destroy，只监控不清理（最安全）
+python soak_test.py --assign-id 10 --interface account --type destroy \
+    --hours 8 --batch 500 --clean monitor
+
+# 短测：跑 5 轮就正常收尾（--rounds 优先于 --hours，适合验证流程/回归）
+python soak_test.py --assign-id 10 --interface account --type normal \
+    --rounds 5 --batch 200 --workers 4
+
+# 长稳时轮换用例（按行号分段、末尾回绕，避免反复发同一批）
+python soak_test.py --assign-id 10 --interface account --type normal \
+    --hours 8 --batch 1000 --rotate
+
+# 打真平台要显式加 --force-live（会透传给 send_test.py）
+python soak_test.py --assign-id 10 --interface account --type normal \
+    --rounds 3 --batch 100 --force-live
+```
+
+输出（`out/soak/`）：
+
+| 文件 | 内容 |
+|---|---|
+| `soak_<接口>_<时间>_soak.log` | 编排日志（每轮一行关键指标 + 异常） |
+| `soak_<接口>_<时间>_trend.csv` | **每轮指标时间序列**（核心产物，可直接画图） |
+| `soak_<接口>_<时间>_summary.json` | 整体汇总 |
+| `soak_<接口>_<时间>_rounds/` | 异常轮明细（默认只留异常轮，避免几千个文件） |
+
+#### ⚠ 判据与 `datahub_test` 不同（重要）
+
+`datahub_test` 用「成功率% / 回复率%」判异常。**策略方向不能照抄**：
+destroy 用例本来就大量不回包（实测 `AD232` 这类 `Pwd` 非法密文的，
+平台读了、ACK 了、**故意不回**）。用回复率下限会把正常跑 destroy 判成一堆假异常。
+
+所以本脚本把**目标流消费组的两个数**当一等指标（原理见 §2.2）：
+
+| 指标 | 含义 | 平台挂了会怎样 |
+|---|---|---|
+| `lag` | 还没被平台读走的条数 | **涨**（平台不伸手了） |
+| `未ACK` | 读了但没确认的条数 | **涨**（平台读了卡住） |
+
+平台正常时这两个数稳定在小值；挂掉后会**单调上涨** —— 这比回复率可靠。
+
+阈值默认全关（`--min-reply-rate 0` / `--max-lag 0` / `--max-pending 0`），
+长稳时建议开：
+
+```bash
+# 未ACK 超过 1000（约 2 轮的量）就标异常并保留明细
+python soak_test.py --assign-id 10 --interface account --type destroy \
+    --hours 8 --batch 500 --max-pending 1000
+```
+
+#### 与 datahub 版的三处实现差异
+
+1. **轮换按"本类型的行号"算，不是按总行数。**
+   本表行序是 `normal(10000) → error → destroy(96)`，destroy 只占
+   10008~10103。若照抄 datahub 按总行数(10103)切段，头几轮的
+   `--cases 1-500` 全是 normal，配 `--type destroy` 一条都选不到 ——
+   实测会让整场 soak 全变成"跳过"。所以先算出该类型的行号列表再轮换。
+2. **`--clean per-round` 有额外警告**：回包流 `DataHub_reply_stream` 是
+   **多条 ST-\* 共用**的全局流，非独占环境清理会干扰别人。默认 `monitor`。
+3. **不再依赖 `--no-run-log` 之外的新参数**：它已加到 `send_test.py`
+   （否则几千轮 = 几千个日志文件）。
+
+其他参数（`--gap` / `--keep-round-stats` / `--round-timeout` / `--soak-out`）
+语义与 `datahub_test/soak_test.py` 一致；未识别参数原样透传给 `send_test.py`。
 
 ---
 
