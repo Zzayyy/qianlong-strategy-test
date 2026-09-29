@@ -1,6 +1,7 @@
 # 运行输出（都可由脚本重新生成，不进版本库）
 out/logs/
 out/performance/
+out/soak/
 out/*.jsonl
 
 # 自测 / 截图产物

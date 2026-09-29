@@ -113,7 +113,49 @@ python send_test.py --host 192.168.1.137 --db 0 --assign-id 1 --type normal --ma
 
 ---
 
-## 5. 用真插件当策略平台（可选，仅用于复核协议）
+## 5. soak_test.py
+
+用法与判据说明见 [guide.md](guide.md) 第 7 节。
+
+### 编排参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--interface` | **必填** | 接口名（每轮跑的都是它） |
+| `--type` | `normal` | 用例类型，**同时决定回复率的默认档位**（见下） |
+| `--assign-id` / `--stream` | 必填其一 | 目标流 `ST-<id>` / 直接指定流名 |
+| `--hours` | 8.0 | 总时长（小时） |
+| `--rounds` | 0 | 按轮数跑；指定后忽略 `--hours`（短测用） |
+| `--batch` | 500 | **每轮条数**（覆盖传下去的 `--max`） |
+| `--gap` | 0.0 | 轮间间隔秒 |
+| `--rotate` | 关 | 每轮换一批用例（按**本类型的行号**分段，末尾回绕） |
+| `--clean` | `monitor` | `monitor`=只监控；`per-round`=每轮清回包流（⚠ 该流是多条 `ST-*` 共用，非独占环境别开） |
+| `--keep-round-stats` | 关 | 保留每轮 stats（默认只留异常轮） |
+| `--round-timeout` | 600 | 单轮最长秒数，防卡死 |
+| `--soak-out` | `out/soak` | 输出根目录 |
+
+### 判据参数（0 / 负值 = 不判）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--min-reply-rate` | **按类型** | 回复率下限%。不给就按 `--type` 取：`normal`=99，`error`/`destroy`/`all`=0。显式给 0 = 不判 |
+| `--max-lag` | 0 | 目标流 `lag` 超它算异常（平台**不读**的信号） |
+| `--max-pending` | 0 | 目标流未ACK 超它算异常（平台**读了卡住**的信号） |
+| `--max-timeout-reply` | 0 | 单轮「超时未回」超它算异常 |
+| `--max-outstanding` | 0 | 单轮结束时「在途未回」超它算异常 |
+
+> `--min-reply-rate` 的分子只算**能对上本次 `request_id`** 的回包，
+> 所以恒 ≤ 100%。共用回包流上别人的回复不影响它（记进 trend 的「非本次回包」列）。
+>
+> ⚠️ `destroy` 的回包行为**不稳定**（实测同一天出现过 0% 和 100%），
+> 给它设回复率下限要谨慎。详见 [dev-notes.md](dev-notes.md) 第 2.3 节。
+
+未识别参数原样**透传**给 `send_test.py`（如 `--workers` / `--wait` / `--rate` /
+`--no-reply` / `--force-live` / `--quiet` / `--sync-probe`）。
+
+---
+
+## 6. 用真插件当策略平台（可选，仅用于复核协议）
 
 **常规测试完全不需要 `.so`。** 本目录没有任何文件加载 `.so` —— 插件原本的职责
 （上线、心跳、收 `ST-N`、回包）已全部由 `mock_strategy.py` 用纯 socket 实现。
@@ -140,7 +182,7 @@ python mock_datahub.py --host 192.168.1.137 --db 0 --alloc-start 1
 
 ---
 
-## 6. 文件结构
+## 7. 文件结构
 
 | 文件 | 说明 |
 |---|---|
@@ -166,7 +208,7 @@ python mock_datahub.py --host 192.168.1.137 --db 0 --alloc-start 1
 
 ---
 
-## 7. 输出与指标口径
+## 8. 输出与指标口径
 
 | 产物 | 内容 |
 |---|---|

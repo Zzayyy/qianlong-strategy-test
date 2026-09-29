@@ -127,13 +127,25 @@ class PerfCollector(object):
         # 累计
         self.sent = 0
         self.sent_bytes = 0
+        # reply = 【只算能对上本次发送 request_id 的】回包（口径见 record_reply）。
+        # 回包流 DataHub_reply_stream 是多条 ST-* 共用的全局流，别人的回包、
+        # --sync-probe 自己发的那些，都会出现在这条流上 —— 混进来会让回复率 >100%
+        #（实测 quickstart 发 2000 回 2020、create_destroy 发 50 回 70）。
         self.reply = 0
         self.reply_bytes = 0
+        self.reply_raw = 0            # 流上【看到】的全部回包（含别人的）
+        self.reply_raw_bytes = 0
+        self.reply_foreign = 0        # 其中对不上本次发送的（仅作参考，不参与判据）
+        self.reply_foreign_bytes = 0
         self.send_fail = 0
         self.timeout_reply = 0
 
         # 延迟（毫秒）
         self.latencies = []
+
+        # 已被 expire_pending 清掉、但之后才姗姗来迟的回包 id。
+        # 有它才能把"超时后才到"和"压根不是我们的"区分开。
+        self._expired = set()
 
         # 按秒序列
         self.series = []          # [{'sec':n,'sent':..,'sent_bytes':..,'reply':..,'reply_bytes':..}]
@@ -192,14 +204,15 @@ class PerfCollector(object):
         if self._cur is None or self._cur["sec"] != sec:
             self._flush_cur()
             self._cur = {"sec": sec, "sent": 0, "sent_bytes": 0,
-                         "reply": 0, "reply_bytes": 0}
+                         "reply": 0, "reply_bytes": 0, "reply_foreign": 0}
         return self._cur
 
     def _merge(self, b):
         """把桶并入 series，同 sec 就累加。"""
         for x in reversed(self.series):
             if x["sec"] == b["sec"]:
-                for k in ("sent", "sent_bytes", "reply", "reply_bytes"):
+                for k in ("sent", "sent_bytes", "reply", "reply_bytes",
+                          "reply_foreign"):
                     x[k] += b[k]
                 return
             if x["sec"] < b["sec"]:
@@ -227,12 +240,39 @@ class PerfCollector(object):
         with self.pending_lock:
             self.pending[request_id] = now()
 
-    def record_reply(self, request_id, nbytes=0):
-        """收到回包：算 RTT。request_id 不在 pending 里说明是超时后才到的，忽略。"""
-        with self.pending_lock:
-            t_send = self.pending.pop(request_id, None)
-        lat = (now() - t_send) * 1000.0 if t_send else None
+    def record_reply(self, request_id, nbytes=0, matched=True):
+        """收到一条回包。
+
+        ★ 只有【能对上本次发送 request_id】的才算进 reply —— 这是"回复率"的分子。
+          对不上的（别人的 ST-* 的回包、--sync-probe 额外发的、超时后才到的）
+          只累加到 reply_raw / reply_foreign，仅作参考。
+
+        为什么必须这么改：回包流 DataHub_reply_stream 是【多条 ST-* 共用的全局流】，
+        XREAD 到的是流上的一切。旧实现无条件 reply += 1，实测出现过
+        "发 1 条回 21 条 (2100%)"、"发 50 回 70 (140%)"、"发 2000 回 2020 (101%)"。
+        拿这种数当回复率判据必然误判。
+
+        matched=False 表示调用方已经判定过这条对不上（省一次查表）。
+        """
+        hit = False
+        if matched:
+            with self.pending_lock:
+                t_send = self.pending.pop(request_id, None)
+                if t_send is None and request_id in self._expired:
+                    self._expired.discard(request_id)
+                    hit = True          # 超时后才到：算回包，但没有可用延迟
+                elif t_send is not None:
+                    hit = True
+        lat = (now() - t_send) * 1000.0 if (hit and t_send) else None
         with self.lock:
+            self.reply_raw += 1
+            self.reply_raw_bytes += nbytes
+            if not hit:
+                self.reply_foreign += 1
+                self.reply_foreign_bytes += nbytes
+                b = self._bucket()
+                b["reply_foreign"] += 1
+                return
             self.reply += 1
             self.reply_bytes += nbytes
             b = self._bucket()
@@ -250,7 +290,11 @@ class PerfCollector(object):
         with self.pending_lock:
             for k in [k for k, v in self.pending.items() if v < cut]:
                 self.pending.pop(k, None)
+                self._expired.add(k)     # 记住它，迟到时仍算"我们的回包"
                 n += 1
+            # 防止无限增长：只留最近的一批
+            if len(self._expired) > 200000:
+                self._expired = set(list(self._expired)[-100000:])
         with self.lock:
             self.timeout_reply += n
         return n
@@ -275,6 +319,9 @@ class PerfCollector(object):
                 duration=(self.t_end or now()) - (self.t0 or now()),
                 sent=self.sent, sent_bytes=self.sent_bytes,
                 reply=self.reply, reply_bytes=self.reply_bytes,
+                reply_raw=self.reply_raw, reply_raw_bytes=self.reply_raw_bytes,
+                reply_foreign=self.reply_foreign,
+                reply_foreign_bytes=self.reply_foreign_bytes,
                 send_fail=self.send_fail, timeout_reply=self.timeout_reply,
                 outstanding=self.outstanding,
                 series=list(self.series),
@@ -289,6 +336,8 @@ class PerfCollector(object):
         s["reply_per_sec"] = s["reply"] / d
         s["sent_bytes_per_sec"] = s["sent_bytes"] / d
         s["reply_bytes_per_sec"] = s["reply_bytes"] / d
+        # 回复率 = 对得上本次发送的回包 / 发送数（恒 <= 100%）
+        s["reply_rate"] = (s["reply"] / float(s["sent"])) if s["sent"] else None
         if s["sent"]:
             s["avg_sent_bytes"] = s["sent_bytes"] / float(s["sent"])
         if s["reply"]:
@@ -319,6 +368,11 @@ class PerfCollector(object):
               % (s["sent"], s["send_per_sec"], s["send_fail"]))
         print("  回包条数          : %d  (%.1f 条/秒, 超时未回 %d, 在途 %d)"
               % (s["reply"], s["reply_per_sec"], s["timeout_reply"], s["outstanding"]))
+        if s["sent"]:
+            print("  回复率            : %.2f%%  (%d/%d%s)"
+                  % (s["reply_rate"] * 100.0, s["reply"], s["sent"],
+                     ("，另有 %d 条非本次回包已剔除" % s["reply_foreign"])
+                     if s["reply_foreign"] else ""))
         print("  发送字节          : %d  (%.3f MB, %.1f MB/s, 均 %.0f B/条)"
               % (s["sent_bytes"], s["sent_bytes"] / 1048576.0,
                  s["sent_bytes_per_sec"] / 1048576.0, s.get("avg_sent_bytes", 0)))
@@ -398,6 +452,9 @@ class PerfCollector(object):
             ("发送速率(条/秒)", round(s["send_per_sec"], 2)),
             ("回包条数", s["reply"]), ("回包超时", s["timeout_reply"]),
             ("在途未回", s["outstanding"]),
+            ("回复率(%)", None if s["reply_rate"] is None
+             else round(s["reply_rate"] * 100.0, 2)),
+            ("非本次回包(已剔除)", s["reply_foreign"]),
             ("回包速率(条/秒)", round(s["reply_per_sec"], 2)),
             ("发送字节", s["sent_bytes"]),
             ("发送字节速率(MB/s)", round(s["sent_bytes_per_sec"] / 1048576.0, 4)),

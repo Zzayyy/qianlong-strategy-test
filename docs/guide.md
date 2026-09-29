@@ -387,8 +387,8 @@ python make_excel.py --interface remove --bulk-normal 10000 --ref-seq 501
 2. **命令行**：
 
 ```bash
-# 8 小时，每轮 500 条 destroy，只监控不清理（最安全）
-python soak_test.py --assign-id 50 --interface account --type destroy \
+# 8 小时，每轮 500 条 normal，只监控不清理（最安全）
+python soak_test.py --assign-id 50 --interface account --type normal \
     --hours 8 --batch 500 --clean monitor
 
 # 短测：跑 5 轮就正常收尾（--rounds 优先于 --hours）
@@ -403,9 +403,10 @@ python soak_test.py --assign-id 50 --interface account --type normal \
 python soak_test.py --assign-id 50 --interface account --type normal \
     --rounds 3 --batch 100 --force-live
 
-# 开异常阈值（长稳建议）：未ACK 超 1000 就标异常并保留明细
-python soak_test.py --assign-id 50 --interface account --type destroy \
-    --hours 8 --batch 500 --max-pending 1000
+# 长稳建议把四个阈值都设上（不设=不判，只记进 trend.csv）
+python soak_test.py --assign-id 50 --interface account --type normal \
+    --hours 8 --batch 500 --max-lag 1000 --max-pending 1000 \
+    --max-outstanding 100 --max-timeout-reply 100
 ```
 
 输出（`out/soak/`）：
@@ -413,16 +414,42 @@ python soak_test.py --assign-id 50 --interface account --type destroy \
 | 文件 | 内容 |
 |---|---|
 | `..._trend.csv` | **每轮指标时间序列**（核心产物，可直接画图） |
-| `..._summary.json` | 整体汇总 |
+| `..._summary.json` | 整体汇总（含本轮实际生效的 `criteria`） |
 | `..._soak.log` | 编排日志（每轮一行关键指标 + 异常） |
 | `..._rounds/` | 异常轮明细（默认只留异常轮，避免几千个文件） |
 
 其余参数（`--gap` / `--keep-round-stats` / `--round-timeout` / `--soak-out`）
 语义同 `datahub_test/soak_test.py`；未识别参数原样透传给 `send_test.py`。
 
-> **判据与 `datahub_test` 不同**：本脚本把目标流的 `lag` / `未ACK` 当一等指标
-> （平台不读了 / 读了卡住），**不用回复率** —— destroy 用例本来就大量不回包，
-> 用回复率会判出一堆假异常。阈值默认全关（`--max-lag 0` / `--max-pending 0`）。
+### 判据：三类信号，各有各的用途
+
+| 信号 | 参数 | 默认 | 能看出什么 |
+|---|---|---|---|
+| **回复率** | `--min-reply-rate` | **按类型**：normal=99，error/destroy/all=不判 | 平台漏处理、回包链路断了 |
+| **lag / 未ACK** | `--max-lag` / `--max-pending` | 0（不判） | 区分「平台没读」与「读了卡住」 |
+| **超时未回 / 在途** | `--max-timeout-reply` / `--max-outstanding` | 0（不判） | 这一轮积压了多少 |
+
+回复率**按用例类型分档**，不是一刀切：
+
+* `normal` = 99%：压测数据本来就该条条有回包（实测 30/30、2000/2000 全回）。
+* `destroy` / `error` / `all` = 0（不判）：畸形报文大量不回包是**平台的正常行为**
+  （平台读了、XACK 了、故意不回，如 Pwd 非法密文的 `AD232`）。
+
+> ⚠️ **destroy 的回包行为并不固定，别想当然。** 2026-09-29 实测同一天里：
+> 上午 account destroy 发 96 回 0（平台压根没读，`lag=96`），
+> 下午同样 96 条却 96/96 全回。所以「destroy 不回包」只是"默认别误报"，
+> 真要盯 destroy 的回包请显式给 `--min-reply-rate`。
+
+> **回复率的分母分子**：分子只算**能对上本次发送 `request_id` 的回包**。
+> 回包流 `DataHub_reply_stream` 是**多条 `ST-*` 共用的全局流**，XREAD 会读到
+> 别人的回包以及 `--sync-probe` 自己发的那些 —— 对不上的记进 trend 的
+> 「非本次回包」列，不参与判据。所以回复率**恒 ≤ 100%**。
+
+> 阈值默认大多关闭（只记录、不判），这是刻意的：避免长稳跑了一半才发现
+> 判据本身在误报。**长稳建议四个阈值都设上**，尤其是 `lag`/`未ACK` ——
+> 回包为 0 时只有它能告诉你平台是"没读"还是"读了卡住"。
+
+判据的设计理由与实测证据见 [dev-notes.md](dev-notes.md) 第 2 节。
 
 ---
 

@@ -440,6 +440,10 @@ class MainWindow(QWidget):
                             "1" if self.chk_soak_keep.isChecked() else "0")
                 self.cp.set("gui", "soak_maxlag", str(self.spin_soak_maxlag.value()))
                 self.cp.set("gui", "soak_maxpend", str(self.spin_soak_maxpend.value()))
+                self.cp.set("gui", "soak_maxtout", str(self.spin_soak_maxtout.value()))
+                self.cp.set("gui", "soak_maxout", str(self.spin_soak_maxout.value()))
+                self.cp.set("gui", "soak_minreply",
+                            "%g" % self.spin_soak_minreply.value())
         except Exception:
             pass
 
@@ -1072,15 +1076,30 @@ class MainWindow(QWidget):
             "避免跑一晚上堆出几千个文件。勾上则每轮都留（占空间，排查细粒度用）。")
         sp.addWidget(self.chk_soak_keep, 4, 0, 1, 4)
 
-        # ---- 异常阈值（策略方向专用：看 lag/未ACK，不看回复率）----
+        # ---- 异常阈值 ----
         note = QLabel(
-            "⚠ 判异常看的是【平台有没有卡住】，不是回复率：\n"
-            "destroy 用例本来就大量不回包（平台读了、ACK 了、故意不回），\n"
-            "拿回复率当判据会把正常跑 destroy 判成一堆假异常。")
+            "⚠ 判异常用三类信号（回复率按用例类型自动分档）：\n"
+            "· normal 默认要求回复率 ≥99%（压测数据本该条条有回包）\n"
+            "· destroy/error 默认不判回复率（畸形报文不回包是平台正常行为）\n"
+            "· lag/未ACK 能区分「平台没读」和「读了卡住」，建议长稳时都设上")
         note.setWordWrap(True)
         note.setStyleSheet("color:#a15c00; background:#fff8e6;"
                            " border:1px solid #f0d9a0; border-radius:3px; padding:4px;")
         sp.addWidget(note, 5, 0, 1, 4)
+
+        self.spin_soak_minreply = QDoubleSpinBox()
+        self.spin_soak_minreply.setRange(-1, 100)
+        self.spin_soak_minreply.setDecimals(1)
+        self.spin_soak_minreply.setValue(
+            float(ini_get(self.cp, "gui", "soak_minreply", "-1") or -1))
+        self.spin_soak_minreply.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_soak_minreply.setToolTip(
+            "单轮回复率低于它就算异常轮。-1 = 按用例类型自动（normal 99，"
+            "destroy/error 不判）；0 = 显式不判。\n\n"
+            "⚠ destroy 的回包行为不稳定：2026-09-29 同一天实测过 0% 和 100%，\n"
+            "盯 destroy 的回包要谨慎，别把它当硬判据。\n\n"
+            "分子只算「对得上本次 request_id」的回包，恒 ≤100%（共用回包流上\n"
+            "别人的回复已被剔除）。")
 
         self.spin_soak_maxlag = QSpinBox()
         self.spin_soak_maxlag.setRange(0, 100000000)
@@ -1103,25 +1122,60 @@ class MainWindow(QWidget):
             "未ACK 持续上涨 = 平台读了却处理不完（卡住/线程池耗尽），\n"
             "这是最可靠的「平台挂了」信号（每次卡死都留下这个特征）。")
 
+        self.spin_soak_maxtout = QSpinBox()
+        self.spin_soak_maxtout.setRange(0, 100000000)
+        self.spin_soak_maxtout.setValue(
+            int(float(ini_get(self.cp, "gui", "soak_maxtout", "0") or 0)))
+        self.spin_soak_maxtout.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_soak_maxtout.setToolTip(
+            "单轮「超时未回」超过它算异常轮。0 = 不判。\n"
+            "建议设成每轮条数的 1~2 倍。跑 normal 时它基本等于「丢失数」。")
+
+        self.spin_soak_maxout = QSpinBox()
+        self.spin_soak_maxout.setRange(0, 100000000)
+        self.spin_soak_maxout.setValue(
+            int(float(ini_get(self.cp, "gui", "soak_maxout", "0") or 0)))
+        self.spin_soak_maxout.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_soak_maxout.setToolTip(
+            "单轮结束时「在途未回」超过它算异常轮。0 = 不判。\n"
+            "在途不清零 = 平台收了却一直不回（配合未ACK 看能区分卡在哪）。")
+
         sp.addWidget(QLabel("lag 上限"), 6, 0)
         sp.addWidget(self.spin_soak_maxlag, 6, 1)
         sp.addWidget(QLabel("未ACK 上限"), 6, 2)
         sp.addWidget(self.spin_soak_maxpend, 6, 3)
 
+        sp.addWidget(QLabel("回复率下限%"), 7, 0)
+        sp.addWidget(self.spin_soak_minreply, 7, 1)
+        sp.addWidget(QLabel("超时未回上限"), 7, 2)
+        sp.addWidget(self.spin_soak_maxtout, 7, 3)
+
+        sp.addWidget(QLabel("在途上限"), 8, 0)
+        sp.addWidget(self.spin_soak_maxout, 8, 1)
+
         self.lbl_soak_hint = QLabel("")
         self.lbl_soak_hint.setWordWrap(True)
         self.lbl_soak_hint.setStyleSheet("color:#666;")
-        sp.addWidget(self.lbl_soak_hint, 7, 0, 1, 4)
+        sp.addWidget(self.lbl_soak_hint, 9, 0, 1, 4)
 
         g.addWidget(self.soak_params, r, 0, 1, 4)
         r += 1
 
         for w in (self.spin_soak_batch, self.spin_soak_rounds, self.spin_soak_hours,
-                  self.spin_soak_gap, self.spin_soak_maxlag, self.spin_soak_maxpend):
+                  self.spin_soak_gap, self.spin_soak_maxlag, self.spin_soak_maxpend,
+                  self.spin_soak_maxtout, self.spin_soak_maxout,
+                  self.spin_soak_minreply):
             self.guard.install(w)
         self.combo_soak_mode.currentIndexChanged.connect(self._sync_soak_mode)
         self.chk_soak.toggled.connect(self._sync_soak_visibility)
         self.spin_soak_batch.valueChanged.connect(self._update_soak_hint)
+        # 这些都会改变"实际生效的判据"，提示要跟着变
+        for w in (self.spin_soak_maxlag, self.spin_soak_maxpend,
+                  self.spin_soak_maxtout, self.spin_soak_maxout,
+                  self.spin_soak_minreply):
+            w.valueChanged.connect(self._update_soak_hint)
+        # 用例类型决定回复率默认档位，切换时要刷新提示
+        self.combo_type.currentIndexChanged.connect(self._update_soak_hint)
         self._sync_soak_visibility()
         self._sync_soak_mode()
         self._update_soak_hint()
@@ -1216,6 +1270,27 @@ class MainWindow(QWidget):
                     self.spin_soak_hours.value(), b)
             if n:
                 desc += "；%d 个接口依次各跑一场" % n
+            # 判据也提示出来：默认哪些是关的，避免"以为在判其实没判"
+            mr = self.spin_soak_minreply.value()
+            if mr < 0:
+                # -1 = 按类型自动，和 soak_test.default_min_reply_rate_for 同口径
+                mr_txt = ("99%(normal)" if (self.combo_type.currentText() or ""
+                                            ).lower() == "normal" else "不判")
+            elif mr == 0:
+                mr_txt = "不判"
+            else:
+                mr_txt = "%g%%" % mr
+            on = []
+            if self.spin_soak_maxlag.value() > 0:
+                on.append("lag>%d" % self.spin_soak_maxlag.value())
+            if self.spin_soak_maxpend.value() > 0:
+                on.append("未ACK>%d" % self.spin_soak_maxpend.value())
+            if self.spin_soak_maxtout.value() > 0:
+                on.append("超时未回>%d" % self.spin_soak_maxtout.value())
+            if self.spin_soak_maxout.value() > 0:
+                on.append("在途>%d" % self.spin_soak_maxout.value())
+            desc += "\n判据：回复率%s；发送失败>0%s" % (
+                mr_txt, ("；" + "；".join(on)) if on else "；lag/未ACK/超时/在途 均未设阈值")
             self.lbl_soak_hint.setText("将执行：" + desc)
         except Exception:
             pass
@@ -1243,6 +1318,13 @@ class MainWindow(QWidget):
             a += ["--max-lag", str(self.spin_soak_maxlag.value())]
         if self.spin_soak_maxpend.value() > 0:
             a += ["--max-pending", str(self.spin_soak_maxpend.value())]
+        if self.spin_soak_maxtout.value() > 0:
+            a += ["--max-timeout-reply", str(self.spin_soak_maxtout.value())]
+        if self.spin_soak_maxout.value() > 0:
+            a += ["--max-outstanding", str(self.spin_soak_maxout.value())]
+        # 回复率下限：-1 表示"按类型自动"（不加参数，交给 soak 自己按 type 取）
+        if self.spin_soak_minreply.value() >= 0:
+            a += ["--min-reply-rate", "%g" % self.spin_soak_minreply.value()]
 
         # ---- 透传给 send_test.py 的发送参数（soak 原样转发）----
         a += ["--workers", str(self.spin_workers.value())]

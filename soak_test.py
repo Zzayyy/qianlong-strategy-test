@@ -4,20 +4,35 @@
 ========================================================
 参考 datahub_test/soak_test.py，但判据按【策略方向】重做。
 
-为什么不能照抄 datahub 的判据（重点）
-------------------------------------
-1) datahub 用「成功率% / 回复率%」当异常判据。策略方向不适用：
-   destroy 用例（畸形报文）**本来就大量不回包**（实测 AD232 这种
-   Pwd 非法密文的，平台读了、ACK 了、但故意不回）。若用回复率下限，
-   正常跑 destroy 会被判成一堆假异常。
+判据怎么定的（重点，改之前先读完）
+----------------------------------
+用三种信号，各有各的用途，缺一不可：
 
-2) 策略方向真正要盯的是【平台会不会挂着】。硬信号是目标流消费组的
-   两个数（见 docs/guide.md 第 8 节）：
+1) 回复率（默认【按 --type 分档】）：
+   - normal = 99%：压测数据本来就该条条有回包（实测 30/30、2000/2000 全回）。
+     低于它说明平台漏处理或回包链路断了。
+   - error / destroy / all = 0（不判）：畸形报文大量不回包是【平台的正常行为】
+     （平台读了、XACK 了、故意不回 —— 如 Pwd 非法密文的 AD232）。
+
+   ⚠️ 但 destroy 的回包行为【不是固定的】，不能想当然。2026-09-29 实测同一天里：
+        10:29  account destroy  发 96 回 0    （平台压根没读，lag=96）
+        11:26  account destroy  发 96 回 96   （全回）
+     所以"destroy 不回包"只是"默认别误报"，真要盯就显式 --min-reply-rate N。
+
+2) lag / 未ACK（目标流消费组，只读）：区分"没读"和"读了卡住"，这是
+   回复率【给不出】的信息 —— 回包为 0 时，lag=96 说明平台没伸手，
+   未ACK=96 说明读了但卡死。所以即使开了回复率，也建议同时设这两个阈值。
        lag      = 还没被平台读走的条数（平台不伸手 -> 涨）
        pending  = 读了但没 ACK 的条数（平台读了卡住 -> 涨）
-   平台正常时这两个数会稳定在小值；平台挂掉后它们会**单调上涨**。
-   所以本脚本把 lag / 未ACK 当成一等指标，并支持 --max-lag / --max-pending
-   阈值告警。这比"回复率"可靠得多。
+
+3) 超时未回 / 在途未回（单轮结束时）：回复率的补充 —— 它们能指出
+   "这一轮积压了多少"，且不像回复率那样受用例类型影响。
+
+★ 回复率的分子只算【能对上本次发送 request_id 的回包】。
+  回包流 DataHub_reply_stream 是多条 ST-* 共用的【全局流】，XREAD 会读到
+  别人的回包以及 --sync-probe 自己发的那些。旧实现无条件累加，实测出现过
+  "发 1 回 21 (2100%)"、"发 50 回 70 (140%)"、"发 2000 回 2020 (101%)"。
+  对的算进 reply，对不上的进 reply_foreign（只展示、不参与判据）。
 
 设计（与 datahub 一致）：不改 send_test.py 的发送逻辑，靠"反复调用 + 汇总"：
   每轮调一次 send_test.py（--max <batch> + --no-run-log），
@@ -25,8 +40,8 @@
   正常轮的明细清掉、异常轮保留；最后产出 soak.log / trend.csv / summary.json。
 
 用法：
-  # 8 小时，每轮 500 条（destroy），只监控不清理
-  python soak_test.py --assign-id 10 --interface account --type destroy \
+  # 8 小时，每轮 500 条（normal），只监控不清理
+  python soak_test.py --assign-id 10 --interface account --type normal \
       --hours 8 --batch 500 --clean monitor
 
   # 短测：只跑 5 轮（--rounds 优先于 --hours，便于验证流程）
@@ -69,9 +84,32 @@ REPLY_STREAM = "DataHub_reply_stream"     # 策略平台 -> 数据中台 的回�
 GROUP = "user_group"
 
 # 异常判定阈值（只给该轮打"异常"标记并保留明细，绝不中断整体测试）
-DEFAULT_MIN_REPLY_RATE = 0.0   # 回复率下限%，0=不判（destroy 本来就不回包）
+#
+# ★ 回复率默认值【按 --type 分档】，不是一刀切：
+#   - normal：压测数据本来就该条条有回包（实测 30/30、2000/2000 全回），
+#     所以默认要求 99% —— 低于它说明平台漏处理或回包链路有问题。
+#   - destroy / all / error：畸形报文大量不回包是【平台的正常行为】
+#     （平台读了、ACK 了、故意不回），拿回复率判会出一堆假异常，默认不判。
+#
+#   但要注意：destroy 的回包行为【不是固定的】。2026-09-29 实测同一天里，
+#   上午 account destroy 出现过 0/96（平台压根没读），下午 96/96 全回。
+#   所以这只是"默认不误报"，真要盯 destroy 的回包请显式给 --min-reply-rate。
+DEFAULT_MIN_REPLY_RATE_BY_TYPE = {
+    "normal": 99.0,
+    "error": 0.0,
+    "destroy": 0.0,
+    "all": 0.0,
+}
 DEFAULT_MAX_LAG = 0            # lag  超过它算异常，0=不判
 DEFAULT_MAX_PENDING = 0        # 未ACK 超过它算异常，0=不判
+DEFAULT_MAX_TIMEOUT_REPLY = 0  # 超时未回超过它算异常，0=不判
+DEFAULT_MAX_OUTSTANDING = 0    # 在途未回超过它算异常，0=不判
+
+
+def default_min_reply_rate_for(type_tag):
+    """按用例类型给回复率默认下限（%）。"""
+    t = (type_tag or "normal").strip().lower()
+    return DEFAULT_MIN_REPLY_RATE_BY_TYPE.get(t, 0.0)
 
 
 # ==================== 工具 ====================
@@ -371,7 +409,7 @@ def main():
     ap.add_argument("--clean", choices=["monitor", "per-round"],
                     default="monitor",
                     help="monitor=只监控不清理(默认，最安全)；"
-                         "per-round=每轮清空回包流（⚠ 回包流是多条 ST-* 共用的，"
+                         "per-round=每轮清空回包流（注意：回包流是多条 ST-* 共用的，"
                          "非独占环境别开）")
     ap.add_argument("--rotate", action="store_true",
                     help="每轮轮换用例（按行号分段、末尾回绕），避免反复发同一批数据")
@@ -381,17 +419,30 @@ def main():
                     help="单轮最长秒数，防卡死（默认 600）")
     ap.add_argument("--soak-out", default="", help="输出根目录（默认 out/soak）")
 
-    # ---- 异常判据（策略方向：默认只看发送失败 + lag/pending 增长）----
-    ap.add_argument("--min-reply-rate", type=float, default=DEFAULT_MIN_REPLY_RATE,
-                    help="回复率下限%%，低于它算异常。默认 0=不判"
-                         "（destroy 用例本来就大量不回包，别拿它判）")
+    # ---- 异常判据（默认：发送失败 + 回复率(按类型) + lag/pending/在途/超时）----
+    ap.add_argument("--min-reply-rate", type=float, default=None,
+                    help="回复率下限%%，低于它算异常。默认按 --type 自动取："
+                         "normal=99，error/destroy/all=0（不判）。"
+                         "显式给 0 = 不判。destroy 的回包行为不稳定"
+                         "（同一天实测过 0%% 和 100%%），要盯就显式指定")
     ap.add_argument("--max-lag", type=int, default=DEFAULT_MAX_LAG,
                     help="目标流 lag 超过它算异常（平台不读的信号）。默认 0=不判")
     ap.add_argument("--max-pending", type=int, default=DEFAULT_MAX_PENDING,
                     help="目标流未ACK 超过它算异常（平台读了卡住的信号）。"
                          "默认 0=不判。建议长稳时设成 batch 的 1~2 倍")
+    ap.add_argument("--max-timeout-reply", type=int,
+                    default=DEFAULT_MAX_TIMEOUT_REPLY,
+                    help="单轮「超时未回」超过它算异常。默认 0=不判。"
+                         "建议设成 batch 的 1~2 倍（跑 normal 时它等价于丢失数）")
+    ap.add_argument("--max-outstanding", type=int,
+                    default=DEFAULT_MAX_OUTSTANDING,
+                    help="单轮结束时「在途未回」超过它算异常。默认 0=不判")
     args, unknown = ap.parse_known_args()
     args.passthrough = unknown
+
+    # ---- 回复率下限：没显式给就按 --type 自动取（normal=99，其余=0）----
+    if args.min_reply_rate is None:
+        args.min_reply_rate = default_min_reply_rate_for(args.type)
 
     # ---- Redis 连接参数：命令行优先，其次 config.ini ----
     # ★ 这里不能把 args 直接传给 redis_kwargs：本脚本的 --port 默认值是 0，
@@ -459,6 +510,14 @@ def main():
     log("稳定性测试开始: 接口=%s 类型=%s 目标流=%s %s 每轮=%d 清理=%s 轮间隔=%ss"
         % (args.interface, args.type, stream, target_desc, args.batch,
            args.clean, args.gap))
+    log("判据: 回复率下限=%s  发送失败>0   lag>%s判定   未ACK>%s判定   "
+        "超时未回>%s判定   在途>%s判定"
+        % (("%g%%" % args.min_reply_rate) if args.min_reply_rate > 0 else "关",
+           args.max_lag or "不", args.max_pending or "不",
+           args.max_timeout_reply or "不", args.max_outstanding or "不"))
+    if args.min_reply_rate > 0 and args.type.strip().lower() in ("destroy", "all"):
+        log("⚠ 类型=%s 却开了回复率下限：destroy 的回包行为不稳定"
+            "（实测同一天出现过 0%% 与 100%%），可能产生假异常" % args.type)
     log("Redis=%s:%s db=%s  输出目录=%s（前缀 %s）"
         % (kw["host"], kw["port"], kw["db"], root, prefix))
     if args.rotate:
@@ -483,7 +542,7 @@ def main():
             "这时每轮都会收不到回包（不等于平台挂了）" % (stream, GROUP))
 
     header = ["轮次", "时间", "发送数", "回包数", "发送失败", "超时未回", "在途",
-              "回复率%", "发送速率(条/s)",
+              "回复率%", "非本次回包", "发送速率(条/s)",
               "延迟p50(ms)", "延迟p99(ms)", "延迟max(ms)",
               "目标流XLEN", "已读", "未ACK", "lag", "回复流XLEN",
               "CPU%", "异常"]
@@ -548,10 +607,17 @@ def main():
                     fail = _int_or(stats.get("send_fail"))
                     tout = _int_or(stats.get("timeout_reply"))
                     outn = _int_or(stats.get("outstanding"))
-                    rep_rate = (reply / float(sent) * 100.0) if sent else 0.0
+                    foreign = _int_or(stats.get("reply_foreign"))
+                    # 回复率优先用 perfor 自算的 reply_rate（= 对得上本次的回包/发送数），
+                    # 拿不到就退回 reply/sent —— 两种情况都恒 <= 100%。
+                    rr = _as_num(stats.get("reply_rate"))
+                    rep_rate = (rr * 100.0) if rr is not None else \
+                        ((reply / float(sent) * 100.0) if sent else 0.0)
                     sps = _float_or(stats.get("send_per_sec"))
 
-                    # ---- 异常判定（策略方向）----
+                    # ---- 异常判定 ----
+                    # 回复率只对"该回包的"类型设默认（normal=99%），
+                    # destroy/error 默认 0=不判（畸形报文不回包是平台正常行为）。
                     reasons = []
                     if fail > 0:
                         reasons.append("发送失败%d" % fail)
@@ -561,6 +627,10 @@ def main():
                         reasons.append("未ACK%d>%d" % (pd, args.max_pending))
                     if args.max_lag > 0 and lag is not None and lag > args.max_lag:
                         reasons.append("lag%d>%d" % (lag, args.max_lag))
+                    if args.max_timeout_reply > 0 and tout > args.max_timeout_reply:
+                        reasons.append("超时未回%d>%d" % (tout, args.max_timeout_reply))
+                    if args.max_outstanding > 0 and outn > args.max_outstanding:
+                        reasons.append("在途%d>%d" % (outn, args.max_outstanding))
                     bad = bool(reasons)
 
                     totals["rounds"] += 1
@@ -573,7 +643,7 @@ def main():
                         abnormal_rounds.append(round_no)
 
                     row = [round_no, _now_str(), sent, reply, fail, tout, outn,
-                           round(rep_rate, 2), round(sps, 1),
+                           round(rep_rate, 2), foreign, round(sps, 1),
                            round(_float_or(stats.get("lat_p50_ms")), 2),
                            round(_float_or(stats.get("lat_p99_ms")), 2),
                            round(_float_or(stats.get("lat_max_ms")), 2),
@@ -584,6 +654,7 @@ def main():
                         "耗时=%.1fs | 目标流 XLEN=%s 已读=%s 未ACK=%s lag=%s"
                         % (round_no, sent, reply, fail, rep_rate, dt,
                            xlen, rd, pd, lag)
+                        + ("  [剔除非本次 %d 条]" % foreign if foreign else "")
                         + ("  [异常: %s]" % ",".join(reasons) if bad else ""))
 
                     if not args.keep_round_stats and not bad:
@@ -628,6 +699,14 @@ def main():
             "batch": args.batch,
             "clean_mode": args.clean,
             "rotate": bool(args.rotate),
+            # ---- 本轮实际生效的判据（事后复盘必须知道"用什么判的"）----
+            "criteria": {
+                "min_reply_rate%": args.min_reply_rate,
+                "max_lag": args.max_lag,
+                "max_pending": args.max_pending,
+                "max_timeout_reply": args.max_timeout_reply,
+                "max_outstanding": args.max_outstanding,
+            },
             "rounds_total": totals["rounds"],
             "rounds_abnormal": totals["abnormal"],
             "rounds_skipped": totals["skipped"],
