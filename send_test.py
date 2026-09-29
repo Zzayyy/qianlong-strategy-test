@@ -623,7 +623,9 @@ def build_parser(cp):
     # 压测参数
     ap.add_argument("--workers", type=int, default=None, help="并发线程数")
     ap.add_argument("--max", type=int, default=None,
-                    help="发送总条数；0=不限（循环复用用例直到手动停止或 --seconds 到点）")
+                    help="最多处理多少条(0=全部)。"
+                         "0=按当前 type/接口/筛选把用例各发一次；"
+                         "小于用例数=只发前 N 条；大于用例数=循环复用凑够 N 条")
     ap.add_argument("--rate", type=float, default=None, help="全局限速 条/秒，0=不限")
     ap.add_argument("--wait", type=float, default=None, help="发完等回包秒数")
     ap.add_argument("--seconds", type=float, default=0,
@@ -747,17 +749,37 @@ def main():
     logfile = os.path.join(LOG_DIR, "%s.log" % label)
     logger = Logger(logfile, quiet=bool(a.quiet))
 
+    # ---- 解析「总条数」语义（对齐 datahub_test：0 = 全部）----
+    #   0（或未填）  = 按当前 type/接口/筛选，把用例【各发一次】
+    #                 例：account + destroy -> 发 96 条就结束
+    #   < 用例数     = 只发前 N 条
+    #   > 用例数     = 循环复用用例凑够 N 条（压测要量大时用）
+    # 【为什么要在这里定死】早先 0 被当成"不限量"，_producer 里 total=0 让
+    # break 永不触发，会一直循环发到手动停止 —— 想发 96 条 destroy，
+    # 实际把上万条 normal 发出去就是它造成的。
+    # 只有 --seconds（按时间跑）才应该是"不限量"。
+    if a.seconds and a.seconds > 0:
+        effective_max = 0            # 0 = 不限，交给计时线程喊停
+    elif max_count and max_count > 0:
+        effective_max = max_count
+    else:
+        effective_max = len(pool)    # ★ 0 = 全部用例各发一次
+
     logger.write("发送器启动：目标 %s:%s db%s  流=%s"
                  % (kw["host"], kw["port"], kw["db"], stream), force=True)
     logger.write("用例: type=%s interface=%s cases=%r  共 %d 条"
                  % (type_tag, interface, a.cases, len(pool)), force=True)
+    if effective_max == 0:
+        _total_desc = "不限(按时间跑，%.0fs)" % a.seconds
+    elif not max_count or max_count <= 0:
+        _total_desc = "%d(=用例数，各发一次)" % effective_max
+    elif max_count > len(pool):
+        _total_desc = "%d(用例 %d 条循环复用)" % (effective_max, len(pool))
+    else:
+        _total_desc = "%d(取前 %d 条)" % (effective_max, effective_max)
     logger.write("并发=%d  总数=%s  限速=%s 条/秒  等回包=%.1fs  seconds=%.1f"
-                 % (workers, max_count or "不限(循环发到停止)", rate or "不限",
-                    wait, a.seconds),
+                 % (workers, _total_desc, rate or "不限", wait, a.seconds),
                  force=True)
-    if not max_count and not (a.seconds and a.seconds > 0):
-        logger.write("★ 提示：--max 0 且未设 --seconds = 不限量，会一直循环发送，"
-                     "直到手动停止（不是「每种发一次」）。", force=True)
 
     # 确保流和消费组存在（策略平台 Mock 会建；这里兜底，且保证 XLEN 可查）
     try:
@@ -784,7 +806,8 @@ def main():
         logger.write("准备目标流失败: %s" % e, force=True)
 
     sender = Sender(
-        kw=kw, stream=stream, cases=pool, workers=workers, max_count=max_count,
+        kw=kw, stream=stream, cases=pool, workers=workers,
+        max_count=effective_max,
         rate=rate, quiet=bool(a.quiet), logger=logger, wait=wait,
         no_reply=a.no_reply, reply_stream=a.reply_stream,
         timeout_expire=a.reply_timeout, stats_interval=a.stats_interval,
@@ -792,7 +815,7 @@ def main():
 
     t0 = time.time()
     if a.seconds and a.seconds > 0:
-        # 按时间跑：把 max 设成一个很大的数，用计时线程喊停
+        # 按时间跑：不限条数（0），由计时线程喊停
         sender.max_count = 0
         timer = threading.Timer(a.seconds, sender.stop.set)
         timer.daemon = True
