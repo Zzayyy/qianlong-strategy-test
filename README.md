@@ -706,17 +706,69 @@ mock_datahub.py       ──PUBLISH───────┘
 |---|---|
 | `_show_stream.py` | **看实际发出去的报文**：从 Redis 流里读回（`--json` 格式化 / `--full` 不截断 / `--out` 导出）。`out/logs/` 里**不含**报文内容，只有它能看到 |
 | `_verify_bulk.py` | **复核批量数据**：账号唯一性、`UniqueAccount` 是否跟随、`Ref` 是否唯一、号段是否对齐、`Pwd` 能否解回 |
-| `_ack_gap.py` | **平台卡在哪一条**：对着服务端 PEL 列出「已 ACK / 未 ACK」的分界，未 ACK 的就是平台读了但没处理完的 |
+| `_ack_gap.py` | **看平台停在哪**：对着服务端 PEL 列出「已 ACK / 未 ACK / 从没读」的分界 |
+| `_find_culprit.py` | **定位是哪条报文把平台弄挂**：单条注入 + 等确认，消除并发这个变量（详见 §2.3） |
 
 ```bash
 python tests/_show_stream.py --stream ST-50 -n 5      # 最近 5 条
 python tests/_verify_bulk.py                          # 复核 data/*.xlsx
-python tests/_ack_gap.py --stream ST-50               # 平台卡在哪条
+python tests/_ack_gap.py --stream ST-10               # 平台停在哪
+python tests/_find_culprit.py --assign-id 10 --type destroy   # 逐条揪凶手
 ```
 
 > 早先这里还有一套 GUI 自测（`_gui_*`、`_e2e_*`、`_run_suites` 等 18 个），
 > **已全部删除** —— 它们只在开发期用来防回归，日常用不到，
 > 与 `datahub_test` 的结构保持一致（那边也没有测试目录）。
+
+### 2.3 平台是多线程的，怎么知道是哪条请求弄挂的
+
+**先说结论：事后从"卡住的状态"反推是无效的。** 平台多线程处理，
+完成顺序 ≠ 发送顺序，所以看到"ACK 到第 51 条为止"只能说明"有一批没做完"，
+**不能说明是哪一条**。典型佐证（2026-09-29 ST-10 实测）：
+
+```
+ST-10 XLEN=96  entries-read=96  lag=0   ← 96 条全被读走
+ACK=51  PEND=45  NEVER=0
+PEL idle: 45 条全部 = 518138ms，跨度 0    ← 一模一样，说明是一次性批量派发的
+```
+
+还有 9 条「已 ACK 但无回包」（A205/AD215/AD223/AD232/AD235~AD239），
+以及回包流里的 `{"Errmsg":"json parse error","ErrID":-8}` ——
+都说明平台对畸形报文**有容错**，不是一碰就死；"没回包"也不等于"挂了"。
+
+**正确做法：消除并发这个变量 —— 一次只发一条，等它确认。**
+
+用 `tests/_find_culprit.py`：
+
+```bash
+# 先确认平台在线（脚本会自己做健康检查，不在线就直接中止，不白发）
+python tests/_find_culprit.py --assign-id 10 --interface account --type destroy
+
+# 只试可疑的一段
+python tests/_find_culprit.py --assign-id 10 --type destroy --cases AD240-AD503
+
+# 平台慢就把等待调大
+python tests/_find_culprit.py --assign-id 10 --type destroy --wait 8
+```
+
+它每条都发一个「正常」基线用例确认平台本来是活的，然后逐条发并等确认，
+一旦某条超时未确认就停下并报告——**上一条成功、这一条卡住，就是它**。
+
+三种判定：
+
+| verdict | 含义 | 说明 |
+|---|---|---|
+| `OK` / `OK_NO_REPLY` | 平台确认了 | `OK_NO_REPLY` = 平台处理了但没回包（平台自己的错误路径） |
+| `STUCK_PEND` | **读了但一直不确认** | 最可疑，就是让平台卡住的那条 |
+| `NOT_READ` | 压根没读 | 平台已经不干活了（先修平台再定位） |
+
+**它只用只读命令探测**（`XPENDING`/`XRANGE`/`XINFO`），
+**绝不 `XREADGROUP`** —— 那样会加入平台的消费组抢走消息（Streams 同组是
+负载均衡不是广播），真平台的单子会莫名少掉且不报错。
+
+> 如果单条都不挂：说明触发条件是**并发/组合**（线程池耗尽、连接池打满、
+> 某几条叠加），不是单条毒丸。这时用 `--cases` 把可疑段一起发来复现，
+> 或去查平台侧的线程/连接池。
 
 ### 2.2 平台挂了，怎么知道是哪条请求挂的
 
