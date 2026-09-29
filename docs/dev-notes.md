@@ -209,6 +209,63 @@ quickstart                       发 2000  回 2020  →  101%
 
 所以 [../soak_test.py](../soak_test.py) 先算出该类型的行号列表再轮换。
 
+### 3.2.1 业务流模式（`--flow`）为什么必须每轮重生成 modify/remove 表
+
+**背景**：`datahub_test` 那边只跑 query 查询接口，所以 soak 是"单接口循环"。
+策略方向这条链路是**增加/修改/删除**，要按业务顺序成组跑才有意义：
+一组 = `create → modify → remove` 各 batch 条，循环。
+
+**硬约束**：`modify`/`remove` 的 `Ref` 必须是平台上**真实存在**的单号
+（否则 `ref not exist`），而单号是**平台在 create 回包里给的**。
+
+单号的生成规则（[../interfaces/_common.py](../interfaces/_common.py) 的 `make_ref`）：
+
+```python
+make_ref(n) = "YYYYMMDD" + "%06d" % n     # 如 20260929000001
+```
+
+`__REF{i}__` 在**发送当天**展开成这个固定值 —— 注意它**不随轮次变化**。
+推论（这个坑很关键）：
+
+* 同一轮里，create 第 i 行永远会去建 `2026092900000i` 号单；
+* 如果上一轮的 remove **没删干净**，这一轮的 create 必然 `ref already inserted`；
+* 反过来，只要每轮 remove 真删掉，下一轮 create 就能**重建同样的号** ——
+  **一个完整生命周期刚好可以干净循环**，这正是 `--flow` 成立的前提。
+
+所以 `--flow` 的实现是：
+① create 用 `--refs-out` 把**本轮回包里的真实单号**落盘成 `refs.json`
+（`send_test.py` 的 `_on_reply_body` 抓 `Ref`）；
+② 调 `make_excel.py --interface modify --bulk-normal N --ref-map <refs.json>`
+用**账号→单号**映射回填，现生成 `modify.xlsx`；③ 发 modify；
+④/⑤ 对 remove 重复 ②③。
+
+**为什么不能"只生成一次反复用"**：`__REF` 展开带当天日期。跨天后
+单号整体变成新的日期段，预先写死的旧表会一条都对不上（全 `ref not exist`）。
+用 `--ref-map` 拿回包真值还额外解决了一个问题：**不依赖"create 一定按行序成功"**，
+跳过失败单也不会错位（对比 `--ref-seq` 的"靠行序对齐"，那个是备选方案）。
+
+**实施位置**：`run_flow_cycle()` / `gen_table()` / `ensure_create_table()`。
+
+### 3.2.2 mock 的 `--ref-echo`：不补这个，业务流跑不起来
+
+原 `mock_strategy.py` 的回包是**固定字符串** `{"status":"OK"}`，
+**不含 `Ref`** —— 这是 mock 的一个保真缺口：
+
+* 真实平台的 create 回包是
+  `{"Ref":"20260929000001","Errmsg":"insert success","ErrID":0}`
+  （见 `out/performance/*_refs.json` 实测：客户端发 `__REF1__` 展开值，
+  平台回的 `ref` 是同一个值）；
+* 而 mock 固定回包时，`send_test` 的 `_on_reply_body` 取不到 `Ref` →
+  `refs.json` 不落盘 → 第 ② 步直接失败（**任何人都跑不通**）。
+
+所以给 [../mock_strategy.py](../mock_strategy.py) 加了 `--ref-echo`：
+从请求的 `create`/`modify`/`remove` 子对象里取 `Ref` 原样回带，
+仿真实平台行为。跑 `--flow` 必须开它。
+
+> 这个坑的教训与 §1.1 是同一类：**mock 比真平台"更宽容"或"更简陋"时，
+> 本地跑通不代表链路成立**。改任何依赖回包内容的逻辑，都要先确认
+> mock 的回包是否具备真实平台的那些字段。
+
 ### 3.3 `--clean per-round` 在策略方向更危险
 
 `datahub_test` 每条 WT 有自己的回复流；策略方向的

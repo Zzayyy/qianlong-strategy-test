@@ -11,7 +11,8 @@ gui_test.py —— 策略平台测试 GUI（PySide6）
 
 界面结构（参照 datahub_test/gui_test.py 的布局习惯）：
     顶栏        标题 + 当前连接摘要
-    左栏(可滚动) 1 测试数据 → 2 发送参数（含 稳定性测试 分区）
+    左栏(可滚动) 1 测试数据（造/选数据）
+                 2 发送参数（发送范围 / 规模与速率 / 回复处理 / 稳定性测试）
     右栏(可滚动) 服务管理（起/停 Mock 策略平台/数据中台）
                  + 连接设置 / 策略平台身份 / 输出
     下栏标签页   运行日志 | 统计汇总（各带一条工具条）
@@ -415,6 +416,10 @@ class MainWindow(QWidget):
             if not self.cp.has_section("gui"):
                 self.cp.add_section("gui")
             self.cp.set("gui", "stats_out", self.edit_stats_out.text().strip())
+            # Mock 服务选项（纯偏好，无风险）
+            if hasattr(self, "chk_svc_refecho"):
+                self.cp.set("gui", "svc_refecho",
+                            "1" if self.chk_svc_refecho.isChecked() else "0")
             # 「每次发送前自动清空日志」记住用户的选择（纯偏好，无风险）
             self.cp.set("gui", "autoclear_log",
                         "1" if self.chk_autoclear.isChecked() else "0")
@@ -426,6 +431,8 @@ class MainWindow(QWidget):
             if hasattr(self, "chk_soak"):
                 self.cp.set("gui", "soak",
                             "1" if self.chk_soak.isChecked() else "0")
+                self.cp.set("gui", "soak_flow",
+                            "1" if self.chk_soak_flow.isChecked() else "0")
                 self.cp.set("gui", "soak_mode",
                             self.combo_soak_mode.currentData() or "rounds")
                 self.cp.set("gui", "soak_rounds", str(self.spin_soak_rounds.value()))
@@ -491,10 +498,14 @@ class MainWindow(QWidget):
 
     # ---- 左栏：只管「发什么」----
     def _build_left(self):
-        """左栏 = 1 测试数据 → 2 发送参数（含稳定性测试分区）。
+        """左栏 = 1 测试数据（造/选数据）→ 2 发送参数（怎么发，含 4 个分区）。
 
         布局参考 datahub_test/gui_test.py：连接/身份/输出/服务都搬到右栏，
         让左栏专注「要发什么」，从上到下一条主流程走完。
+
+        ★ 「用例类型」/「指定用例」放在「2. 发送参数 → 发送范围」而【不是】
+          「1. 测试数据」：它们是 send_test 的 --type/--cases，属于"这一批
+          怎么筛"，不改任何数据。datahub_test 也是这么摆的（g2 里）。
         """
         outer = QWidget()
         ol = QVBoxLayout(outer)
@@ -627,36 +638,27 @@ class MainWindow(QWidget):
             self.chk_ifaces[n] = chk
             g.addWidget(chk, i // 3, i % 3)
 
-        self.combo_type = QComboBox()
-        self.combo_type.addItems(["normal", "error", "destroy", "all"])
-        self.combo_type.currentTextChanged.connect(self._update_case_count)
-
-        self.edit_cases = QLineEdit("")
-        self.edit_cases.setPlaceholderText("留空=全部；如 C201,C203-C210 或 5-20（行号）")
-        self.edit_cases.setToolTip(
-            "按用例编号筛选，支持区间。分隔符可用 , ; 和空格，可混用。\n"
-            "  带字母 = 按「用例编号」列匹配（忽略大小写与前导零）：C201 / CB00001\n"
-            "  纯数字 = 按 Excel 数据行号（1 起始）：5 / 5-20\n"
-            "编号前缀=接口首字母：C=create M=modify R=remove P=pwdUpdate A=account\n\n"
-            "★ 写错会直接报错并停止发送，不会退化成「发全表」。\n"
-            "命令行下若没显式给 --type，写这里会自动把类型放宽为 all，\n"
-            "否则 --cases C201（destroy 用例）会被 normal 过滤成 0 条。")
-        # 改筛选条件也要刷新提示（只是拼字符串，不读表）
-        self.edit_cases.textChanged.connect(self._update_case_count)
-
-        g.addWidget(QLabel("用例类型"), len(names) // 3 + 1, 0)
-        g.addWidget(self.combo_type, len(names) // 3 + 1, 1)
-        g.addWidget(QLabel("指定用例"), len(names) // 3 + 2, 0)
-        g.addWidget(self.edit_cases, len(names) // 3 + 2, 1, 1, 2)
-
-        self.lbl_cases = QLabel("")
-        self.lbl_cases.setStyleSheet("color:#555;")
-        g.addWidget(self.lbl_cases, len(names) // 3 + 3, 0, 1, 3)
+        # 业务流模式下接口勾选不参与（接口固定），给一行说明。
+        # 行号放在所有接口勾选框【之下】：勾选框占 0..(len-1)//3 行。
+        self.lbl_ifaces_note = QLabel("")
+        self.lbl_ifaces_note.setWordWrap(True)
+        self.lbl_ifaces_note.setStyleSheet(
+            "color:#a15c00; background:#fff8e6;"
+            " border:1px solid #f0d9a0; border-radius:3px; padding:3px;")
+        self.lbl_ifaces_note.setVisible(False)
+        note_row = (len(names) - 1) // 3 + 1
+        g.addWidget(self.lbl_ifaces_note, note_row, 0, 1, 3)
 
         # ---------------- 生成压测数据（--bulk-normal / --ref-map）----------------
         # 默认每个接口 normal 只有 2~5 条，压测会循环复用同一批报文；
         # 这里按 datahub_test 的做法：批量账号 + 用 create 落盘的真实单号回填。
-        row_gen = len(names) // 3 + 4
+        #
+        # ★ 「用例类型」/「指定用例」原在本面板，已移到「2. 发送参数」的
+        #   「发送范围」分区 —— 它们是【发送时的筛选器】（send_test 的
+        #   --type / --cases），不是数据本身；本面板只留"造/选数据"的东西。
+        # ★ 行号要从「接口勾选 + 业务流说明」之下开始：
+        #   勾选框占 0..note_row-1，说明行在 note_row。
+        row_gen = note_row + 1
         self.spin_bulk_accounts = QSpinBox()
         self.spin_bulk_accounts.setRange(0, 1000000)
         self.spin_bulk_accounts.setValue(int(ini_get(self.cp, "gui", "bulk_accounts", "0") or 0))
@@ -719,7 +721,6 @@ class MainWindow(QWidget):
         self.lbl_gen.setStyleSheet("color:#666;")
         g.addWidget(self.lbl_gen, row_gen + 3, 0, 1, 4)
 
-        self.guard.install(self.combo_type)
         return box
 
     def _pick_ref_map(self):
@@ -812,7 +813,7 @@ class MainWindow(QWidget):
         self._update_case_count()
 
     def _box_send(self):
-        """2. 发送参数 —— 含「规模与速率 / 回复处理 / 稳定性测试」三个分区。
+        """2. 发送参数 —— 含「发送范围 / 规模与速率 / 回复处理 / 稳定性测试」四个分区。
 
         分区标题用下划线样式分隔（同 datahub_test），视觉上把参数分组，
         避免一长串控件看不出层次。
@@ -896,8 +897,51 @@ class MainWindow(QWidget):
         g.setColumnStretch(3, 1)
         g.setVerticalSpacing(6)
 
-        # ==================== A. 规模与速率 ====================
+        # ==================== A. 发送范围 ====================
+        # 「用例类型」(--type) 和「指定用例」(--cases) 是【发送时的筛选器】，
+        # 不是数据本身 —— 所以放在这里，与 datahub_test 的 g2 一致。
+        # 上面「1. 测试数据」只管"造/选哪些 Excel 数据"。
         r = 0
+        g.addWidget(section("发送范围"), r, 0, 1, 4)
+        r += 1
+
+        self.combo_type = QComboBox()
+        self.combo_type.addItems(["normal", "error", "destroy", "all"])
+        self.combo_type.currentTextChanged.connect(self._update_case_count)
+        self.combo_type.setToolTip(
+            "按用例类型筛选（命令行 --type）。\n"
+            "normal=合法报文（压测基线）；error=业务层非法；\n"
+            "destroy=畸形/极端报文；all=不过滤。\n\n"
+            "★ 它同时决定「稳定性测试」里回复率的默认档位：\n"
+            "  normal 默认要求 ≥99%，error/destroy/all 默认不判。")
+
+        self.edit_cases = QLineEdit("")
+        self.edit_cases.setPlaceholderText("留空=全部；如 C201,C203-C210 或 5-20（行号）")
+        self.edit_cases.setToolTip(
+            "按用例编号筛选，支持区间。分隔符可用 , ; 和空格，可混用。\n"
+            "  带字母 = 按「用例编号」列匹配（忽略大小写与前导零）：C201 / CB00001\n"
+            "  纯数字 = 按 Excel 数据行号（1 起始）：5 / 5-20\n"
+            "编号前缀=接口首字母：C=create M=modify R=remove P=pwdUpdate A=account\n\n"
+            "★ 写错会直接报错并停止发送，不会退化成「发全表」。\n"
+            "命令行下若没显式给 --type，写这里会自动把类型放宽为 all，\n"
+            "否则 --cases C201（destroy 用例）会被 normal 过滤成 0 条。")
+        # 改筛选条件也要刷新提示（只是拼字符串，不读表）
+        self.edit_cases.textChanged.connect(self._update_case_count)
+
+        g.addWidget(flabel("用例类型", "--type"), r, 0)
+        g.addWidget(self.combo_type, r, 1)
+        g.addWidget(flabel("指定用例", "--cases"), r, 2)
+        g.addWidget(self.edit_cases, r, 3)
+        r += 1
+
+        # 提示行跟着搬过来：它汇总的正是「接口 + 类型 + 指定用例」这个筛选结果
+        self.lbl_cases = QLabel("")
+        self.lbl_cases.setStyleSheet("color:#555;")
+        self.lbl_cases.setWordWrap(True)
+        g.addWidget(self.lbl_cases, r, 0, 1, 4)
+        r += 1
+
+        # ==================== B. 规模与速率 ====================
         g.addWidget(section("规模与速率"), r, 0, 1, 4)
         r += 1
         g.addWidget(flabel("并发线程", "--workers", "并发发送线程数。命令行：--workers N"),
@@ -925,7 +969,7 @@ class MainWindow(QWidget):
         g.addWidget(self.spin_rate, r, 3)
         r += 1
 
-        # ==================== B. 回复处理 ====================
+        # ==================== C. 回复处理 ====================
         g.addWidget(section("回复处理"), r, 0, 1, 4)
         r += 1
         g.addWidget(flabel("等回包 s", "--wait",
@@ -949,7 +993,7 @@ class MainWindow(QWidget):
         g.addWidget(self.chk_force_live, r, 0, 1, 4)
         r += 1
 
-        # ==================== C. 稳定性测试(Soak) ====================
+        # ==================== D. 稳定性测试(Soak) ====================
         r = self._build_soak_section(g, section, r)
 
         # 「按秒跑」> 0 时「总条数」失效（send_test.py 会把 max 强制设 0），
@@ -974,7 +1018,27 @@ class MainWindow(QWidget):
             "· 按轮反复调用 send_test.py（报文与「开始发送」完全一致）\n"
             "· 结束条件可选：按时长（默认 8h）或按轮数（短测用，跑够 N 轮收尾）\n"
             "· 只产出 trend.csv / summary.json / soak.log（避免几千个日志/表格）\n\n"
-            "接口/类型/目标流沿用左栏「1. 测试数据」与右栏「策略平台身份」的选择。")
+            "接口/类型/目标流沿用「1. 测试数据」的接口勾选、"
+            "本面板的「发送范围」与右栏「策略平台身份」的选择。")
+        # ---- 模式选择：单接口循环 vs 业务流循环 ----
+        self.chk_soak_flow = QCheckBox(
+            "业务流模式：一组 = create → modify → remove（推荐）")
+        self.chk_soak_flow.setChecked(
+            ini_get(self.cp, "gui", "soak_flow", "0") == "1")
+        self.chk_soak_flow.setToolTip(
+            "勾上 = 按【业务顺序】成组循环，最接近真实负载：\n"
+            "  ① create 发 N 条（自动从回包抓真实单号）\n"
+            "  ② 用这些单号现生成 modify 表 → 发 modify N 条\n"
+            "  ③ 同样现生成 remove 表 → 发 remove N 条\n"
+            "  然后循环下一组。\n\n"
+            "★ Ref 是动态的（平台回包给的），所以 modify/remove 表【每组重新生成】，\n"
+            "  不能预先写死 —— 否则第二天单号日期变了会全部 ref not exist。\n\n"
+            "不勾 = 单接口循环（原来的行为：反复发「1. 测试数据」里勾选的那个接口）。\n\n"
+            "⚠ 用自带 Mock 平台验证时必须勾 Mock 的「回包带回 Ref」，\n"
+            "   否则抓不到单号、业务流跑不起来。")
+        g.addWidget(self.chk_soak_flow, r, 0, 1, 4)
+        r += 1
+
         g.addWidget(self.chk_soak, r, 0, 1, 4)
         r += 1
 
@@ -1168,6 +1232,9 @@ class MainWindow(QWidget):
             self.guard.install(w)
         self.combo_soak_mode.currentIndexChanged.connect(self._sync_soak_mode)
         self.chk_soak.toggled.connect(self._sync_soak_visibility)
+        self.chk_soak_flow.toggled.connect(self._sync_soak_flow)
+        # 注意：chk_svc_refecho 属于【右栏服务管理】，而这里是左栏，
+        # 构建顺序上它还不存在 —— 那个信号在 _build_right 里接。
         self.spin_soak_batch.valueChanged.connect(self._update_soak_hint)
         # 这些都会改变"实际生效的判据"，提示要跟着变
         for w in (self.spin_soak_maxlag, self.spin_soak_maxpend,
@@ -1178,6 +1245,7 @@ class MainWindow(QWidget):
         self.combo_type.currentIndexChanged.connect(self._update_soak_hint)
         self._sync_soak_visibility()
         self._sync_soak_mode()
+        self._sync_soak_flow()
         self._update_soak_hint()
         return r
 
@@ -1255,21 +1323,94 @@ class MainWindow(QWidget):
         self.btn_soak.setEnabled(
             self.chk_soak.isChecked() and not getattr(self, "_soak_running", False))
 
+    def _set_ifaces_hint(self, flow):
+        """业务流模式时，在接口勾选区显示"这些勾选不参与"的说明。"""
+        lbl = getattr(self, "lbl_ifaces_note", None)
+        if lbl is None:
+            return
+        if flow:
+            lbl.setText("⚠ 已启用「业务流模式」：接口固定按 create → modify → remove "
+                        "顺序跑，这里的接口勾选【不参与】稳定性测试。")
+        lbl.setVisible(bool(flow))
+
+    def _sync_soak_flow(self):
+        """业务流模式下，把与之冲突的控件置灰。
+
+        soak_test.py 里 --flow 的硬约束（这些控件勾了也没用，灰掉免得误解）：
+          · 不能配 --rotate（每轮要重生成 modify/remove 表，行号轮换无意义）
+          · 只能 --type normal（业务流发的是合法报文）
+          · 只能 --clean monitor（清理回包流会干扰 refs 抓取）
+        """
+        flow = self.chk_soak_flow.isChecked()
+        self.chk_soak_rotate.setEnabled(not flow)
+        self.combo_soak_clean.setEnabled(not flow)
+        self.combo_type.setEnabled(not flow)
+        # 业务流模式的接口是固定的（create→modify→remove），
+        # 「1. 测试数据」的接口勾选不参与 —— 灰掉并说明，免得以为勾了才生效。
+        for chk in getattr(self, "chk_ifaces", {}).values():
+            chk.setEnabled(not flow)
+        self._set_ifaces_hint(flow)
+        if flow:
+            # 业务流恒用 normal + monitor；不强行改用户的选择值，
+            # 只让它们"看起来不生效"，避免来回切换时丢掉用户设置。
+            self.chk_soak_flow.setToolTip(
+                self.chk_soak_flow.toolTip().split("\n\n⚠ 业务流模式")[0] +
+                "\n\n⚠ 业务流模式下：用例类型固定 normal、清理固定 monitor、"
+                "「轮换用例」不生效（已置灰）。")
+        self._sync_refecho_hint()
+        self._update_soak_hint()
+
+    def _sync_refecho_hint(self):
+        """业务流模式依赖 Mock 的「回包带回 Ref」，缺了就明确提醒。
+
+        不自动改用户的勾选（那是服务启动参数，静默改动会让人困惑），
+        但要把后果说清楚 —— 否则只会得到一句莫名其妙的
+        「create 没有返回任何 Ref」。
+        """
+        chk = getattr(self, "chk_svc_refecho", None)
+        if chk is None:
+            return
+        base = ("仿真实平台：回包时把请求里的 Ref 原样带回。\n\n"
+                "★ 跑「业务流模式」（create→modify→remove）【必须勾上】：\n"
+                "  业务流要从 create 的回包抓真实单号，去生成 modify/remove 表。\n"
+                "  不勾的话 Mock 只回固定的 {\"status\":\"OK\"}，抓不到单号，\n"
+                "  第一步就会失败（提示「create 没有返回任何 Ref」）。\n\n"
+                "打真平台时不用管它（真平台本来就带 Ref）。")
+        if self.chk_soak_flow.isChecked() and not chk.isChecked():
+            chk.setStyleSheet("color:#b00; font-weight:bold;")
+            chk.setToolTip("⚠ 你已勾选「业务流模式」，但这里没勾！\n"
+                           "没勾的话 create 抓不到单号，业务流第 1 步就会失败。\n\n" + base)
+        else:
+            chk.setStyleSheet("")
+            chk.setToolTip(base)
+
     def _update_soak_hint(self):
         """把当前配置换算成人话，避免误填。"""
         try:
             n = len(self.selected_interfaces())
             b = self.spin_soak_batch.value()
-            if self._soak_by_rounds():
-                desc = "共 %d 轮 × %d 条 = 约 %d 条" % (
-                    self.spin_soak_rounds.value(), b,
-                    self.spin_soak_rounds.value() * b)
+            flow = self.chk_soak_flow.isChecked()
+            if flow:
+                # 业务流：一组 = 三段各 b 条
+                if self._soak_by_rounds():
+                    desc = "共 %d 组 × (create+modify+remove 各 %d 条) = 约 %d 条" % (
+                        self.spin_soak_rounds.value(), b,
+                        self.spin_soak_rounds.value() * b * 3)
+                else:
+                    desc = ("时长 %.2fh，每组 create+modify+remove 各 %d 条"
+                            "（组数取决于每组耗时）" % (self.spin_soak_hours.value(), b))
+                desc += "；目标流 %s" % self._stream_name()
             else:
-                # 按时长只能给个下限提示（真实轮数取决于每轮耗时）
-                desc = "时长 %.2fh，每轮 %d 条（轮数取决于每轮耗时）" % (
-                    self.spin_soak_hours.value(), b)
-            if n:
-                desc += "；%d 个接口依次各跑一场" % n
+                if self._soak_by_rounds():
+                    desc = "共 %d 轮 × %d 条 = 约 %d 条" % (
+                        self.spin_soak_rounds.value(), b,
+                        self.spin_soak_rounds.value() * b)
+                else:
+                    # 按时长只能给个下限提示（真实轮数取决于每轮耗时）
+                    desc = "时长 %.2fh，每轮 %d 条（轮数取决于每轮耗时）" % (
+                        self.spin_soak_hours.value(), b)
+                if n:
+                    desc += "；%d 个接口依次各跑一场" % n
             # 判据也提示出来：默认哪些是关的，避免"以为在判其实没判"
             mr = self.spin_soak_minreply.value()
             if mr < 0:
@@ -1296,11 +1437,24 @@ class MainWindow(QWidget):
             pass
 
     def build_soak_cmd(self, name):
-        """构造 soak_test.py 命令行（接口/类型/目标流沿用左栏选择）。"""
+        """构造 soak_test.py 命令行（接口/类型/目标流沿用左栏选择）。
+
+        业务流模式（勾了 chk_soak_flow）时不传 --interface，改传 --flow ——
+        soak 自己固定跑 create→modify→remove。
+        """
+        flow = self.chk_soak_flow.isChecked()
         a = self._base_cmd("soak_test.py") + self._conn_args()
         a += ["--assign-id", str(self.spin_assign.value())]
-        a += ["--interface", name]
-        t = self.combo_type.currentText()
+        if flow:
+            a += ["--flow"]
+        else:
+            a += ["--interface", name]
+        # ★ 下面三项在 flow 模式下有硬约束（不满足 soak 会直接拒绝运行）。
+        #   控件虽被置灰，但勾选状态还在，必须在这里按模式过滤：
+        #     --type  只能 normal（业务流发的是合法报文）
+        #     --clean 只能 monitor（清理回包流会干扰 refs 抓取）
+        #     --rotate 不能用（每轮要重生成表，行号轮换无意义）
+        t = "normal" if flow else self.combo_type.currentText()
         if t:
             a += ["--type", t]
         if self._soak_by_rounds():
@@ -1309,8 +1463,9 @@ class MainWindow(QWidget):
             a += ["--hours", "%g" % self.spin_soak_hours.value()]
         a += ["--batch", str(self.spin_soak_batch.value())]
         a += ["--gap", "%g" % self.spin_soak_gap.value()]
-        a += ["--clean", self.combo_soak_clean.currentData() or "monitor"]
-        if self.chk_soak_rotate.isChecked():
+        a += ["--clean", "monitor" if flow
+              else (self.combo_soak_clean.currentData() or "monitor")]
+        if self.chk_soak_rotate.isChecked() and not flow:
             a += ["--rotate"]
         if self.chk_soak_keep.isChecked():
             a += ["--keep-round-stats"]
@@ -1344,26 +1499,37 @@ class MainWindow(QWidget):
         return a
 
     def on_soak(self):
-        """运行稳定性测试：对勾选的每个接口依次跑 soak_test.py。"""
+        """运行稳定性测试。
+
+        单接口模式：对勾选的每个接口依次各跑一场。
+        业务流模式：只跑【一场】（一组固定是 create→modify→remove），
+                   接口勾选不参与 —— 否则勾了 3 个接口就会把同一套业务流跑 3 遍。
+        """
         if not self.chk_soak.isChecked():
             QMessageBox.information(self, "提示",
                                     "请先勾选「启用稳定性测试」")
             return
+        flow = self.chk_soak_flow.isChecked()
         names = self.selected_interfaces()
-        if not names:
+        if flow:
+            # 业务流不按接口拆；给个占位名让后续日志/命令构造照常工作
+            names = ["(业务流)"]
+        elif not names:
             QMessageBox.warning(self, "提示", "请先勾选至少一个接口")
             return
         if not self._confirm_conn():
             return
         # 便宜的预检：只看 Excel 在不在（不读内容）
-        missing = [n for n in names
-                   if CASES and not os.path.exists(CASES.default_excel(n))]
-        if missing:
-            QMessageBox.warning(
-                self, "缺少用例表",
-                "这些接口的 Excel 还不存在：%s\n\n"
-                "先生成：python make_excel.py --interface all" % ",".join(missing))
-            return
+        # 业务流模式下 create 表由 soak 自己按需生成，这里不预检
+        if not flow:
+            missing = [n for n in names
+                       if CASES and not os.path.exists(CASES.default_excel(n))]
+            if missing:
+                QMessageBox.warning(
+                    self, "缺少用例表",
+                    "这些接口的 Excel 还不存在：%s\n\n"
+                    "先生成：python make_excel.py --interface all" % ",".join(missing))
+                return
 
         # 长稳前确认：这是"要跑很久"的操作，且会持续往真流写数据
         rounds_txt = ("%d 轮" % self.spin_soak_rounds.value()) if self._soak_by_rounds() \
@@ -1374,16 +1540,22 @@ class MainWindow(QWidget):
             warn = ("\n⚠ 流处理选了「每轮清理回包流」：\n"
                     "   DataHub_reply_stream 是多条 ST-* 共用的全局流，\n"
                     "   非独占环境会清掉别人的回包。确认只有你在用再继续。\n")
+        what = ("一组 = create → modify → remove 各 %d 条"
+                % self.spin_soak_batch.value()) if flow \
+            else ("接口      : %s" % ",".join(names))
         if not self._ask(
                 "确认运行稳定性测试",
-                "即将对 [%s] 依次运行稳定性测试：\n\n"
+                "即将运行稳定性测试：\n\n"
+                "  模式      : %s\n"
+                "  %s\n"
                 "  类型      : %s\n"
                 "  结束条件  : %s\n"
                 "  每轮条数  : %d\n"
                 "  目标流    : %s\n"
                 "%s\n"
                 "它会持续往目标流写数据。确认继续？"
-                % (",".join(names), self.combo_type.currentText(), rounds_txt,
+                % ("业务流（create→modify→remove）" if flow else "单接口循环",
+                   what, self.combo_type.currentText(), rounds_txt,
                    self.spin_soak_batch.value(), self._stream_name(), warn)):
             return
 
@@ -1391,10 +1563,17 @@ class MainWindow(QWidget):
             self.clear_log("[提示] 日志已自动清空（勾了「每次发送前自动清空」）")
         self.append_log("")
         self.append_log("#" * 60)
-        self.append_log("# 开始稳定性测试：接口=[%s] 类型=%s %s 每轮=%d 目标流=%s"
-                        % (",".join(names), self.combo_type.currentText(),
-                           rounds_txt, self.spin_soak_batch.value(),
-                           self._stream_name()))
+        if flow:
+            self.append_log("# 开始稳定性测试：业务流 create→modify→remove 各 %d 条 %s"
+                            " 目标流=%s"
+                            % (self.spin_soak_batch.value(), rounds_txt,
+                               self._stream_name()))
+            self.append_log("# 每组会从 create 回包抓真实单号，现生成 modify/remove 表")
+        else:
+            self.append_log("# 开始稳定性测试：接口=[%s] 类型=%s %s 每轮=%d 目标流=%s"
+                            % (",".join(names), self.combo_type.currentText(),
+                               rounds_txt, self.spin_soak_batch.value(),
+                               self._stream_name()))
         self.append_log("#" * 60)
         self.append_log("[提示] soak 在子进程里跑；进度可直接看上面的输出，"
                         "或 out/soak/soak_*_soak.log")
@@ -1440,20 +1619,36 @@ class MainWindow(QWidget):
         self.chk_svc_autoid.setToolTip(
             "勾选=自己占编号直接用（不需要数据中台）；\n"
             "取消=等真/Mock 数据中台分配编号（走完整握手）")
+        self.chk_svc_refecho = QCheckBox("回包带回 Ref")
+        self.chk_svc_refecho.setChecked(
+            ini_get(self.cp, "gui", "svc_refecho", "0") == "1")
+        self.chk_svc_refecho.setToolTip(
+            "仿真实平台：回包时把请求里的 Ref 原样带回，例如\n"
+            "  {\"Ref\":\"20260929000001\",\"Errmsg\":\"ok\",\"ErrID\":0}\n\n"
+            "★ 跑「业务流模式」（create→modify→remove）【必须勾上】：\n"
+            "  业务流要从 create 的回包抓真实单号，去生成 modify/remove 表。\n"
+            "  不勾的话 Mock 只回固定的 {\"status\":\"OK\"}，抓不到单号，\n"
+            "  第一步就会失败（提示「create 没有返回任何 Ref」）。\n\n"
+            "打真平台时不用管它（真平台本来就带 Ref，且这个开关只影响 Mock）。")
         self.spin_svc_workers = QSpinBox()
         self.spin_svc_workers.setRange(1, 64)
         self.spin_svc_workers.setValue(4)
         self.spin_svc_workers.setMaximumWidth(70)
         self.spin_svc_workers.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.guard.install(self.spin_svc_workers, self.chk_svc_suffix)
+        self.guard.install(self.spin_svc_workers, self.chk_svc_suffix,
+                           self.chk_svc_refecho)
+        # 左栏的 soak 分区先建好了，这里补接联动（见 _sync_refecho_hint）
+        self.chk_svc_refecho.toggled.connect(self._sync_refecho_hint)
+        self._sync_refecho_hint()
 
         g.addWidget(self.lbl_svc_st, 0, 0, 1, 2)
         g.addWidget(self.btn_st_svc, 1, 0)
         g.addWidget(self.btn_sp_svc, 1, 1)
         g.addWidget(self.chk_svc_autoid, 2, 0)
         g.addWidget(self.chk_svc_suffix, 2, 1)
-        g.addWidget(QLabel("消费线程"), 3, 0)
-        g.addWidget(self.spin_svc_workers, 3, 1)
+        g.addWidget(self.chk_svc_refecho, 3, 0, 1, 2)
+        g.addWidget(QLabel("消费线程"), 4, 0)
+        g.addWidget(self.spin_svc_workers, 4, 1)
         lay.addWidget(grp)
 
         # Mock 数据中台 —— 打真实策略平台时【必起】：真平台重启/清库后会退回
@@ -2115,6 +2310,9 @@ class MainWindow(QWidget):
         a += ["--mac", self.edit_mac.text().strip() or "2cea7fd9d5c0"]
         a += ["--usecount", str(self.spin_usecount.value())]
         a += ["--workers", str(self.spin_svc_workers.value())]
+        if self.chk_svc_refecho.isChecked():
+            # 业务流模式必须开：回包带回请求里的 Ref，soak 才能抓到单号
+            a += ["--ref-echo"]
         if self.chk_svc_suffix.isChecked():
             a += ["--channel-suffix", "_1"]
         if self.chk_svc_autoid.isChecked():

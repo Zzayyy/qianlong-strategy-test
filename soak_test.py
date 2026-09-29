@@ -320,18 +320,24 @@ def _rotate_spec(rows, offset, batch):
     return _compress_rows(picked)
 
 
-# ==================== 单轮 ====================
-def run_round(args, round_no, round_dir, cases_spec=None):
-    """跑一轮 send_test.py。返回 (stats 或 None, 错误信息)。"""
+# ==================== 单次发送 ====================
+def run_send(args, round_dir, interface, label, cases_spec=None, extra=None):
+    """跑一次 send_test.py（指定接口 + 标签 + 额外参数）。
+
+    返回 (stats 或 None, 错误信息, tail)。错误信息为 SQL 式的哨兵串：
+      "SAFETY_GATE" / "NO_CASES" / "单轮超时 ..." / "未生成 stats ..."
+    """
     os.makedirs(round_dir, exist_ok=True)
     # soak 的强制参数放在透传参数之后，确保覆盖（--max / --stats-out）
     cmd = [sys.executable, SEND_TEST] + list(args.passthrough) + [
-        "--interface", args.interface,
+        "--interface", interface,
         "--max", str(args.batch),
         "--stats-out", round_dir,
-        "--label", "soak_r%05d" % round_no,   # 固定标签，便于定位
+        "--label", label,
         "--no-run-log",
     ]
+    if extra:
+        cmd += list(extra)
     if args.type:
         cmd += ["--type", args.type]
     if args.assign_id is not None:
@@ -384,13 +390,205 @@ def run_round(args, round_no, round_dir, cases_spec=None):
     return stats, "", tail
 
 
+def run_round(args, round_no, round_dir, cases_spec=None):
+    """单接口模式的「一轮」= 跑一次 send_test.py。"""
+    return run_send(args, round_dir, args.interface,
+                    "soak_r%05d" % round_no, cases_spec)
+
+
+# ==================== 业务流模式（create -> modify -> remove）====================
+MAKE_EXCEL = os.path.join(BASE_DIR, "make_excel.py")
+
+# 一组业务流的固定顺序。顺序是硬约束（见 docs/guide.md 第 6 节）：
+#   account 先能登录 -> create 造单 -> modify 改单 -> remove 删单
+# 这里不含 account：它是"每个账号一次"的前置动作，不属于每轮循环的业务量。
+FLOW_STAGES = ("create", "modify", "remove")
+
+
+def gen_table(interface, count, ref_map="", timeout=900):
+    """调 make_excel.py 生成/重生成一张表。
+
+    返回 (ok, msg, actual_path)。actual_path 为实际写入的表 ——
+    ★ 如果原表被 Excel/WPS 占着，make_excel 会【另存 _v2.xlsx 且原表不变】，
+      这时候必须让 soak 报错停下，否则会拿旧表接着发（静默发错数据）。
+    """
+    cmd = [sys.executable, MAKE_EXCEL, "--interface", interface,
+           "--bulk-normal", str(count)]
+    if ref_map:
+        cmd += ["--ref-map", ref_map]
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    try:
+        p = subprocess.run(cmd, cwd=BASE_DIR, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout)
+        out = (p.stdout or b"").decode("utf-8", "replace")
+    except Exception as e:
+        return False, "调 make_excel 失败: %s" % e, ""
+    tail = " | ".join(out.strip().splitlines()[-2:]) if out.strip() else ""
+    if p.returncode != 0:
+        return False, "make_excel 退出码 %s: %s" % (p.returncode, tail), ""
+    # ★ 原表被占用：make_excel 退出码仍是 0，但原表没更新（会另存 _v2）
+    if "原文件没有更新" in out:
+        return False, "目标表被 Excel/WPS 占用，原表没更新（新内容另存成了 _v2）：%s" % tail, ""
+    if interface in ("modify", "remove"):
+        if "[ERROR]" in out:
+            return False, "ref 回填失败（全部没命中，发出去会 ref not exist）：%s" % tail, ""
+        if "[WARN]" in out and "账号未在 refs 映射里" in out:
+            return False, "ref 回填部分未命中：%s" % tail, ""
+    return True, tail, os.path.join(BASE_DIR, "data", "%s.xlsx" % interface)
+
+
+def ensure_create_table(args, log):
+    """业务流跑之前，确保 create.xlsx 有 >= batch 行 normal。
+
+    create 的 Ref 是自生成的（__REF{i}__ 当天展开），不依赖 refs.json，
+    所以它的表【只需生成一次】；modify/remove 才要每轮按新 refs 重生成。
+    """
+    excel = os.path.join(BASE_DIR, "data", "create.xlsx")
+    n = len(_rows_of_type(excel, "normal", {"normal"}))
+    if n >= args.batch:
+        log("create.xlsx 已有 %d 行 normal（>= 每轮 %d），无需重新生成"
+            % (n, args.batch))
+        return True
+    log("create.xlsx 只有 %d 行 normal，少于每轮 %d —— 自动生成 --bulk-normal %d"
+        % (n, args.batch, args.batch))
+    ok, msg, _ = gen_table("create", args.batch)
+    log("  生成 create.xlsx: %s%s" % ("OK" if ok else "失败", "" if ok else " " + msg))
+    return ok
+
+
+def run_flow_cycle(args, round_no, cycle_dir, refs_path, log, on_step=None):
+    """跑【一组】业务流：create -> 生成 modify 表 -> modify -> 生成 remove 表 -> remove。
+
+    on_step(stage, stats, dt) 每完成【一次发送】就回调一次，便于逐步写趋势与进度
+    （一组可能有 3×batch 条，等整组跑完才输出会看不到进度）。
+    生成表不是"发送"，不走 on_step，只写日志。
+
+    返回中止原因（"" = 整组跑完）。任何一步失败都中止本组：
+    create 失败 -> 没有单号，后面无从谈起；生成表失败 -> 拒绝拿旧表发送。
+
+    ★ 为什么 modify/remove 表要每轮重生成：
+      Ref 是【当天日期+序号】，同一轮里展开值固定（如 __REF1__ -> 20260929000001）。
+      上一轮的 remove 真删掉之后，这一轮 create 才能重新造出同样的号。
+      所以每轮必须拿【本轮 create 刚回包的真实单号】重新回填 modify/remove，
+      跨天或换号段时也不会错。
+    """
+    os.makedirs(cycle_dir, exist_ok=True)
+
+    def emit(stage, stats, t0):
+        if on_step:
+            on_step(stage, stats, time.time() - t0)
+
+    # ---- 1) create：造单，并从回包抓真实单号落盘 ----
+    t0 = time.time()
+    stats, err, _ = run_send(args, cycle_dir, "create",
+                             "soak_c%05d_create" % round_no,
+                             extra=["--refs-out", refs_path])
+    emit("create", stats, t0)
+    if stats is None:
+        return "create 未成功（%s），本组中止（后续 modify/remove 无单号可用）" % err
+
+    # ---- 2) modify：用刚抓到的真实单号重生成表 ----
+    if not os.path.exists(refs_path):
+        log("  生成 modify 表: 失败 —— 没抓到 refs.json（create 没有返回单号）")
+        return "create 没有返回任何 Ref，无法生成 modify"
+    try:
+        with open(refs_path, encoding="utf-8") as f:
+            n_refs = len(json.load(f))
+    except Exception as e:
+        return "读 refs.json 失败: %s" % e
+    if n_refs <= 0:
+        return "refs.json 里没有单号"
+    log("  create 抓到 %d 个真实单号 -> %s" % (n_refs, os.path.basename(refs_path)))
+
+    t0 = time.time()
+    ok, msg, _ = gen_table("modify", args.batch, ref_map=refs_path)
+    log("  生成 modify 表: %s（%.1fs）%s"
+        % ("OK" if ok else "失败", time.time() - t0, "" if ok else " " + msg))
+    if not ok:
+        return "生成 modify 表失败: %s" % msg
+
+    t0 = time.time()
+    stats, err, _ = run_send(args, cycle_dir, "modify",
+                             "soak_c%05d_modify" % round_no)
+    emit("modify", stats, t0)
+    if stats is None:
+        return "modify 未成功（%s），本组中止（为保证「删干净」不再发 remove）" % err
+
+    # ---- 3) remove：同一批单号，删掉（删干净下一轮 create 才能重建同名号）----
+    t0 = time.time()
+    ok, msg, _ = gen_table("remove", args.batch, ref_map=refs_path)
+    log("  生成 remove 表: %s（%.1fs）%s"
+        % ("OK" if ok else "失败", time.time() - t0, "" if ok else " " + msg))
+    if not ok:
+        return "生成 remove 表失败: %s" % msg
+
+    t0 = time.time()
+    stats, err, _ = run_send(args, cycle_dir, "remove",
+                             "soak_c%05d_remove" % round_no)
+    emit("remove", stats, t0)
+    if stats is None:
+        return "remove 未成功（%s）—— 上一轮的单没删掉，下一轮 create 可能 ref already inserted" % err
+    return ""
+
+
+# ==================== 判据（两种模式共用） ====================
+def judge(stats, args, pd=None, lag=None):
+    """按当前阈值判一次发送是否异常，返回 reasons 列表（空=正常）。
+
+    抽出来是为了让「单接口模式」和「业务流模式」用【同一套判据】，
+    不会出现两处各判一套、标准还不一致的情况。
+    """
+    reasons = []
+    if stats is None:
+        return reasons
+    sent = _int_or(stats.get("sent"))
+    reply = _int_or(stats.get("reply"))
+    fail = _int_or(stats.get("send_fail"))
+    tout = _int_or(stats.get("timeout_reply"))
+    outn = _int_or(stats.get("outstanding"))
+    rr = _as_num(stats.get("reply_rate"))
+    rep_rate = (rr * 100.0) if rr is not None else \
+        ((reply / float(sent) * 100.0) if sent else 0.0)
+    if fail > 0:
+        reasons.append("发送失败%d" % fail)
+    if args.min_reply_rate > 0 and sent and rep_rate < args.min_reply_rate:
+        reasons.append("回复率%.1f%%<%.1f%%" % (rep_rate, args.min_reply_rate))
+    if args.max_pending > 0 and pd is not None and pd > args.max_pending:
+        reasons.append("未ACK%d>%d" % (pd, args.max_pending))
+    if args.max_lag > 0 and lag is not None and lag > args.max_lag:
+        reasons.append("lag%d>%d" % (lag, args.max_lag))
+    if args.max_timeout_reply > 0 and tout > args.max_timeout_reply:
+        reasons.append("超时未回%d>%d" % (tout, args.max_timeout_reply))
+    if args.max_outstanding > 0 and outn > args.max_outstanding:
+        reasons.append("在途%d>%d" % (outn, args.max_outstanding))
+    return reasons
+
+
+def _reply_rate(stats):
+    """取该次发送的回复率%（恒 <= 100）。"""
+    if not stats:
+        return 0.0
+    rr = _as_num(stats.get("reply_rate"))
+    if rr is not None:
+        return rr * 100.0
+    sent = _int_or(stats.get("sent"))
+    return (_int_or(stats.get("reply")) / float(sent) * 100.0) if sent else 0.0
+
+
 # ==================== 主流程 ====================
 def main():
     ap = argparse.ArgumentParser(
         description="稳定性测试编排（复用 send_test.py，按轮持续发送并汇总趋势）",
         epilog="未识别参数会原样透传给 send_test.py")
-    ap.add_argument("--interface", required=True,
-                    help="接口名：create/modify/remove/pwdUpdate/account")
+    ap.add_argument("--interface", required=False, default="",
+                    help="接口名：create/modify/remove/pwdUpdate/account。"
+                         "★ 用 --flow 时忽略它（一组固定跑 create→modify→remove）")
+    ap.add_argument("--flow", action="store_true",
+                    help="业务流模式：一组 = create→modify→remove（各 batch 条），"
+                         "循环跑。每轮 modify/remove 表会用本轮 create 回包抓到的"
+                         "真实单号重新生成（Ref 是动态的，不能预先写死）")
     ap.add_argument("--type", default="normal",
                     help="用例类型 normal/error/destroy/all（默认 normal）")
     ap.add_argument("--assign-id", type=int, default=None,
@@ -465,6 +663,37 @@ def main():
     if args.db is not None:
         kw["db"] = args.db
 
+    # ---- 参数校验（两种模式）----
+    if args.flow:
+        # 业务流模式：接口固定是 create/modify/remove，--interface 无意义
+        if args.rotate:
+            print("[FAIL] --flow 与 --rotate 不能同用："
+                  "业务流每轮都要重生成 modify/remove 表，行号轮换无意义")
+            return 1
+        if not args.batch or args.batch <= 0:
+            print("[FAIL] --flow 需要 --batch > 0（每段各发这么多条）")
+            return 1
+        if args.clean != "monitor":
+            print("[FAIL] --flow 只支持 --clean monitor："
+                  "业务流靠「上一轮 remove 删干净、下一轮 create 重建」循环，"
+                  "清空回包流会干扰 refs 抓取判断")
+            return 1
+        if args.type.strip().lower() not in ("normal", "all", ""):
+            print("[FAIL] --flow 只能配 --type normal（业务流发的是合法报文）；"
+                  "当前是 %s" % args.type)
+            return 1
+        if args.interface:
+            print("[提示] --flow 已启用，忽略 --interface=%s（一组固定跑 %s）"
+                  % (args.interface, "→".join(FLOW_STAGES)))
+    else:
+        if not args.interface:
+            print("[FAIL] 必须给 --interface（或改用 --flow 跑业务流）")
+            return 1
+        if args.interface not in ("create", "modify", "remove",
+                                  "pwdUpdate", "account"):
+            print("[FAIL] --interface 只能是 create/modify/remove/pwdUpdate/account")
+            return 1
+
     # ---- 目标流 ----
     stream = args.stream
     if not stream:
@@ -478,7 +707,9 @@ def main():
 
     root = args.soak_out or os.path.join(BASE_DIR, "out", "soak")
     run_id = time.strftime("%Y%m%d_%H%M%S")
-    prefix = "soak_%s_%s" % (args.interface, run_id)
+    flow_tag = "流" if args.flow else ""
+    prefix = "soak_%s%s_%s" % (flow_tag, "create-modify-remove" if args.flow
+                               else args.interface, run_id)
     os.makedirs(root, exist_ok=True)
     rounds_dir = os.path.join(root, prefix + "_rounds")
     os.makedirs(rounds_dir, exist_ok=True)
@@ -507,9 +738,15 @@ def main():
     deadline = None if by_rounds else time.time() + args.hours * 3600
     target_desc = ("轮数=%d" % args.rounds) if by_rounds else ("时长=%sh" % args.hours)
 
-    log("稳定性测试开始: 接口=%s 类型=%s 目标流=%s %s 每轮=%d 清理=%s 轮间隔=%ss"
-        % (args.interface, args.type, stream, target_desc, args.batch,
-           args.clean, args.gap))
+    if args.flow:
+        log("稳定性测试开始（业务流模式）: 一组 = %s 各 %d 条，目标流=%s %s"
+            % (" → ".join(FLOW_STAGES), args.batch, stream, target_desc))
+        log("每轮 modify/remove 表会用【本轮 create 回包抓到的真实单号】重新生成"
+            "（Ref 是动态的，不能预先写死）")
+    else:
+        log("稳定性测试开始: 接口=%s 类型=%s 目标流=%s %s 每轮=%d 清理=%s 轮间隔=%ss"
+            % (args.interface, args.type, stream, target_desc, args.batch,
+               args.clean, args.gap))
     log("判据: 回复率下限=%s  发送失败>0   lag>%s判定   未ACK>%s判定   "
         "超时未回>%s判定   在途>%s判定"
         % (("%g%%" % args.min_reply_rate) if args.min_reply_rate > 0 else "关",
@@ -541,11 +778,18 @@ def main():
         log("提示：%s 上还没有消费组 %s —— 平台可能没在读这条流。"
             "这时每轮都会收不到回包（不等于平台挂了）" % (stream, GROUP))
 
-    header = ["轮次", "时间", "发送数", "回包数", "发送失败", "超时未回", "在途",
-              "回复率%", "非本次回包", "发送速率(条/s)",
-              "延迟p50(ms)", "延迟p99(ms)", "延迟max(ms)",
-              "目标流XLEN", "已读", "未ACK", "lag", "回复流XLEN",
-              "CPU%", "异常"]
+    if args.flow:
+        header = ["轮次", "时间", "阶段", "发送数", "回包数", "发送失败", "超时未回",
+                  "在途", "回复率%", "非本次回包", "发送速率(条/s)",
+                  "延迟p50(ms)", "延迟p99(ms)", "延迟max(ms)",
+                  "目标流XLEN", "已读", "未ACK", "lag", "回复流XLEN",
+                  "CPU%", "异常"]
+    else:
+        header = ["轮次", "时间", "发送数", "回包数", "发送失败", "超时未回", "在途",
+                  "回复率%", "非本次回包", "发送速率(条/s)",
+                  "延迟p50(ms)", "延迟p99(ms)", "延迟max(ms)",
+                  "目标流XLEN", "已读", "未ACK", "lag", "回复流XLEN",
+                  "CPU%", "异常"]
     with open(trend_path, "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(header)
 
@@ -554,6 +798,33 @@ def main():
     abnormal_rounds = []
     round_no = 0
     start_ts = time.time()
+
+    def append_row(row):
+        with open(trend_path, "a", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(row)
+
+    def snapshot_probe():
+        """取一次服务端视角的快照（目标流/回包流）。"""
+        return (probe.xlen(stream),) + probe.group_state(stream) + \
+               (probe.xlen(REPLY_STREAM),)
+
+    def log_result(prefix_txt, sent, reply, fail, rep_rate, dt, xlen, rd, pd, lag,
+                   foreign, reasons):
+        log("%s 发送=%d 回包=%d 失败=%d 回复率=%.1f%% 耗时=%.1fs | "
+            "目标流 XLEN=%s 已读=%s 未ACK=%s lag=%s"
+            % (prefix_txt, sent, reply, fail, rep_rate, dt, xlen, rd, pd, lag)
+            + ("  [剔除非本次 %d 条]" % foreign if foreign else "")
+            + ("  [异常: %s]" % ",".join(reasons) if reasons else ""))
+
+    # ---- 业务流模式：跑之前先确认 create 表够用（modify/remove 每轮现生成）----
+    if args.flow:
+        if not ensure_create_table(args, log):
+            log("[FAIL] create 表不可用，业务流模式无法开始")
+            try:
+                _log_fp.close()
+            except Exception:
+                pass
+            return 1
 
     try:
         while True:
@@ -565,104 +836,170 @@ def main():
             round_no += 1
             remain = ("剩余 %d 轮" % (args.rounds - round_no)) if by_rounds \
                 else ("剩余 %.1f 分钟" % ((deadline - time.time()) / 60.0))
-            log("--- 第 %d 轮开始（%s）---" % (round_no, remain))
 
             round_dir = os.path.join(rounds_dir, "r%05d" % round_no)
             cases_spec = None
-            if args.rotate and rotate_rows:
+            if not args.flow and args.rotate and rotate_rows:
                 cases_spec = _rotate_spec(rotate_rows,
                                           (round_no - 1) * args.batch, args.batch)
+
+            if args.flow:
+                log("--- 第 %d 组开始（%s）: create → modify → remove，各 %d 条 ---"
+                    % (round_no, remain, args.batch))
+            else:
+                log("--- 第 %d 轮开始（%s）---" % (round_no, remain))
 
             t0 = time.time()
             xlen = rd = pd = lag = rxlen = None
             row = None
             try:
-                stats, err, tail = run_round(args, round_no, round_dir, cases_spec)
-                dt = time.time() - t0
+                if args.flow:
+                    # ==================== 业务流：一组 = create→modify→remove ====================
+                    g_sent = g_reply = g_fail = g_tout = 0
+                    g_abnormal = False
+                    g_foreign = 0
+                    stage_notes = []
 
-                xlen = probe.xlen(stream)
-                rd, pd, lag = probe.group_state(stream)
-                rxlen = probe.xlen(REPLY_STREAM)
+                    def on_step(stage, stats, dt):
+                        """每跑完一步（一次发送）就立刻写一行趋势 ——
+                        一组可能很久（3×batch 条），等整组跑完才输出会看不到进度。"""
+                        nonlocal g_sent, g_reply, g_fail, g_tout, g_abnormal, g_foreign
+                        x_, r_, p_, l_, rx_ = snapshot_probe()
+                        if stats is None:
+                            # 发送失败：算异常，记下来继续下一组
+                            append_row([round_no, _now_str(), stage] + [""] * 16 +
+                                       ["ERR:无 stats"])
+                            log("    第 %d 组 %s: 失败（%.1fs）" % (round_no, stage, dt))
+                            g_abnormal = True
+                            return
+                        sent = _int_or(stats.get("sent"))
+                        reply = _int_or(stats.get("reply"))
+                        fail = _int_or(stats.get("send_fail"))
+                        tout = _int_or(stats.get("timeout_reply"))
+                        outn = _int_or(stats.get("outstanding"))
+                        foreign = _int_or(stats.get("reply_foreign"))
+                        rep_rate = _reply_rate(stats)
+                        sps = _float_or(stats.get("send_per_sec"))
+                        # 判据与单接口模式【完全同一套】（共用 judge）
+                        reasons = judge(stats, args, pd=p_, lag=l_)
+                        g_sent += sent
+                        g_reply += reply
+                        g_fail += fail
+                        g_tout += tout
+                        g_foreign += foreign
+                        if reasons:
+                            g_abnormal = True
+                            stage_notes.append("%s:%s" % (stage, ",".join(reasons)))
+                        append_row([round_no, _now_str(), stage, sent, reply,
+                                    fail, tout, outn, round(rep_rate, 2), foreign,
+                                    round(sps, 1),
+                                    round(_float_or(stats.get("lat_p50_ms")), 2),
+                                    round(_float_or(stats.get("lat_p99_ms")), 2),
+                                    round(_float_or(stats.get("lat_max_ms")), 2),
+                                    x_, r_, p_, l_, rx_,
+                                    round(_float_or((stats.get("cpu") or {}
+                                                     ).get("proc_percent")), 2),
+                                    ",".join(reasons)])
+                        log_result("    第 %d 组 %s:" % (round_no, stage),
+                                   sent, reply, fail, rep_rate, dt,
+                                   x_, r_, p_, l_, foreign, reasons)
 
-                if stats is None:
-                    # 这两类不是"系统异常"，是配置/数据问题，不该污染趋势
-                    if err == "SAFETY_GATE":
-                        log("第 %d 轮被安全闸拦下（目标流上有真平台消费者）。"
-                            "确认无害后加 --force-live（会透传给 send_test）" % round_no)
-                        totals["skipped"] += 1
-                        continue
-                    if err == "NO_CASES":
-                        log("第 %d 轮跳过（该轮用例不匹配 --type 过滤）" % round_no)
-                        totals["skipped"] += 1
-                        continue
-                    log("第 %d 轮失败: %s（耗时 %.1fs）" % (round_no, err, dt))
+                    refs_path = os.path.join(round_dir, "refs.json")
+                    abort = run_flow_cycle(args, round_no, round_dir, refs_path,
+                                           log, on_step=on_step)
+                    dt = time.time() - t0
+                    xlen, rd, pd, lag, rxlen = snapshot_probe()
+
                     totals["rounds"] += 1
-                    totals["abnormal"] += 1
-                    abnormal_rounds.append(round_no)
-                    row = [round_no, _now_str()] + [""] * 15 + \
-                          [rxlen, "", "ERR:%s" % err]
-                else:
-                    sent = _int_or(stats.get("sent"))
-                    reply = _int_or(stats.get("reply"))
-                    fail = _int_or(stats.get("send_fail"))
-                    tout = _int_or(stats.get("timeout_reply"))
-                    outn = _int_or(stats.get("outstanding"))
-                    foreign = _int_or(stats.get("reply_foreign"))
-                    # 回复率优先用 perfor 自算的 reply_rate（= 对得上本次的回包/发送数），
-                    # 拿不到就退回 reply/sent —— 两种情况都恒 <= 100%。
-                    rr = _as_num(stats.get("reply_rate"))
-                    rep_rate = (rr * 100.0) if rr is not None else \
-                        ((reply / float(sent) * 100.0) if sent else 0.0)
-                    sps = _float_or(stats.get("send_per_sec"))
-
-                    # ---- 异常判定 ----
-                    # 回复率只对"该回包的"类型设默认（normal=99%），
-                    # destroy/error 默认 0=不判（畸形报文不回包是平台正常行为）。
-                    reasons = []
-                    if fail > 0:
-                        reasons.append("发送失败%d" % fail)
-                    if args.min_reply_rate > 0 and sent and rep_rate < args.min_reply_rate:
-                        reasons.append("回复率%.1f%%<%.1f%%" % (rep_rate, args.min_reply_rate))
-                    if args.max_pending > 0 and pd is not None and pd > args.max_pending:
-                        reasons.append("未ACK%d>%d" % (pd, args.max_pending))
-                    if args.max_lag > 0 and lag is not None and lag > args.max_lag:
-                        reasons.append("lag%d>%d" % (lag, args.max_lag))
-                    if args.max_timeout_reply > 0 and tout > args.max_timeout_reply:
-                        reasons.append("超时未回%d>%d" % (tout, args.max_timeout_reply))
-                    if args.max_outstanding > 0 and outn > args.max_outstanding:
-                        reasons.append("在途%d>%d" % (outn, args.max_outstanding))
-                    bad = bool(reasons)
-
-                    totals["rounds"] += 1
-                    totals["sent"] += sent
-                    totals["reply"] += reply
-                    totals["send_fail"] += fail
-                    totals["timeout_reply"] += tout
-                    if bad:
+                    totals["sent"] += g_sent
+                    totals["reply"] += g_reply
+                    totals["send_fail"] += g_fail
+                    totals["timeout_reply"] += g_tout
+                    if abort:
+                        g_abnormal = True
+                        stage_notes.append(abort)
+                    if g_abnormal:
                         totals["abnormal"] += 1
                         abnormal_rounds.append(round_no)
+                        log("第 %d 组异常: %s（耗时 %.1fs）"
+                            % (round_no, "；".join(stage_notes), dt))
+                        if abort:
+                            # create 失败会让后面全废；继续下一组（组间是独立的）
+                            log("    （本组已中止，下一组重新开始）")
+                    else:
+                        log("第 %d 组完成: 三段共发送=%d 回包=%d（耗时 %.1fs）"
+                            % (round_no, g_sent, g_reply, dt))
 
-                    row = [round_no, _now_str(), sent, reply, fail, tout, outn,
-                           round(rep_rate, 2), foreign, round(sps, 1),
-                           round(_float_or(stats.get("lat_p50_ms")), 2),
-                           round(_float_or(stats.get("lat_p99_ms")), 2),
-                           round(_float_or(stats.get("lat_max_ms")), 2),
-                           xlen, rd, pd, lag, rxlen,
-                           round(_float_or((stats.get("cpu") or {}).get("proc_percent")), 2),
-                           ",".join(reasons)]
-                    log("第 %d 轮完成: 发送=%d 回包=%d 失败=%d 回复率=%.1f%% "
-                        "耗时=%.1fs | 目标流 XLEN=%s 已读=%s 未ACK=%s lag=%s"
-                        % (round_no, sent, reply, fail, rep_rate, dt,
-                           xlen, rd, pd, lag)
-                        + ("  [剔除非本次 %d 条]" % foreign if foreign else "")
-                        + ("  [异常: %s]" % ",".join(reasons) if bad else ""))
-
-                    if not args.keep_round_stats and not bad:
+                    if not args.keep_round_stats and not g_abnormal:
                         try:
                             for fn in os.listdir(round_dir):
                                 os.remove(os.path.join(round_dir, fn))
                         except Exception:
                             pass
+                    row = None          # 已在 on_step 里逐行写过
+                else:
+                    # ==================== 单接口：一轮 = 一次发送 ====================
+                    stats, err, tail = run_round(args, round_no, round_dir, cases_spec)
+                    dt = time.time() - t0
+
+                    xlen, rd, pd, lag, rxlen = snapshot_probe()
+
+                    if stats is None:
+                        # 这两类不是"系统异常"，是配置/数据问题，不该污染趋势
+                        if err == "SAFETY_GATE":
+                            log("第 %d 轮被安全闸拦下（目标流上有真平台消费者）。"
+                                "确认无害后加 --force-live（会透传给 send_test）" % round_no)
+                            totals["skipped"] += 1
+                            continue
+                        if err == "NO_CASES":
+                            log("第 %d 轮跳过（该轮用例不匹配 --type 过滤）" % round_no)
+                            totals["skipped"] += 1
+                            continue
+                        log("第 %d 轮失败: %s（耗时 %.1fs）" % (round_no, err, dt))
+                        totals["rounds"] += 1
+                        totals["abnormal"] += 1
+                        abnormal_rounds.append(round_no)
+                        row = [round_no, _now_str()] + [""] * 15 + \
+                              [rxlen, "", "ERR:%s" % err]
+                    else:
+                        sent = _int_or(stats.get("sent"))
+                        reply = _int_or(stats.get("reply"))
+                        fail = _int_or(stats.get("send_fail"))
+                        tout = _int_or(stats.get("timeout_reply"))
+                        outn = _int_or(stats.get("outstanding"))
+                        foreign = _int_or(stats.get("reply_foreign"))
+                        rep_rate = _reply_rate(stats)
+                        sps = _float_or(stats.get("send_per_sec"))
+                        # 判据统一走 judge()（与业务流模式同一套）
+                        reasons = judge(stats, args, pd=pd, lag=lag)
+                        bad = bool(reasons)
+
+                        totals["rounds"] += 1
+                        totals["sent"] += sent
+                        totals["reply"] += reply
+                        totals["send_fail"] += fail
+                        totals["timeout_reply"] += tout
+                        if bad:
+                            totals["abnormal"] += 1
+                            abnormal_rounds.append(round_no)
+
+                        row = [round_no, _now_str(), sent, reply, fail, tout, outn,
+                               round(rep_rate, 2), foreign, round(sps, 1),
+                               round(_float_or(stats.get("lat_p50_ms")), 2),
+                               round(_float_or(stats.get("lat_p99_ms")), 2),
+                               round(_float_or(stats.get("lat_max_ms")), 2),
+                               xlen, rd, pd, lag, rxlen,
+                               round(_float_or((stats.get("cpu") or {}).get("proc_percent")), 2),
+                               ",".join(reasons)]
+                        log_result("第 %d 轮完成:" % round_no, sent, reply, fail,
+                                   rep_rate, dt, xlen, rd, pd, lag, foreign, reasons)
+
+                        if not args.keep_round_stats and not bad:
+                            try:
+                                for fn in os.listdir(round_dir):
+                                    os.remove(os.path.join(round_dir, fn))
+                            except Exception:
+                                pass
             except Exception as e:
                 # 本轮意外 -> 只记异常，继续下一轮（绝不 re-raise）。
                 # 0919 事故教训：一轮的脏数据干掉了跑了 21.5h 的任务。
@@ -672,11 +1009,12 @@ def main():
                 abnormal_rounds.append(round_no)
                 log("第 %d 轮异常（已隔离，继续后续轮次）: %s: %s（耗时 %.1fs）"
                     % (round_no, type(e).__name__, e, dt))
-                row = [round_no, _now_str()] + [""] * 15 + \
-                      [rxlen, "", "EXC:%s: %s" % (type(e).__name__, e)]
+                pad = [""] * 15 if not args.flow else [""] * 16
+                row = ([round_no, _now_str()] + (["(异常)"] if args.flow else [])
+                       + pad + [rxlen, "", "EXC:%s: %s" % (type(e).__name__, e)])
 
-            with open(trend_path, "a", newline="", encoding="utf-8-sig") as f:
-                csv.writer(f).writerow(row)
+            if row is not None:
+                append_row(row)
 
             if args.clean == "per-round":
                 ok = probe.clean_reply(REPLY_STREAM)
@@ -689,7 +1027,9 @@ def main():
     finally:
         elapsed = time.time() - start_ts
         summary = {
-            "interface": args.interface,
+            "mode_flow": bool(args.flow),
+            "flow_stages": list(FLOW_STAGES) if args.flow else None,
+            "interface": "(业务流 create→modify→remove)" if args.flow else args.interface,
             "type": args.type,
             "stream": stream,
             "run_id": run_id,

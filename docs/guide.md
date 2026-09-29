@@ -27,16 +27,26 @@ cd strategy_test
 
 1. **右栏 → 服务管理 → 「启动 Mock 策略平台」**
    （默认「自应答编号」勾着，它会自己占编号 1，即下发流 = `ST-1`）
-2. **左栏 → 1. 测试数据**：勾 `create`，类型选 `normal`
+2. **左栏 → 1. 测试数据**：勾 `create`
    （这里**不会**读 Excel，勾选是瞬时的；条数在点发送时才统计）
-3. **左栏 → 2. 发送参数**：并发 8、总条数 2000
-4. **底部 → 「开始发送」**
+3. **左栏 → 2. 发送参数 → 发送范围**：用例类型选 `normal`
+4. **左栏 → 2. 发送参数 → 规模与速率**：并发 8、总条数 2000
+5. **底部 → 「开始发送」**
 
 ### 界面布局
 
-* **左栏**管「发什么」：1. 测试数据 → 2. 发送参数（内含稳定性测试分区）
+* **左栏**管「发什么」，从上到下一条主流程：
+  * **1. 测试数据** —— 管**磁盘上的数据**：勾接口（读哪个 `data/*.xlsx`）、
+    批量账号数、Ref 回填、生成压测数据。只写文件，不发送。
+  * **2. 发送参数** —— 管**这一批怎么发**，内含四个分区：
+    发送范围（`--type` / `--cases`）→ 规模与速率 → 回复处理 → 稳定性测试。
 * **右栏**管「连哪儿、以谁身份、结果存哪」＋服务管理
 * **下栏**是运行日志 / 统计汇总
+
+> 「用例类型」「指定用例」是**发送时的筛选器**（`send_test.py` 的
+> `--type` / `--cases`），不改任何数据，所以归在「2. 发送参数 → 发送范围」，
+> 与 `datahub_test` 的摆法一致。而「接口勾选」虽然也是 `--interface`，
+> 但它决定**读哪张表**，所以留在「1. 测试数据」。
 
 实时日志在「运行日志」页，跑完自动切到「统计汇总」，可一键导出 Excel。
 界面参数会记忆到 `config.ini`。
@@ -377,13 +387,71 @@ python make_excel.py --interface remove --bulk-normal 10000 --ref-seq 501
 ## 7. 稳定性测试
 
 不做一次性压测，而是**连续跑几小时**，看指标是否随时间劣化。
-做法与 `datahub_test` 一致：不改发送逻辑，靠"反复调用 `send_test.py` + 汇总"实现。
+做法：不改发送逻辑，靠"反复调用 `send_test.py` + 汇总"实现。
+
+**有两种模式，按需要选**：
+
+| 模式 | 一轮是什么 | 适用 |
+|---|---|---|
+| **单接口**（默认） | 重复发同一个接口 | 纯压某个接口 / 发 destroy 测健壮性 |
+| **业务流**（`--flow` / GUI 勾选） | `create → modify → remove` 各 batch 条 | **模拟真实业务循环**（推荐做长稳） |
+
+> `datahub_test` 那边只跑 query 查询接口，所以是"单接口循环"；
+> 策略方向这条链路是 **增加/修改/删除**，所以要按业务顺序成组跑。
+
+### 7.1 业务流模式（`--flow`）——推荐
+
+一组 = **1w 个 create → 1w 个 modify → 1w 个 remove**（数量由 `--batch` 定），
+一组跑完接着下一组，如此循环。
+
+```bash
+# 一组 1w 条：create 1w -> modify 1w -> remove 1w，跑 5 组
+python soak_test.py --assign-id 94 --flow --batch 10000 --rounds 5 \
+    --workers 8 --wait 30 --clean monitor
+
+# 长稳 8 小时
+python soak_test.py --assign-id 94 --flow --batch 10000 --hours 8 \
+    --workers 8 --wait 30
+```
+
+**Ref 是动态的，所以 modify/remove 表每轮都要重生成** —— 这正是流程的核心：
+
+```
+① create  发 batch 条  ── 从回包抓真实单号 -> out/soak/<组>/refs.json
+② 生成 modify 表          make_excel --interface modify --bulk-normal N --ref-map <refs.json>
+③ modify  发 batch 条     引用第 ① 步真实存在的单号
+④ 生成 remove 表          同样用 refs.json
+⑤ remove  发 batch 条     把第 ① 步造的单删掉
+   └─ 删干净了，下一组 create 才能重新造出同样的号（否则 ref already inserted）
+```
+
+所以：**必须按 create→modify→remove 的顺序**，不能跳步。任一步失败就中止本组、
+直接进下一组（组与组独立），并在日志里说明原因。
+
+> **前置条件**：平台回包**必须带 `Ref`**（真实平台是带的）。
+> 用自带 mock 验证时记得加 `--ref-echo`，否则 mock 回固定的 `{"status":"OK"}`，
+> 抓不到单号、第 ② 步会直接失败：
+> ```bash
+> python mock_strategy.py --host 192.168.1.137 --db 0 --assign-id 94 --ref-echo
+> ```
+
+> **`--flow` 的约束**：只能配 `--type normal`；不能与 `--rotate` 同用
+> （每轮都要重生成表，行号轮换没意义）；只能 `--clean monitor`
+> （清理回包流会干扰 refs 抓取）。
+
+> **表从哪来**：`create.xlsx` 只需有足够行数（`--batch` 行 normal），
+> 没有会自动 `--bulk-normal` 生成一次；`modify`/`remove` 每轮现生成。
+> ⚠ 生成前**别用 Excel/WPS 打开这些表** —— 被占用时 `make_excel` 会另存成
+> `_v2.xlsx` 而**原表不更新**，soak 会检测到并报错中止（不会静默发旧表）。
+
+### 7.2 单接口模式（默认，与以前一致）
 
 **两种入口，等价**：
 
 1. **GUI**：左栏「2. 发送参数 → 稳定性测试」→ 勾选「启用稳定性测试」
    → 设好结束条件/每轮条数 → 点底部「运行稳定性测试」。
-   接口/类型/目标流沿用左栏选择；勾选的多个接口会依次各跑一场。
+   接口沿用「1. 测试数据」的勾选，类型沿用同面板「发送范围」的选择，
+   目标流沿用右栏「策略平台身份」；勾选的多个接口会依次各跑一场。
 2. **命令行**：
 
 ```bash
@@ -409,14 +477,16 @@ python soak_test.py --assign-id 50 --interface account --type normal \
     --max-outstanding 100 --max-timeout-reply 100
 ```
 
+### 7.3 输出与判据
+
 输出（`out/soak/`）：
 
 | 文件 | 内容 |
 |---|---|
-| `..._trend.csv` | **每轮指标时间序列**（核心产物，可直接画图） |
-| `..._summary.json` | 整体汇总（含本轮实际生效的 `criteria`） |
-| `..._soak.log` | 编排日志（每轮一行关键指标 + 异常） |
-| `..._rounds/` | 异常轮明细（默认只留异常轮，避免几千个文件） |
+| `..._trend.csv` | **每轮指标时间序列**（核心产物，可直接画图）<br>业务流模式下每段一行，多一个「阶段」列（create/modify/remove） |
+| `..._summary.json` | 整体汇总（含实际生效的 `criteria`） |
+| `..._soak.log` | 编排日志（每段一行关键指标 + 异常） |
+| `..._rounds/` | 异常轮的明细与 `refs.json`（默认只留异常轮） |
 
 其余参数（`--gap` / `--keep-round-stats` / `--round-timeout` / `--soak-out`）
 语义同 `datahub_test/soak_test.py`；未识别参数原样透传给 `send_test.py`。
@@ -428,6 +498,8 @@ python soak_test.py --assign-id 50 --interface account --type normal \
 | **回复率** | `--min-reply-rate` | **按类型**：normal=99，error/destroy/all=不判 | 平台漏处理、回包链路断了 |
 | **lag / 未ACK** | `--max-lag` / `--max-pending` | 0（不判） | 区分「平台没读」与「读了卡住」 |
 | **超时未回 / 在途** | `--max-timeout-reply` / `--max-outstanding` | 0（不判） | 这一轮积压了多少 |
+
+业务流模式下**三段用同一套判据**（共用 `judge()`），任一阶段异常就把整组记为异常组。
 
 回复率**按用例类型分档**，不是一刀切：
 

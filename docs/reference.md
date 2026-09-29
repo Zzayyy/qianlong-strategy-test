@@ -70,7 +70,8 @@
 | `--no-assign` | 关 | 不自己应答上线，等真中台分配编号 |
 | `--no-reply` | 关 | 只收不回（观察模式） |
 | `--reply-stream` | `auto` | `auto`=DataHub_reply_stream、`reply`=ST-N-reply、`both` |
-| `--reply-data` | `{"status":"OK"}` | 回包内容 |
+| `--reply-data` | `{"status":"OK"}` | 回包内容（固定串） |
+| `--ref-echo` | 关 | 回包时把请求里的 `Ref` 原样带回（仿真实平台）。<br>★ 跑 `--flow` 业务流**必须开**：soak 要从 create 回包抓真实单号，固定回包抓不到 |
 | `--read-count` | 100 | 每次取多少条。真插件是 **1**；用 1 会让 mock 成为瓶颈（实测仅 ~475 条/秒） |
 | `--channel-suffix` | 空 | 现场有带 `_1` 与不带后缀两套；匹配现场真中台用 `--channel-suffix _1` |
 | `--workers` | 配置(4) | 消费线程数 |
@@ -121,15 +122,16 @@ python send_test.py --host 192.168.1.137 --db 0 --assign-id 1 --type normal --ma
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--interface` | **必填** | 接口名（每轮跑的都是它） |
-| `--type` | `normal` | 用例类型，**同时决定回复率的默认档位**（见下） |
+| `--interface` | 空 | 接口名（**单接口模式必填**；`--flow` 时忽略） |
+| `--flow` | 关 | **业务流模式**：一组 = `create → modify → remove` 各 `--batch` 条，循环跑。每轮 modify/remove 表用本轮 create 回包抓到的真实单号重新生成 |
+| `--type` | `normal` | 用例类型，**同时决定回复率的默认档位**（见下）。`--flow` 只能配 `normal` |
 | `--assign-id` / `--stream` | 必填其一 | 目标流 `ST-<id>` / 直接指定流名 |
 | `--hours` | 8.0 | 总时长（小时） |
-| `--rounds` | 0 | 按轮数跑；指定后忽略 `--hours`（短测用） |
-| `--batch` | 500 | **每轮条数**（覆盖传下去的 `--max`） |
+| `--rounds` | 0 | 按轮数跑；指定后忽略 `--hours`（短测用）。`--flow` 下是"组数" |
+| `--batch` | 500 | **每轮/每段条数**（`--flow` 时三段各发这么多） |
 | `--gap` | 0.0 | 轮间间隔秒 |
-| `--rotate` | 关 | 每轮换一批用例（按**本类型的行号**分段，末尾回绕） |
-| `--clean` | `monitor` | `monitor`=只监控；`per-round`=每轮清回包流（⚠ 该流是多条 `ST-*` 共用，非独占环境别开） |
+| `--rotate` | 关 | 每轮换一批用例（按**本类型的行号**分段，末尾回绕）。⚠ 与 `--flow` 互斥 |
+| `--clean` | `monitor` | `monitor`=只监控；`per-round`=每轮清回包流（⚠ 该流是多条 `ST-*` 共用，非独占环境别开；`--flow` 只允许 `monitor`） |
 | `--keep-round-stats` | 关 | 保留每轮 stats（默认只留异常轮） |
 | `--round-timeout` | 600 | 单轮最长秒数，防卡死 |
 | `--soak-out` | `out/soak` | 输出根目录 |
