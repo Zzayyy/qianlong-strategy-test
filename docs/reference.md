@@ -238,7 +238,8 @@ python mock_datahub.py --host 192.168.1.137 --db 0 --alloc-start 1
 | `check_env.py` | 只读环境体检（连之前先跑它） |
 | `ssh_runner.py` | **SSH 远程执行**：连接/上传/执行/回传/下载（稳定性测试跑 Linux 用，见第 7 节） |
 | `mock_datahub.py` | ○**可选** — 模拟数据中台，仅在「测完整上线握手」或「观察真中台」时需要 |
-| `config.py` `config.ini` | 共享配置（CLI 参数优先） |
+| `config.py` | 配置读取（内置默认值 + `config.ini`，CLI 参数优先） |
+| `config.ini` | **本地配置，不进版本库**（含 Redis/SSH 密码与个人路径）。<br>首次由 GUI 退出时自动生成，或手动照 `config.py` 的 `DEFAULTS` 写 |
 | `tests/` | 辅助工具（不是测试） |
 | `out/logs/` `out/performance/` `out/soak/` | 运行日志、性能统计、稳定性测试输出 |
 | `docs/` | 使用指南、参数手册、[开发备忘](dev-notes.md) |

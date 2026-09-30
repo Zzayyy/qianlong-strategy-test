@@ -282,7 +282,29 @@ make_ref(n) = "YYYYMMDD" + "%06d" % n     # 如 20260929000001
 
 `_save_ui_state()` 在退出时把界面偏好写回 `config.ini`。
 **写自动化测试时注意**：用离屏（`QT_QPA_PLATFORM=offscreen`）
-构造 `MainWindow` 会真实改写 `config.ini`，测完要 `git checkout` 还原。
+构造 `MainWindow` 会真实改写 `config.ini`，测完要还原
+（它现在不进版本库，所以是"先备份再还原"，不能靠 `git checkout`）。
+
+### 3.5.1 `config.ini` 为什么不进版本库
+
+它含 **Redis 密码 / SSH 密码 / 各人的绝对路径**（`stats_out`），
+提交上去等于把凭据写进仓库。已在 `.gitignore` 屏蔽。
+
+**没有 example 模板**（曾加过一个，用户不要）：仓库里干脆不放配置文件，
+首次使用由 GUI 退出时自动生成，或用户自己照 `config.py` 的 `DEFAULTS` 写。
+
+**代码在 config.ini 缺失时必须能跑**（新克隆的人不会一开始就有它）：
+
+* `config.py:load()` 先读文件、缺的项用 `DEFAULTS` 补 —— 已实测缺文件也能工作
+* `gui_test.py` 的 `load_config()` 同理（`if os.path.exists(CONFIG_PATH)`）
+* 命令行参数优先级永远高于配置（`redis_kwargs` 的 `pick()`）
+
+> ⚠️ **遗留问题：密码仍硬编码在代码里。** `config.py` 的
+> `"pwd": "QianLong@2026&"`，以及 `check_env.py` / `resp_min.py` /
+> `soak_test.py` / `gui_test.py` 的默认值里都有（共 6 处）。
+> 屏蔽 `config.ini` **拦不住**这些 —— 它们照样随代码进仓库。
+> 要彻底干净得把默认值换成空串或占位符（如 `"CHANGE_ME"`），
+> 由 `config.ini` / `--pwd` 传入。**尚未处理**（用户明确表示暂不管密码）。
 
 ### 3.6 稳定性测试跑远程 Linux（ssh_runner.py）
 

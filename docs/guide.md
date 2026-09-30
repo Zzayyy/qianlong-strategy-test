@@ -10,6 +10,18 @@
 Python 3.8+。用仓库根目录的 `venv`（`D:\Code\Python\多线程\venv`）即可，
 已装好 PySide6 + openpyxl。依赖清单见 `requirements.txt`。
 
+**关于本地配置 `config.ini`**：
+
+`config.ini` **不进版本库**（含 Redis/SSH 明文密码与各人的绝对路径），
+所以仓库里没有它。**首次使用不需要手动创建**，两种方式任选：
+
+* **用 GUI（推荐）**：右栏「连接设置」填好地址/密码 → 退出时自动写入 `config.ini`
+* **用命令行**：每次带 `--host` / `--db` / `--pwd` 即可，不建文件也能跑
+
+> 代码有内置默认值，命令行参数优先级最高，所以 `config.ini` 缺失不影响使用。
+> 想手动建就照 `config.py` 的 `DEFAULTS` 写（段落：`[redis]` `[strategy]`
+> `[test]` `[gui]`）。
+
 下文命令都假设已经 `cd strategy_test`；不想 `cd` 就把
 `..\venv\Scripts\python.exe` 换成绝对路径
 `D:\Code\Python\多线程\venv\Scripts\python.exe`。

@@ -14,6 +14,10 @@ cd strategy_test
 ..\venv\Scripts\python.exe gui_test.py
 ```
 
+> `config.ini` **不在仓库里**（含 Redis/SSH 明文密码与个人路径，已 gitignore）。
+> 首次使用**不需要手动创建**：直接用界面即可（有内置默认值），
+> 在右栏「连接设置」填好地址密码后，退出 GUI 会自动生成 `config.ini`。
+
 **图形界面（推荐）**，打开后按顺序：
 
 1. 右栏「服务管理」→ **启动 Mock 策略平台**
