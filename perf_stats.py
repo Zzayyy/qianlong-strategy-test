@@ -140,6 +140,17 @@ class PerfCollector(object):
         self.send_fail = 0
         self.timeout_reply = 0
 
+        # 业务失败：回包到了、但平台在业务上拒绝了（ErrID != 0）。
+        # ★ 为什么要单独算：回包"到了"不等于"办成了"。实测过一整批
+        #   create 里混着 {"ErrID":-5,"Errmsg":"ref already inserted"}，
+        #   而回复率仍是 100% —— 光看回复率会把这种批次当成"全绿"。
+        self.biz_fail = 0
+        self.biz_ok = 0               # 回包明确报成功（ErrID == 0）的条数
+        self.biz_fail_msgs = {}       # {Errmsg: 次数}，最多留前 N 种
+        # 回包里没有 ErrID 字段的（比如 Mock 的 {"status":"OK"}）——
+        # 无法判断业务结果，单独记，避免误当成成功或失败。
+        self.biz_unknown = 0
+
         # 延迟（毫秒）
         self.latencies = []
 
@@ -253,6 +264,10 @@ class PerfCollector(object):
         拿这种数当回复率判据必然误判。
 
         matched=False 表示调用方已经判定过这条对不上（省一次查表）。
+
+        ★ 返回 True/False 表示这条是否算"我们的回包"。调用方要靠它决定
+          要不要把业务结果（ErrID）也记上 —— 否则会把【别人的回包】的
+          业务结果混进统计（和当年回复率 >100% 是同一个坑）。
         """
         hit = False
         if matched:
@@ -272,7 +287,7 @@ class PerfCollector(object):
                 self.reply_foreign_bytes += nbytes
                 b = self._bucket()
                 b["reply_foreign"] += 1
-                return
+                return False
             self.reply += 1
             self.reply_bytes += nbytes
             b = self._bucket()
@@ -282,6 +297,37 @@ class PerfCollector(object):
                 self.latencies.append(lat)
                 if len(self.latencies) > 2_000_000:
                     self.latencies = self.latencies[-1_000_000:]
+        return True
+
+    def record_biz_result(self, errid, errmsg=""):
+        """记录一条回包的【业务结果】。
+
+        errid 取回包里的 ErrID：
+          == 0     -> 业务成功（biz_ok）
+          != 0     -> 业务失败（biz_fail），并按 Errmsg 归类
+          None     -> 回包里没有 ErrID（如 Mock 的 {"status":"OK"}），
+                      记为 biz_unknown —— 既不当作成功也不当作失败。
+
+        ★ 只从【已经解析好的 dict】里取字段，不做额外 json.loads，
+          所以调用方应在解析回包时顺手调用（成本 = 一次 dict.get）。
+        """
+        if errid is None:
+            with self.lock:
+                self.biz_unknown += 1
+            return
+        try:
+            ok = int(errid) == 0
+        except (TypeError, ValueError):
+            # ErrID 不是数字（畸形回包）—— 当失败处理并记录原值
+            ok = False
+        with self.lock:
+            if ok:
+                self.biz_ok += 1
+                return
+            self.biz_fail += 1
+            key = str(errmsg)[:60] if errmsg else "(无 Errmsg)"
+            if len(self.biz_fail_msgs) < 50 or key in self.biz_fail_msgs:
+                self.biz_fail_msgs[key] = self.biz_fail_msgs.get(key, 0) + 1
 
     def expire_pending(self, older_than=0.0):
         """把迟迟没回的请求清掉，返回清掉的条数（计入 timeout_reply）。"""
@@ -323,6 +369,9 @@ class PerfCollector(object):
                 reply_foreign=self.reply_foreign,
                 reply_foreign_bytes=self.reply_foreign_bytes,
                 send_fail=self.send_fail, timeout_reply=self.timeout_reply,
+                biz_fail=self.biz_fail, biz_ok=self.biz_ok,
+                biz_unknown=self.biz_unknown,
+                biz_fail_msgs=dict(self.biz_fail_msgs),
                 outstanding=self.outstanding,
                 series=list(self.series),
                 errors=dict(self.errors),
@@ -337,7 +386,11 @@ class PerfCollector(object):
         s["sent_bytes_per_sec"] = s["sent_bytes"] / d
         s["reply_bytes_per_sec"] = s["reply_bytes"] / d
         # 回复率 = 对得上本次发送的回包 / 发送数（恒 <= 100%）
-        s["reply_rate"] = (s["reply"] / float(s["sent"])) if s["sent"] else None
+        s["reply_rate"] = (self.reply / float(self.sent)) if self.sent else None
+        # 业务成功率 = 明确报成功 / 【有 ErrID 的】回包。
+        # 分母用 biz_ok+biz_fail（不含 unknown），否则 Mock 场景会被拉低。
+        judged = self.biz_ok + self.biz_fail
+        s["biz_rate"] = (self.biz_ok / float(judged)) if judged else None
         if s["sent"]:
             s["avg_sent_bytes"] = s["sent_bytes"] / float(s["sent"])
         if s["reply"]:
@@ -373,6 +426,17 @@ class PerfCollector(object):
                   % (s["reply_rate"] * 100.0, s["reply"], s["sent"],
                      ("，另有 %d 条非本次回包已剔除" % s["reply_foreign"])
                      if s["reply_foreign"] else ""))
+        # 业务结果：回包"到了"不等于"办成了"（ErrID != 0 算业务失败）
+        if s["biz_ok"] or s["biz_fail"]:
+            print("  业务成功率        : %.2f%%  (成功 %d, 失败 %d%s)"
+                  % (s["biz_rate"] * 100.0, s["biz_ok"], s["biz_fail"],
+                     ("，%d 条回包无 ErrID 未计入" % s["biz_unknown"])
+                     if s["biz_unknown"] else ""))
+            if s["biz_fail_msgs"]:
+                print("  业务失败分布      :")
+                for k, v in sorted(s["biz_fail_msgs"].items(),
+                                   key=lambda x: -x[1])[:10]:
+                    print("      x%-6d %s" % (v, k))
         print("  发送字节          : %d  (%.3f MB, %.1f MB/s, 均 %.0f B/条)"
               % (s["sent_bytes"], s["sent_bytes"] / 1048576.0,
                  s["sent_bytes_per_sec"] / 1048576.0, s.get("avg_sent_bytes", 0)))
@@ -455,6 +519,11 @@ class PerfCollector(object):
             ("回复率(%)", None if s["reply_rate"] is None
              else round(s["reply_rate"] * 100.0, 2)),
             ("非本次回包(已剔除)", s["reply_foreign"]),
+            # 业务结果：回包到了 ≠ 办成了
+            ("业务成功", s["biz_ok"]), ("业务失败", s["biz_fail"]),
+            ("业务成功率(%)", None if s["biz_rate"] is None
+             else round(s["biz_rate"] * 100.0, 2)),
+            ("回包无ErrID(未计入)", s["biz_unknown"]),
             ("回包速率(条/秒)", round(s["reply_per_sec"], 2)),
             ("发送字节", s["sent_bytes"]),
             ("发送字节速率(MB/s)", round(s["sent_bytes_per_sec"] / 1048576.0, 4)),

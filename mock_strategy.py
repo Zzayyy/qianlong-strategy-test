@@ -68,7 +68,8 @@ class MockStrategy(object):
                  online_interval=2.0, beat_interval=5.0, reply_mode=P.REPLY_AUTO,
                  workers=1, read_count=100, quiet=False, listener=None,
                  max_messages=0, channel_suffix="", verbose=False,
-                 log_first=20, log_every=200, force_live=False, ref_echo=False):
+                 log_first=20, log_every=200, force_live=False, ref_echo=False,
+                 fail_rate=0.0):
         self.kw = kw
         self.unique = unique
         self.assign_id = int(assign_id)
@@ -80,6 +81,8 @@ class MockStrategy(object):
         self.ch_offline = P.chan(P.CH_STRATEGY_OFFLINE, self.channel_suffix)
         self.reply_data = reply_data
         self.ref_echo = bool(ref_echo)   # 回包时把请求里的 Ref 原样带回（仿真实平台）
+        self.fail_rate = float(fail_rate or 0)
+        self._fail_seq = 0               # --fail-rate 的计数器（见 _reply_body）
         self.do_reply = do_reply
         self.do_assign = do_assign
         self.online_interval = float(online_interval)
@@ -397,9 +400,11 @@ class MockStrategy(object):
 
         --ref-echo 打开时，仿真实平台：把请求里的 Ref 原样回带，
         这样 send_test 能从 create 的回包抓出真实单号（业务流必需）。
+
+        --fail-rate > 0 时，按比例回"业务失败"
+        （{"ErrID":-5,"Errmsg":"ref already inserted"}），
+        用于验证「回复率 100% 但业务失败」能不能被判出来。
         """
-        if not self.ref_echo:
-            return self.reply_data
         ref = ""
         try:
             obj = json.loads(task) if task else None
@@ -414,6 +419,19 @@ class MockStrategy(object):
                     ref = str(obj["Ref"])
         except Exception:
             ref = ""
+
+        if self.fail_rate > 0:
+            import random
+            self._fail_seq += 1
+            # 用计数器而非纯随机：条数少时也能稳定出现失败，
+            # 避免"设了 30% 却一条没失败"导致验证不了。
+            period = max(1, int(round(1.0 / self.fail_rate)))
+            if self._fail_seq % period == 0:
+                return json.dumps({"Ref": ref, "Errmsg": "ref already inserted",
+                                   "ErrID": -5}, ensure_ascii=False)
+
+        if not self.ref_echo:
+            return self.reply_data
         return json.dumps({"Ref": ref, "Errmsg": "ok", "ErrID": 0},
                           ensure_ascii=False)
 
@@ -660,6 +678,11 @@ def build_parser():
                          "回 {\"Ref\":\"<请求里的 Ref>\",\"Errmsg\":\"ok\",\"ErrID\":0}。\n"
                          "★ 跑「create→modify→remove」业务流必须开它：soak 要从 create "
                          "回包里抓真实单号去生成 modify/remove，固定回包抓不到单号。")
+    ap.add_argument("--fail-rate", type=float, default=0.0,
+                    help="按比例回【业务失败】{\"ErrID\":-5,\"Errmsg\":\"ref already "
+                         "inserted\"}，如 0.3 = 约 30%% 失败。\n"
+                         "★ 用途：验证「回复率 100%% 但业务失败」能不能被判出来。"
+                         "默认 0=全成功。")
     ap.add_argument("--reply-stream", choices=[P.REPLY_AUTO, P.REPLY_ST, P.REPLY_BOTH],
                     default=P.REPLY_AUTO,
                     help="回包写到哪：auto=DataHub_reply_stream(实测真插件行为), "
@@ -725,6 +748,7 @@ def main():
         usecount=int(g("usecount", "usecount")),
         reply_data=(a.reply_data or cfgmod.get(cp, "strategy", "reply_data")),
         ref_echo=a.ref_echo,
+        fail_rate=a.fail_rate,
         do_reply=not a.no_reply,
         do_assign=not a.no_assign,
         online_interval=float(g("online_interval", "online_interval")),

@@ -188,13 +188,22 @@ class Sender(object):
                 for k in list(self._rid_meta)[:100000]:
                     self._rid_meta.pop(k, None)
 
-    def _on_reply_body(self, rid, task):
-        """回包里若带 Ref，就记成 (账号, 用例号, Ref)。
+    def _on_reply_body(self, rid, task, ours=True):
+        """解析回包：① 抓 Ref（create 造单后落盘，供 modify/remove 用）
+                        ② 记业务结果（ErrID），区分"回包到了"和"办成了"。
 
         ⚠ 策略平台方向的回包格式与 datahub_test(WT 方向)【不同】：
           ST 方向是平的   {"Ref":"2026...","Errmsg":"insert success","ErrID":0}
           WT 方向是嵌套的 {"Err":0,"results":[{"Ref":"..."}]}
         这里两种都兼容，取到第一个 Ref 就记下。
+
+        ★ 只 json.loads 一次，同时取 Ref 和 ErrID —— 不额外增加解析开销。
+          实测过整批 create 里混着 {"ErrID":-5,"ref already inserted"}，
+          而回复率仍是 100%：不记业务结果的话，长稳报告会"假绿"。
+
+        ours=False 表示这条回包【对不上本次发送】(别人的 ST-*、--sync-probe
+        自己发的)。此时只提取 Ref（无害），**不记业务结果** —— 否则会把别人
+        的业务成败混进本次统计，和当年回复率 >100% 是同一个坑。
         """
         if not task:
             return
@@ -204,6 +213,18 @@ class Sender(object):
             return
         if not isinstance(obj, dict):
             return
+
+        # ---- ② 业务结果（先记，因为它不依赖有没有 Ref）----
+        # ErrID 缺失（如 Mock 的 {"status":"OK"}）时传 None -> 记为 biz_unknown，
+        # 不会被误算成失败。WT 方向的 Err 字段也一并兼容。
+        if ours:
+            errid = obj.get("ErrID")
+            if errid is None:
+                errid = obj.get("Err")
+            self.perf.record_biz_result(errid,
+                                        obj.get("Errmsg") or obj.get("Msg") or "")
+
+        # ---- ① Ref ----
         ref = obj.get("Ref")
         if not ref:
             for key in ("results", "Results"):
@@ -367,9 +388,12 @@ class Sender(object):
                         rid = fields.get("request_id", "")
                         task = fields.get("task", "")
                         self.reply_seen += 1
-                        self.perf.record_reply(rid, len(str(task).encode("utf-8")))
-                        # 从回包里抓 Ref（create 造单后落盘，供 modify/remove 用）
-                        self._on_reply_body(rid, task)
+                        # record_reply 返回"这条是否算我们的回包"——
+                        # 回包流是共用的，别人的回包不能算进业务统计
+                        ours = self.perf.record_reply(
+                            rid, len(str(task).encode("utf-8")))
+                        # 抓 Ref + 记业务结果（create 造单后落盘，供 modify/remove 用）
+                        self._on_reply_body(rid, task, ours=ours)
                         if self.logger and not self.quiet:
                             self.logger.write("← [%s] #%s rid=%s task=%s"
                                               % (st, eid, rid, str(task)[:200]))

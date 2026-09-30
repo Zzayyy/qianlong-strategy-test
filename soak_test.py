@@ -104,6 +104,11 @@ DEFAULT_MAX_LAG = 0            # lag  超过它算异常，0=不判
 DEFAULT_MAX_PENDING = 0        # 未ACK 超过它算异常，0=不判
 DEFAULT_MAX_TIMEOUT_REPLY = 0  # 超时未回超过它算异常，0=不判
 DEFAULT_MAX_OUTSTANDING = 0    # 在途未回超过它算异常，0=不判
+# 业务失败（回包里的 ErrID != 0）超过它算异常，0=不判。
+# ★ 为什么要有它：回包"到了"不等于"办成了"。实测过整批 create 里混着
+#   {"ErrID":-5,"ref already inserted"}，而回复率仍是 100% —— 光看回复率
+#   会把这种批次判成"全绿"。跑一夜长稳时这个盲区尤其危险。
+DEFAULT_MAX_BIZ_FAIL = 0
 
 
 def default_min_reply_rate_for(type_tag):
@@ -563,7 +568,35 @@ def judge(stats, args, pd=None, lag=None):
         reasons.append("超时未回%d>%d" % (tout, args.max_timeout_reply))
     if args.max_outstanding > 0 and outn > args.max_outstanding:
         reasons.append("在途%d>%d" % (outn, args.max_outstanding))
+    # 业务失败：回复率看不出它（回包到了仍可能被平台拒）
+    # 语义：< 0 = 零容忍（一条都不许失败）；0 = 不判；N = 超过 N 条才判
+    biz = _int_or(stats.get("biz_fail"))
+    if biz > 0 and args.max_biz_fail != 0:
+        msgs = stats.get("biz_fail_msgs") or {}
+        top = ""
+        if isinstance(msgs, dict) and msgs:
+            k = max(msgs, key=lambda x: msgs[x])
+            top = "(%s×%d)" % (k, msgs[k])
+        if args.max_biz_fail < 0:
+            reasons.append("业务失败%d(零容忍)%s" % (biz, top))
+        elif biz > args.max_biz_fail:
+            reasons.append("业务失败%d>%d%s" % (biz, args.max_biz_fail, top))
     return reasons
+
+
+def _biz_of(stats):
+    """取该次发送的业务结果三元组 (成功数, 失败数, 成功率%)。
+
+    成功率分母是"有 ErrID 的回包"，没有 ErrID 的（纯 Mock {"status":"OK"}）
+    既不算成功也不算失败，所以分母为 0 时返回 None（显示成空，不报 0%）。
+    """
+    if not stats:
+        return "", "", ""
+    ok = _int_or(stats.get("biz_ok"))
+    bad = _int_or(stats.get("biz_fail"))
+    r = _as_num(stats.get("biz_rate"))
+    rate = round(r * 100.0, 2) if r is not None else ""
+    return ok, bad, rate
 
 
 def _reply_rate(stats):
@@ -635,6 +668,15 @@ def main():
     ap.add_argument("--max-outstanding", type=int,
                     default=DEFAULT_MAX_OUTSTANDING,
                     help="单轮结束时「在途未回」超过它算异常。默认 0=不判")
+    ap.add_argument("--max-biz-fail", type=int,
+                    default=DEFAULT_MAX_BIZ_FAIL,
+                    help="单轮【业务失败】(回包 ErrID != 0，如 ref already inserted)"
+                         "达到多少条算异常。\n"
+                         "  0  = 不判（默认）\n"
+                         "  -1 = 零容忍：失败 1 条就报（长稳推荐）\n"
+                         "  N  = 超过 N 条才报\n"
+                         "★ 回复率看不出业务失败：回包到了仍可能被平台拒。"
+                         "实测过回复率 100%% 但 30%% 是 ref already inserted。")
     args, unknown = ap.parse_known_args()
     args.passthrough = unknown
 
@@ -747,11 +789,15 @@ def main():
         log("稳定性测试开始: 接口=%s 类型=%s 目标流=%s %s 每轮=%d 清理=%s 轮间隔=%ss"
             % (args.interface, args.type, stream, target_desc, args.batch,
                args.clean, args.gap))
+    mbiz = args.max_biz_fail
+    biz_txt = ("不判定" if mbiz == 0
+               else ("零容忍(失败1条即报)" if mbiz < 0 else ">%d判定" % mbiz))
     log("判据: 回复率下限=%s  发送失败>0   lag>%s判定   未ACK>%s判定   "
-        "超时未回>%s判定   在途>%s判定"
+        "超时未回>%s判定   在途>%s判定   业务失败%s"
         % (("%g%%" % args.min_reply_rate) if args.min_reply_rate > 0 else "关",
            args.max_lag or "不", args.max_pending or "不",
-           args.max_timeout_reply or "不", args.max_outstanding or "不"))
+           args.max_timeout_reply or "不", args.max_outstanding or "不",
+           biz_txt))
     if args.min_reply_rate > 0 and args.type.strip().lower() in ("destroy", "all"):
         log("⚠ 类型=%s 却开了回复率下限：destroy 的回包行为不稳定"
             "（实测同一天出现过 0%% 与 100%%），可能产生假异常" % args.type)
@@ -780,13 +826,15 @@ def main():
 
     if args.flow:
         header = ["轮次", "时间", "阶段", "发送数", "回包数", "发送失败", "超时未回",
-                  "在途", "回复率%", "非本次回包", "发送速率(条/s)",
+                  "在途", "回复率%", "非本次回包", "业务成功", "业务失败", "业务成功率%",
+                  "发送速率(条/s)",
                   "延迟p50(ms)", "延迟p99(ms)", "延迟max(ms)",
                   "目标流XLEN", "已读", "未ACK", "lag", "回复流XLEN",
                   "CPU%", "异常"]
     else:
         header = ["轮次", "时间", "发送数", "回包数", "发送失败", "超时未回", "在途",
-                  "回复率%", "非本次回包", "发送速率(条/s)",
+                  "回复率%", "非本次回包", "业务成功", "业务失败", "业务成功率%",
+                  "发送速率(条/s)",
                   "延迟p50(ms)", "延迟p99(ms)", "延迟max(ms)",
                   "目标流XLEN", "已读", "未ACK", "lag", "回复流XLEN",
                   "CPU%", "异常"]
@@ -809,10 +857,16 @@ def main():
                (probe.xlen(REPLY_STREAM),)
 
     def log_result(prefix_txt, sent, reply, fail, rep_rate, dt, xlen, rd, pd, lag,
-                   foreign, reasons):
-        log("%s 发送=%d 回包=%d 失败=%d 回复率=%.1f%% 耗时=%.1fs | "
+                   foreign, reasons, biz=None):
+        biz_txt = ""
+        if biz:
+            bok, bbad, brate = biz
+            if bok != "" or bbad != "":
+                biz_txt = " | 业务: 成功=%s 失败=%s%s" % (
+                    bok, bbad, (" 成功率=%s%%" % brate) if brate != "" else "")
+        log("%s 发送=%d 回包=%d 失败=%d 回复率=%.1f%%%s 耗时=%.1fs | "
             "目标流 XLEN=%s 已读=%s 未ACK=%s lag=%s"
-            % (prefix_txt, sent, reply, fail, rep_rate, dt, xlen, rd, pd, lag)
+            % (prefix_txt, sent, reply, fail, rep_rate, biz_txt, dt, xlen, rd, pd, lag)
             + ("  [剔除非本次 %d 条]" % foreign if foreign else "")
             + ("  [异常: %s]" % ",".join(reasons) if reasons else ""))
 
@@ -867,8 +921,11 @@ def main():
                         x_, r_, p_, l_, rx_ = snapshot_probe()
                         if stats is None:
                             # 发送失败：算异常，记下来继续下一组
-                            append_row([round_no, _now_str(), stage] + [""] * 16 +
-                                       ["ERR:无 stats"])
+                            # 按表头长度算，避免手写 [""]*N 数错（曾少一列）
+                            tail = ["ERR:无 stats"]
+                            head = [round_no, _now_str(), stage]
+                            append_row(head + [""] * (len(header) - len(head)
+                                                      - len(tail)) + tail)
                             log("    第 %d 组 %s: 失败（%.1fs）" % (round_no, stage, dt))
                             g_abnormal = True
                             return
@@ -880,6 +937,7 @@ def main():
                         foreign = _int_or(stats.get("reply_foreign"))
                         rep_rate = _reply_rate(stats)
                         sps = _float_or(stats.get("send_per_sec"))
+                        bok, bbad, brate = _biz_of(stats)
                         # 判据与单接口模式【完全同一套】（共用 judge）
                         reasons = judge(stats, args, pd=p_, lag=l_)
                         g_sent += sent
@@ -892,6 +950,7 @@ def main():
                             stage_notes.append("%s:%s" % (stage, ",".join(reasons)))
                         append_row([round_no, _now_str(), stage, sent, reply,
                                     fail, tout, outn, round(rep_rate, 2), foreign,
+                                    bok, bbad, brate,
                                     round(sps, 1),
                                     round(_float_or(stats.get("lat_p50_ms")), 2),
                                     round(_float_or(stats.get("lat_p99_ms")), 2),
@@ -902,7 +961,8 @@ def main():
                                     ",".join(reasons)])
                         log_result("    第 %d 组 %s:" % (round_no, stage),
                                    sent, reply, fail, rep_rate, dt,
-                                   x_, r_, p_, l_, foreign, reasons)
+                                   x_, r_, p_, l_, foreign, reasons,
+                                   biz=(bok, bbad, brate))
 
                     refs_path = os.path.join(round_dir, "refs.json")
                     abort = run_flow_cycle(args, round_no, round_dir, refs_path,
@@ -959,8 +1019,10 @@ def main():
                         totals["rounds"] += 1
                         totals["abnormal"] += 1
                         abnormal_rounds.append(round_no)
-                        row = [round_no, _now_str()] + [""] * 15 + \
-                              [rxlen, "", "ERR:%s" % err]
+                        # 按表头长度算，避免手写 [""]*N 数错（曾少一列）
+                        tail = [rxlen, "", "ERR:%s" % err]
+                        head = [round_no, _now_str()]
+                        row = head + [""] * (len(header) - len(head) - len(tail)) + tail
                     else:
                         sent = _int_or(stats.get("sent"))
                         reply = _int_or(stats.get("reply"))
@@ -970,6 +1032,7 @@ def main():
                         foreign = _int_or(stats.get("reply_foreign"))
                         rep_rate = _reply_rate(stats)
                         sps = _float_or(stats.get("send_per_sec"))
+                        bok, bbad, brate = _biz_of(stats)
                         # 判据统一走 judge()（与业务流模式同一套）
                         reasons = judge(stats, args, pd=pd, lag=lag)
                         bad = bool(reasons)
@@ -984,7 +1047,8 @@ def main():
                             abnormal_rounds.append(round_no)
 
                         row = [round_no, _now_str(), sent, reply, fail, tout, outn,
-                               round(rep_rate, 2), foreign, round(sps, 1),
+                               round(rep_rate, 2), foreign, bok, bbad, brate,
+                               round(sps, 1),
                                round(_float_or(stats.get("lat_p50_ms")), 2),
                                round(_float_or(stats.get("lat_p99_ms")), 2),
                                round(_float_or(stats.get("lat_max_ms")), 2),
@@ -992,7 +1056,8 @@ def main():
                                round(_float_or((stats.get("cpu") or {}).get("proc_percent")), 2),
                                ",".join(reasons)]
                         log_result("第 %d 轮完成:" % round_no, sent, reply, fail,
-                                   rep_rate, dt, xlen, rd, pd, lag, foreign, reasons)
+                                   rep_rate, dt, xlen, rd, pd, lag, foreign, reasons,
+                                   biz=(bok, bbad, brate))
 
                         if not args.keep_round_stats and not bad:
                             try:
@@ -1009,9 +1074,12 @@ def main():
                 abnormal_rounds.append(round_no)
                 log("第 %d 轮异常（已隔离，继续后续轮次）: %s: %s（耗时 %.1fs）"
                     % (round_no, type(e).__name__, e, dt))
-                pad = [""] * 15 if not args.flow else [""] * 16
-                row = ([round_no, _now_str()] + (["(异常)"] if args.flow else [])
-                       + pad + [rxlen, "", "EXC:%s: %s" % (type(e).__name__, e)])
+                # 异常行：除了前两列(轮次/时间)、业务流多一列(阶段)、
+                # 以及末尾三列(回复流XLEN/CPU/异常)，中间全空。
+                # 直接按表头长度算，避免手写 [""]*N 数错（曾少一列）。
+                tail = [rxlen, "", "EXC:%s: %s" % (type(e).__name__, e)]
+                head = [round_no, _now_str()] + (["(异常)"] if args.flow else [])
+                row = head + [""] * (len(header) - len(head) - len(tail)) + tail
 
             if row is not None:
                 append_row(row)
@@ -1046,6 +1114,7 @@ def main():
                 "max_pending": args.max_pending,
                 "max_timeout_reply": args.max_timeout_reply,
                 "max_outstanding": args.max_outstanding,
+                "max_biz_fail": args.max_biz_fail,
             },
             "rounds_total": totals["rounds"],
             "rounds_abnormal": totals["abnormal"],

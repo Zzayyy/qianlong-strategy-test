@@ -133,8 +133,15 @@ python soak_test.py --assign-id 94 --flow --batch 10 --rounds 2 \
 
 ```bash
 python soak_test.py --assign-id 94 --flow --batch 10000 --hours 8 \
-    --workers 8 --wait 30 --max-lag 20000 --max-pending 20000
+    --workers 8 --wait 30 --max-lag 20000 --max-pending 20000 \
+    --max-biz-fail -1
 ```
+
+> `--max-biz-fail -1` = **业务失败零容忍**。强烈建议加上：
+> 回复率只看"回包到没到"，而回包到了**不等于办成了** ——
+> 平台可能回 `{"ErrID":-5,"ref already inserted"}`，回复率仍是 100%。
+> 不加这个，跑一夜也可能拿到一份"全绿"的假报告。
+> 详见 [guide.md](guide.md) 第 7 节判据表。
 
 **参数怎么定**:
 
@@ -261,6 +268,7 @@ mkdir -p out/soak
 setsid nohup python3 soak_test.py --host 192.168.1.137 --db 0 \
     --assign-id 94 --flow --batch 10000 --hours 8 \
     --workers 8 --wait 30 --max-lag 20000 --max-pending 20000 \
+    --max-biz-fail -1 \
     > out/soak/nohup.log 2>&1 < /dev/null &
 ```
 
@@ -299,13 +307,21 @@ setsid nohup python3 soak_test.py --host 192.168.1.137 --db 0 \
 |---|---|---|
 | `create 没有返回任何 Ref` | 平台回包不带 `Ref` | Mock 要勾「回包带回 Ref」;真平台不该有这问题 |
 | `生成 modify 表: 失败` + `原文件没有更新` | `data/*.xlsx` 被 Excel/WPS 占着 | 关掉 Excel,重跑(工具会拒绝发旧表,不会静默出错) |
-| `ref not exist` | 上一组 remove 没删掉,或跨天了 | 看上一组 remove 的回复率;跨天的表要重新生成 |
+| `ref not exist` | 上一组 remove 没删掉,或跨天了 | 看上一组 remove 的业务失败数;跨天的表要重新生成 |
 | `ref already inserted` | 上一组没删干净 | 同上;必要时换个 `--assign-id` 干净流重来 |
+| **回复率 100% 但事事不顺** | 业务失败被"回包成功"掩盖了 | **加 `--max-biz-fail -1`** 让工具自己判出来(见下方说明) |
 | 回复率 0%、`lag` 猛涨 | 平台没在读(消费者不在/编号错) | 用 `check_env.py` / `_ack_gap.py` 查 |
 | 回复率 0%、`未ACK` 也涨 | 平台读了但卡住 | 查平台侧 |
 | `[FAIL] --flow 与 --rotate 不能同用` | 传了冲突参数 | GUI 已自动过滤;命令行去掉 `--rotate` |
 | 远端 `cd: 没有那个文件或目录` | 远端目录不存在且命令没走上传 | 用 GUI(会自动建目录+上传),或手动 mkdir |
 | 「停止远端」总说"仍在运行" | `pgrep` 自匹配(已修) | 更新到最新代码 |
+
+> ⚠️ **最隐蔽的一类问题**：平台**回了包**但**业务上拒了**，例如
+> `{"ErrID":-5,"Errmsg":"ref already inserted"}`。这种回包会让回复率显示
+> **100%**，看起来一切正常。实测过一整批 create 里 30% 是这种失败。
+>
+> 判断方法：加 `--max-biz-fail -1`（零容忍），或直接看 trend.csv 的
+> 「业务成功 / 业务失败 / 业务成功率%」三列 —— 它们是分开统计的。
 
 **排查工具**(都在 `tests/`,只读):
 
@@ -349,13 +365,15 @@ python soak_test.py --assign-id 94 --flow --batch 10 --rounds 2 --wait 5
 
 # ---------- 本地长稳 ----------
 python soak_test.py --assign-id 94 --flow --batch 10000 --hours 8 \
-    --workers 8 --wait 30 --max-lag 20000 --max-pending 20000
+    --workers 8 --wait 30 --max-lag 20000 --max-pending 20000 \
+    --max-biz-fail -1
 
 # ---------- 远端 nohup 长稳 ----------
 mkdir -p out/soak
 setsid nohup python3 soak_test.py --host 192.168.1.137 --db 0 \
     --assign-id 94 --flow --batch 10000 --hours 8 \
     --workers 8 --wait 30 --max-lag 20000 --max-pending 20000 \
+    --max-biz-fail -1 \
     > out/soak/nohup.log 2>&1 < /dev/null &
 tail -f out/soak/soak_*_soak.log
 pkill -INT -f '[s]oak_test.py'        # 停（别用 -9）

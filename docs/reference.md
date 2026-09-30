@@ -145,12 +145,19 @@ python send_test.py --host 192.168.1.137 --db 0 --assign-id 1 --type normal --ma
 | `--max-pending` | 0 | 目标流未ACK 超它算异常（平台**读了卡住**的信号） |
 | `--max-timeout-reply` | 0 | 单轮「超时未回」超它算异常 |
 | `--max-outstanding` | 0 | 单轮结束时「在途未回」超它算异常 |
+| `--max-biz-fail` | 0 | **业务失败**（回包 `ErrID != 0`）达到多少条算异常：<br>`0`=不判（默认）、`-1`=**零容忍**（失败 1 条就报）、`N`=超过 N 条才报 |
 
 > `--min-reply-rate` 的分子只算**能对上本次 `request_id`** 的回包，
 > 所以恒 ≤ 100%。共用回包流上别人的回复不影响它（记进 trend 的「非本次回包」列）。
 >
 > ⚠️ `destroy` 的回包行为**不稳定**（实测同一天出现过 0% 和 100%），
 > 给它设回复率下限要谨慎。详见 [dev-notes.md](dev-notes.md) 第 2.3 节。
+
+> ⚠️ **回复率看不出业务失败。** 回包「到了」不等于「办成了」—— 平台可能回
+> `{"ErrID":-5,"Errmsg":"ref already inserted"}`，回复率仍是 100%。
+> 实测过一整批 create 里 30% 是这种失败，而回复率显示"全绿"。
+> 长稳建议加 `--max-biz-fail -1`（零容忍）。业务失败数与原因会记进
+> trend.csv 的「业务成功/业务失败/业务成功率%/异常」列。
 
 未识别参数原样**透传**给 `send_test.py`（如 `--workers` / `--wait` / `--rate` /
 `--no-reply` / `--force-live` / `--quiet` / `--sync-probe`）。

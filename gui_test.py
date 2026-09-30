@@ -33,7 +33,7 @@ import time
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts.warning=false")
 
 from PySide6.QtCore import (Qt, QThread, Signal, QObject, QProcess,
-                            QProcessEnvironment)
+                            QProcessEnvironment, QEvent)
 from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QPushButton, QSpinBox,
@@ -76,41 +76,75 @@ CASES = _try_import_cases()
 
 # ==================== 滚轮防误改 ====================
 class WheelGuard(QObject):
-    """让 SpinBox/ComboBox 不再"滚轮一划过就改值"，改为滚外层滚动区。
+    """让 SpinBox/ComboBox 不再"滚轮悬停即改值"，改为滚动外层滚动区。
 
-    背景：Qt 的 QAbstractSpinBox / QComboBox 默认把滚轮当"改值"操作。
-    在需要滚动的高面板里，鼠标划过输入框却把参数改了——而且常常没察觉
-    （比如把 10000 改成 9999）。
+    背景：Qt 的 QAbstractSpinBox / QComboBox 默认把滚轮当作"改值"操作。
+    在「发送参数」这种内容超高、需要滚动的面板里，用户只想滚页面，
+    鼠标划过输入框却把参数改了 —— 而且常常没察觉（如把 10000 改成 9999）。
 
-    判断"用户是否真的聚焦"不能用 hasFocus()：Qt 在投递滚轮事件前会先
-    把焦点给该控件，所以过滤器里读到的 hasFocus() 恒为 True，防护形同虚设。
-    这里用"是否是 Tab/点击进来的持久焦点"近似：改用事件类型 + 鼠标是否
-    真的在控件上按下过来判断，简单起见直接吞掉滚轮事件并转发给父滚动区。
+    【不能用 hasFocus() 判断】—— 这是踩过的坑：
+      这些控件的 focusPolicy 默认是 Qt.WheelFocus，含义包含
+      "鼠标滚轮也能让它获得焦点"。真实流程是：
+        滚轮事件到达 -> Qt 先把焦点给该控件 -> 再投递给它
+      所以过滤器里读到的 hasFocus() 恒为 True，永远走"放行"分支，
+      防护形同虚设。
+      （早期用 sendEvent 直接投给控件测试时看不到这个问题，因为那条路径
+        不经过 Qt 的焦点处理，导致"测试通过、真机失效"。）
+
+    改用【显式交互】判断：只有用户真正点进来（Tab/点击）才允许滚轮微调。
+    做法：把焦点策略从 WheelFocus 降为 StrongFocus（去掉"滚轮可获焦"），
+    这样滚轮不再抢焦点，hasFocus() 就恢复成"用户主动聚焦"的可靠信号。
+
+    本实现与 datahub_test/gui_test.py 的 WheelGuard 保持一致，改之前先看那边。
     """
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def _has_user_focus(self, obj):
+        """obj 或其内部子控件（如 SpinBox 的 QLineEdit）当前是否持有焦点。
 
-    def eventFilter(self, obj, ev):
-        if ev.type() == ev.Type.Wheel:
-            # 找最近的 QScrollArea 祖先，把滚动交给它
-            w = obj.parentWidget()
-            while w is not None:
-                if isinstance(w, QScrollArea):
-                    bar = w.verticalScrollBar()
-                    bar.setValue(bar.value() - ev.angleDelta().y())
-                    return True
-                w = w.parentWidget()
+        SpinBox 被点击时，真实焦点在其内部 QLineEdit 上；只判断 obj.hasFocus()
+        会把"用户已点进来"误判为未聚焦，导致滚轮微调失效。
+        """
+        if obj.hasFocus():
             return True
+        for child in obj.findChildren(QWidget):
+            if child.hasFocus():
+                return True
         return False
 
+    def eventFilter(self, obj, ev):
+        if ev.type() != QEvent.Type.Wheel:
+            return False
+        if self._has_user_focus(obj):
+            return False          # 用户已聚焦：保留原生滚轮微调
+        # 转交给最近的祖先滚动区，让页面正常滚动
+        w = obj.parentWidget()
+        while w is not None:
+            if isinstance(w, QScrollArea):
+                QApplication.sendEvent(w.viewport(), ev)
+                break
+            w = w.parentWidget()
+        return True               # 吃掉，阻止改值
+
     def install(self, *widgets):
+        """给一批控件装上。
+
+        关键：必须同时把焦点策略从 WheelFocus 降为 StrongFocus，
+        否则滚轮会先抢走焦点、让 hasFocus() 判据失效（见类注释）。
+        """
         for w in widgets:
-            w.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-            w.installEventFilter(self)
-            # 可编辑的 ComboBox 会转发滚轮到内部 QLineEdit，一并拦掉
-            if isinstance(w, QComboBox):
+            if w is None:
+                continue
+            fp = w.focusPolicy()
+            if fp == Qt.FocusPolicy.WheelFocus:
                 w.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            w.installEventFilter(self)
+            # SpinBox 内部有 QLineEdit，鼠标真实落点是它；一并装上更保险
+            for child in w.findChildren(QWidget):
+                if isinstance(child, (QLineEdit, QAbstractSpinBox, QComboBox)):
+                    cfp = child.focusPolicy()
+                    if cfp == Qt.FocusPolicy.WheelFocus:
+                        child.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                    child.installEventFilter(self)
 
 
 # ==================== 配置读写 ====================
@@ -518,6 +552,7 @@ class MainWindow(QWidget):
                 self.cp.set("gui", "soak_maxpend", str(self.spin_soak_maxpend.value()))
                 self.cp.set("gui", "soak_maxtout", str(self.spin_soak_maxtout.value()))
                 self.cp.set("gui", "soak_maxout", str(self.spin_soak_maxout.value()))
+                self.cp.set("gui", "soak_maxbiz", str(self.spin_soak_maxbiz.value()))
                 self.cp.set("gui", "soak_minreply",
                             "%g" % self.spin_soak_minreply.value())
         except Exception:
@@ -1001,6 +1036,7 @@ class MainWindow(QWidget):
         g.addWidget(self.combo_type, r, 1)
         g.addWidget(flabel("指定用例", "--cases"), r, 2)
         g.addWidget(self.edit_cases, r, 3)
+        self.guard.install(self.combo_type)     # 防"滚轮划过即改值"
         r += 1
 
         # 提示行跟着搬过来：它汇总的正是「接口 + 类型 + 指定用例」这个筛选结果
@@ -1273,6 +1309,23 @@ class MainWindow(QWidget):
             "单轮结束时「在途未回」超过它算异常轮。0 = 不判。\n"
             "在途不清零 = 平台收了却一直不回（配合未ACK 看能区分卡在哪）。")
 
+        self.spin_soak_maxbiz = QSpinBox()
+        self.spin_soak_maxbiz.setRange(-1, 100000000)
+        self.spin_soak_maxbiz.setValue(
+            int(float(ini_get(self.cp, "gui", "soak_maxbiz", "0") or 0)))
+        self.spin_soak_maxbiz.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_soak_maxbiz.setToolTip(
+            "单轮【业务失败】达到多少条算异常轮。\n"
+            "  0  = 不判（默认）\n"
+            "  -1 = 零容忍：失败 1 条就报（长稳推荐）\n"
+            "  N  = 超过 N 条才报\n\n"
+            "★ 为什么需要它：回包「到了」不等于「办成了」。\n"
+            "  平台可能回 {\"ErrID\":-5,\"Errmsg\":\"ref already inserted\"}\n"
+            "  —— 这算业务失败，但回复率仍是 100%。\n"
+            "  实测过回复率 100% 而其中 30% 是业务失败的批次，\n"
+            "  光看回复率会把它判成「全绿」。\n\n"
+            "失败原因会归类显示在日志/trend.csv 的「异常」列里。")
+
         sp.addWidget(QLabel("lag 上限"), 6, 0)
         sp.addWidget(self.spin_soak_maxlag, 6, 1)
         sp.addWidget(QLabel("未ACK 上限"), 6, 2)
@@ -1285,6 +1338,8 @@ class MainWindow(QWidget):
 
         sp.addWidget(QLabel("在途上限"), 8, 0)
         sp.addWidget(self.spin_soak_maxout, 8, 1)
+        sp.addWidget(QLabel("业务失败上限"), 8, 2)
+        sp.addWidget(self.spin_soak_maxbiz, 8, 3)
 
         self.lbl_soak_hint = QLabel("")
         self.lbl_soak_hint.setWordWrap(True)
@@ -1294,10 +1349,14 @@ class MainWindow(QWidget):
         g.addWidget(self.soak_params, r, 0, 1, 4)
         r += 1
 
+        # SpinBox + ComboBox 都要装：漏装的下拉框会被"鼠标滚轮划过"直接改值
+        # （曾经漏了 combo_soak_mode / combo_soak_clean，用户只是滚页面
+        #   却把「结束条件」「流处理」改了）。
         for w in (self.spin_soak_batch, self.spin_soak_rounds, self.spin_soak_hours,
                   self.spin_soak_gap, self.spin_soak_maxlag, self.spin_soak_maxpend,
                   self.spin_soak_maxtout, self.spin_soak_maxout,
-                  self.spin_soak_minreply):
+                  self.spin_soak_maxbiz, self.spin_soak_minreply,
+                  self.combo_soak_mode, self.combo_soak_clean):
             self.guard.install(w)
         self.combo_soak_mode.currentIndexChanged.connect(self._sync_soak_mode)
         self.chk_soak.toggled.connect(self._sync_soak_visibility)
@@ -1308,7 +1367,7 @@ class MainWindow(QWidget):
         # 这些都会改变"实际生效的判据"，提示要跟着变
         for w in (self.spin_soak_maxlag, self.spin_soak_maxpend,
                   self.spin_soak_maxtout, self.spin_soak_maxout,
-                  self.spin_soak_minreply):
+                  self.spin_soak_maxbiz, self.spin_soak_minreply):
             w.valueChanged.connect(self._update_soak_hint)
         # 用例类型决定回复率默认档位，切换时要刷新提示
         self.combo_type.currentIndexChanged.connect(self._update_soak_hint)
@@ -1683,8 +1742,17 @@ class MainWindow(QWidget):
                 on.append("超时未回>%d" % self.spin_soak_maxtout.value())
             if self.spin_soak_maxout.value() > 0:
                 on.append("在途>%d" % self.spin_soak_maxout.value())
+            mb = self.spin_soak_maxbiz.value()
+            if mb < 0:
+                on.append("业务失败零容忍")
+            elif mb > 0:
+                on.append("业务失败>%d" % mb)
             desc += "\n判据：回复率%s；发送失败>0%s" % (
-                mr_txt, ("；" + "；".join(on)) if on else "；lag/未ACK/超时/在途 均未设阈值")
+                mr_txt, ("；" + "；".join(on)) if on
+                else "；lag/未ACK/超时/在途/业务失败 均未设阈值")
+            if mb == 0:
+                desc += "\n⚠ 未设「业务失败上限」：回包到了但业务被拒（如 ref already " \
+                        "inserted）不会被判成异常"
             self.lbl_soak_hint.setText("将执行：" + desc)
         except Exception:
             pass
@@ -1730,6 +1798,9 @@ class MainWindow(QWidget):
             a += ["--max-timeout-reply", str(self.spin_soak_maxtout.value())]
         if self.spin_soak_maxout.value() > 0:
             a += ["--max-outstanding", str(self.spin_soak_maxout.value())]
+        # 业务失败上限：0=不判（不加参数）；-1=零容忍；N=超过 N 条
+        if self.spin_soak_maxbiz.value() != 0:
+            a += ["--max-biz-fail", str(self.spin_soak_maxbiz.value())]
         # 回复率下限：-1 表示"按类型自动"（不加参数，交给 soak 自己按 type 取）
         if self.spin_soak_minreply.value() >= 0:
             a += ["--min-reply-rate", "%g" % self.spin_soak_minreply.value()]
