@@ -20,7 +20,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import (ZH, REAL_ACCOUNT, REAL_UNIQUE_ACCOUNT, REAL_BLOCKS,
+from _common import (ZH, REAL_ACCOUNT, REAL_UNIQUE_ACCOUNT,
                      collect, is_blank, put, to_typed, gen_fuzz, gen_cross,
                      add_cases, fmt_account, unique_account, ACCOUNT_START)
 
@@ -30,15 +30,61 @@ MSG_TYPE = 11
 TOP_KEY = "modify"
 REF_KEY = "Ref"          # make_excel 的 --ref-spec 用
 
-# modify 只带部分嵌套块（实测/文档里是 Entrust + CondPrice）
-BLOCKS = [("Entrust", dict(REAL_BLOCKS[0][1])),
-          ("CondPrice", dict(REAL_BLOCKS[5][1]))]
+# ==================== modify 专属的嵌套块 ====================
+# ★ 这里【不再复用 create 的 REAL_BLOCKS】，而是 modify 自己的一套。
+#   原因：现场给的 modify 目标报文与 create 有两处实质差异，
+#   直接复用会让 create 跟着变（create 的既有用例含义就变了）：
+#     1) 带的块更多：create 全套 12 个，modify 也要 12 个（原来只带 Entrust+CondPrice）
+#     2) 同名块取值不同：MarketOrderType 15→1、
+#        CondPrice.TriggerPrice 0.123→0.0675、
+#        CondLoss/CondProfit 合约 10011743→90007676、
+#        CondTargetLoss/CondTargetProfit 标的 510050→159901
+#        （ExchangeNum / PriceUnit / EntrustAmount 与 create 一致：2 / 0.0001 / 20）
+#   ⚠ 字段名大小写【保持与 create 一致的大写】
+#     （Op / Method / ValueType / WithdrawType / Withdraw /
+#       TriggerPercent / TriggerDate / TriggerTime），
+#     不采用目标报文里的小写写法 —— 详见 _common.py 顶部说明（实测大写）。
+MODIFY_BLOCKS = [
+    ("CfgExceedPrice", {"ExchangeNum": 2, "StockCode": "90007676",
+                        "StockName": "50ETF", "PriceStepBuy": -1,
+                        "PriceStepSell": 1, "PriceType": 0,
+                        "PriceUnit": "0.0001", "Decimals": 4}),
+    ("CfgFixedSplit", {"LimitBase": 50, "LimitStep": 50, "LimitInterval": 300,
+                       "MarketBase": 10, "MarketStep": 10,
+                       "MarketInterval": 300}),
+    ("CfgRandSplit", {"LimitBase": 1, "LimitMin": 1, "LimitMax": 5,
+                      "LimitInterval": 300, "MarketBase": 1, "MarketMin": 1,
+                      "MarketMax": 5, "MarketInterval": 300}),
+    ("CfgAppend", {"MarketOrderType": 15, "Tick": 2, "IntervalSec": 300,
+                   "Repeat": 2, "EndWithdraw": False}),
+    ("Entrust", {"ContractCode": "90007676", "ExchangeNum": 2,
+                 "EntrustPrice": "0.1033", "MarketOrderType": 1,
+                 "CoveredType": False, "BSType": 1, "OCType": 1,
+                 "PriceUnit": "0.0001", "EntrustAmount": 20}),
+    ("CondPrice", {"ContractCode": "90007676", "ExchangeNum": 2,
+                   "Op": ">", "TriggerPrice": "0.0675"}),
+    ("CondPercent", {"ContractCode": "90007676", "ExchangeNum": 2,
+                     "Op": ">", "TriggerPercent": "5.25"}),
+    # 字段名是 TriggerDate（不是 TriggerData）；时间按现场要求固定。
+    ("CondTime", {"ContractCode": "90007676", "ExchangeNum": 2,
+                  "TriggerDate": "20260918", "TriggerTime": "093100"}),
+    ("CondLoss", {"ContractCode": "90007676", "ExchangeNum": 2,
+                  "Method": 1, "ValueType": 1, "Value": "0.0675"}),
+    ("CondTargetLoss", {"StockCode": "159901", "ExchangeNum": 2,
+                        "Method": 1, "ValueType": 1, "Value": "0.0675"}),
+    ("CondProfit", {"ContractCode": "90007676", "ExchangeNum": 2, "Method": 1,
+                    "ValueType": 1, "Value": "0.0675", "WithdrawType": 2,
+                    "Withdraw": "0.50"}),
+    ("CondTargetProfit", {"StockCode": "159901", "ExchangeNum": 2,
+                          "Method": 1, "ValueType": 1, "Value": "0.0675",
+                          "WithdrawType": 2, "Withdraw": "0.50"}),
+]
+BLOCKS = MODIFY_BLOCKS
 
 HEADERS = [
     ("case_no", ZH["case_no"]),
     ("case_type", ZH["case_type"]),
     ("case_desc", ZH["case_desc"]),
-    ("Account_Model", ZH["Model"]),
     ("Account_AccountType", ZH["AccountType"]),
     ("Account_AccAtt", ZH["AccAtt"]),
     ("Account_FAccount", ZH["FAccount"]),
@@ -48,6 +94,8 @@ HEADERS = [
     ("Validity", ZH["Validity"]),
     ("UniqueAccount", ZH["UniqueAccount"]),
     ("Ref", "要修改的条件单号(须真实存在)"),
+    ("Status", ZH["Status"]),
+    ("Mode", ZH["Mode"]),
 ]
 for prefix, sample in BLOCKS:
     for leaf in sample:
@@ -67,17 +115,20 @@ def _blank_row():
 
 def _real_row():
     r = _blank_row()
+    # ★ 不再写 Account_Model：现场给的 modify 目标报文里 Account 只有
+    #   FAccount/AccountType/AccAtt（create 才带 Model）。
     r.update({
-        "Account_Model": REAL_ACCOUNT["Model"],
         "Account_AccountType": REAL_ACCOUNT["AccountType"],
         "Account_AccAtt": REAL_ACCOUNT["AccAtt"],
         "Account_FAccount": REAL_ACCOUNT["FAccount"],
         "CondType": 1,
-        "CondName": "name1-modified",
-        "CondDesc": "desc1",
+        "CondName": "strategy_name",
+        "CondDesc": "strategy_desc",
         "Validity": 0,
         "UniqueAccount": REAL_UNIQUE_ACCOUNT,
         "Ref": "__REF1__",
+        "Status": 0,
+        "Mode": 1,
     })
     for prefix, sample in BLOCKS:
         for leaf, val in sample.items():
@@ -209,7 +260,6 @@ def build_bulk_rows(count, start=0, ref_seq=1):
         r[idx["case_type"]] = "normal"
         r[idx["case_desc"]] = ("账号%s 修改当日第 %d 号单（需先 create）"
                                % (facct, ref_seq + i))
-        r[idx["Account_Model"]] = REAL_ACCOUNT["Model"]
         r[idx["Account_AccountType"]] = at
         r[idx["Account_AccAtt"]] = aa
         r[idx["Account_FAccount"]] = facct
@@ -229,7 +279,7 @@ def build_payload(row):
     if acct:
         body["Account"] = acct
     for leaf in ("CondType", "CondName", "CondDesc", "Validity",
-                 "UniqueAccount", "Ref"):
+                 "UniqueAccount", "Ref", "Status", "Mode"):
         put(body, leaf, row)
     for prefix, _s in BLOCKS:
         blk = collect(row, prefix)

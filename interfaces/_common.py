@@ -323,12 +323,12 @@ def fmt_shareholders(seq):
     return [(sh, 1), (sz, 2)]
 
 REAL_ENTRUST = {
-    "ContractCode": "90007856", "ExchangeNum": 2, "EntrustPrice": "0.1033",
+    "ContractCode": "90007676", "ExchangeNum": 2, "EntrustPrice": "0.1033",
     "MarketOrderType": 15, "CoveredType": False, "BSType": 1, "OCType": 1,
     "PriceUnit": "0.0001", "EntrustAmount": 20, "FOK": False,
 }
 REAL_CFG_EXCEED = {
-    "ExchangeNum": 2, "StockCode": "90007856", "StockName": "50ETF",
+    "ExchangeNum": 2, "StockCode": "90007676", "StockName": "50ETF",
     "PriceStepBuy": -1, "PriceStepSell": 1, "PriceType": 0,
     "PriceUnit": "0.0001", "Decimals": 4,
 }
@@ -344,11 +344,11 @@ REAL_CFG_APPEND = {
     "MarketOrderType": 15, "Tick": 2, "IntervalSec": 3, "Repeat": 2,
     "EndWithdraw": False,
 }
-REAL_COND_PRICE = {"ContractCode": "90007856", "ExchangeNum": 2,
+REAL_COND_PRICE = {"ContractCode": "90007676", "ExchangeNum": 2,
                    "Op": ">", "TriggerPrice": "0.123"}
-REAL_COND_PERCENT = {"ContractCode": "90007856", "ExchangeNum": 2,
+REAL_COND_PERCENT = {"ContractCode": "90007676", "ExchangeNum": 2,
                      "Op": ">", "TriggerPercent": "5.25"}
-REAL_COND_TIME = {"ContractCode": "90007856", "ExchangeNum": 2,
+REAL_COND_TIME = {"ContractCode": "90007676", "ExchangeNum": 2,
                   "TriggerDate": "__TODAY_PLUS7__", "TriggerTime": "093240"}
 REAL_COND_LOSS = {"ContractCode": "10011743", "ExchangeNum": 1,
                   "Method": 1, "ValueType": 1, "Value": "0.0675"}
