@@ -28,6 +28,10 @@
 
 **一组的实际发送量 = 3 × N**。`--batch 10000` 就是一组 3 万条。
 
+> 可选:加 `--mid-gap 10`(GUI 勾「业务流中场停顿」)会把一组改成
+> `create → modify → 停 10 秒 → remove`,用来观察"改单后放一会儿再删单"。
+> 停顿不改变发送量,但计入本组耗时。见 2.4。
+
 ---
 
 ## 1. 准备:让平台能返回单号
@@ -86,6 +90,7 @@ Mock 默认只回固定的 `{"status":"OK"}`,**抓不到单号**,业务流第 1 
 | 并发线程 | 2 | |
 | 等回包 | 5 | |
 | 回复率下限% | -1 | = 按类型自动(normal 判 99%) |
+| 业务流中场停顿 | 不勾 | 勾上就变成 `create→modify→停N秒→remove`(见 2.5) |
 
 提示行会显示:
 
@@ -94,7 +99,22 @@ Mock 默认只回固定的 `{"status":"OK"}`,**抓不到单号**,业务流第 1 
 判据：回复率99%(normal)；发送失败>0；lag/未ACK/超时/在途 均未设阈值
 ```
 
-### 2.4 跑
+### 2.4 可选:中场停顿 `create → modify → 停 10 秒 → remove`
+
+想让 modify 和 remove 之间隔一段时间(比如观察"改单后放一会儿再删单"),
+勾上 **「业务流中场停顿」** 并把秒数填成 10 即可。命令行等价于:
+
+```bash
+python soak_test.py --assign-id 94 --flow --batch 100 --rounds 5 --mid-gap 10
+```
+
+* 停顿期间**完全不碰 Redis**,是一段干净的静默窗口
+* 停顿**计入本组耗时**,trend.csv 的耗时/速率会相应变慢 —— 别误判成平台卡了
+* 日志里会画出来:`--- 第 1 组开始: create → modify → 停 10s → remove，各 100 条 ---`
+* ⚠ 这个控件**只在业务流模式下可用**;单接口模式会自动置灰
+  (没有 modify→remove 这个中途位置,强行传 `--mid-gap` 会被 soak 拒绝)
+
+### 2.5 跑
 
 点底部 **「运行稳定性测试」** → 确认弹窗 → 看下面日志:
 
@@ -116,7 +136,7 @@ Mock 默认只回固定的 `{"status":"OK"}`,**抓不到单号**,业务流第 1 
 * 两次「生成 xx 表: OK」
 * `rounds_abnormal: 0`
 
-### 2.5 命令行等价写法
+### 2.6 命令行等价写法
 
 ```bash
 python mock_strategy.py --host 192.168.1.137 --db 0 --assign-id 94 --ref-echo
@@ -362,6 +382,9 @@ rm -rf /home/yangsh/so_test/strategy_soak     # 确认不再需要时
 # ---------- 本地试跑 ----------
 python mock_strategy.py --host 192.168.1.137 --db 0 --assign-id 94 --ref-echo
 python soak_test.py --assign-id 94 --flow --batch 10 --rounds 2 --wait 5
+
+# ---------- 带中场停顿(create→modify→停10s→remove) ----------
+python soak_test.py --assign-id 94 --flow --batch 100 --rounds 5 --mid-gap 10
 
 # ---------- 本地长稳 ----------
 python soak_test.py --assign-id 94 --flow --batch 10000 --hours 8 \

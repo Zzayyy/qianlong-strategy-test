@@ -345,7 +345,7 @@ REAL_CFG_APPEND = {
     "EndWithdraw": False,
 }
 REAL_COND_PRICE = {"ContractCode": "90007461", "ExchangeNum": 2,
-                   "Op": ">", "TriggerPrice": "0.234"}
+                   "Op": ">", "TriggerPrice": "0.123"}
 REAL_COND_PERCENT = {"ContractCode": "90007461", "ExchangeNum": 2,
                      "Op": ">", "TriggerPercent": "5.25"}
 REAL_COND_TIME = {"ContractCode": "90007461", "ExchangeNum": 2,

@@ -444,6 +444,25 @@ python soak_test.py --assign-id 94 --flow --batch 10000 --hours 8 \
 所以：**必须按 create→modify→remove 的顺序**，不能跳步。任一步失败就中止本组、
 直接进下一组（组与组独立），并在日志里说明原因。
 
+#### 中场停顿：`create → modify → 停 10 秒 → remove`
+
+加 `--mid-gap SEC`（GUI 是「业务流中场停顿」勾选框 + 秒数）可以在 modify 发完
+之后、remove 发之前插一段静默等待：
+
+```bash
+# 一组 = create → modify → 停 10s → remove
+python soak_test.py --assign-id 94 --flow --batch 100 --rounds 5 --mid-gap 10
+```
+
+用途是观察**改单后停留一段时间再删单**的时序场景 —— 比如平台在 modify 之后
+需要一段时间才把改动落库，立刻 remove 和等一会儿 remove 的行为可能不同。
+
+* 停顿落在 modify 收工之后**紧邻**处，期间**完全不碰 Redis**，是一段干净的静默窗口
+* 停顿**计入本组耗时**，所以 `trend.csv` 的耗时/速率会相应变慢（别当成平台卡了）
+* 日志/`summary.json` 会写明流程（`flow_desc`），一眼能看出这轮带不带停顿
+* ⚠ **只在 `--flow` 下有效**：单接口模式没有 modify→remove 这个中途位置，
+  传了会直接 `[FAIL]` 退出。GUI 里单接口模式会自动置灰这个控件
+
 > **前置条件**：平台回包**必须带 `Ref`**（真实平台是带的）。
 > 用自带 mock 验证时记得加 `--ref-echo`，否则 mock 回固定的 `{"status":"OK"}`，
 > 抓不到单号、第 ② 步会直接失败：

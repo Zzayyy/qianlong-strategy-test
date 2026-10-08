@@ -56,6 +56,10 @@
   python soak_test.py --assign-id 10 --interface account --type normal \
       --rounds 3 --batch 100 --force-live
 
+  # 业务流模式（一组 = create→modify→remove）；--mid-gap 在 modify 后插一段停顿
+  python soak_test.py --assign-id 10 --flow --type normal \
+      --rounds 5 --batch 100 --mid-gap 10
+
 其它未识别参数原样透传给 send_test.py（--workers / --wait / --rate /
 --no-reply / --force-live / --quiet ...）。
 
@@ -410,6 +414,18 @@ MAKE_EXCEL = os.path.join(BASE_DIR, "make_excel.py")
 FLOW_STAGES = ("create", "modify", "remove")
 
 
+def flow_desc_of(args):
+    """一组业务流的流程描述（带 --mid-gap 时把停顿显式画出来）。
+
+    ★ 日志/汇总里必须写清停顿，否则事后看日志分不清
+      "这轮慢" 是平台卡了还是自己停的 —— 停顿会明显拉高本组耗时。
+    """
+    gap = float(getattr(args, "mid_gap", 0.0) or 0.0)
+    if gap > 0:
+        return "create → modify → 停 %gs → remove" % gap
+    return " → ".join(FLOW_STAGES)
+
+
 def gen_table(interface, count, ref_map="", timeout=900):
     """调 make_excel.py 生成/重生成一张表。
 
@@ -464,7 +480,7 @@ def ensure_create_table(args, log):
 
 
 def run_flow_cycle(args, round_no, cycle_dir, refs_path, log, on_step=None):
-    """跑【一组】业务流：create -> 生成 modify 表 -> modify -> 生成 remove 表 -> remove。
+    """跑【一组】业务流：create -> 生成 modify 表 -> modify -> [停顿] -> 生成 remove 表 -> remove。
 
     on_step(stage, stats, dt) 每完成【一次发送】就回调一次，便于逐步写趋势与进度
     （一组可能有 3×batch 条，等整组跑完才输出会看不到进度）。
@@ -478,6 +494,12 @@ def run_flow_cycle(args, round_no, cycle_dir, refs_path, log, on_step=None):
       上一轮的 remove 真删掉之后，这一轮 create 才能重新造出同样的号。
       所以每轮必须拿【本轮 create 刚回包的真实单号】重新回填 modify/remove，
       跨天或换号段时也不会错。
+
+    ★ --mid-gap（停顿）：
+      在 modify 发完之后、remove 发之前停 N 秒。用于"改单后放一会儿再删单"
+      这类时序场景。停顿计入本组耗时（和 --gap 一样）。
+      位置刻意选在 modify 之后【紧邻】处，这样"modify 收工 -> remove 开工"
+      之间是真的静默 N 秒（生成 remove 表是本地动作，另计）。
     """
     os.makedirs(cycle_dir, exist_ok=True)
 
@@ -520,6 +542,15 @@ def run_flow_cycle(args, round_no, cycle_dir, refs_path, log, on_step=None):
     emit("modify", stats, t0)
     if stats is None:
         return "modify 未成功（%s），本组中止（为保证「删干净」不再发 remove）" % err
+
+    # ---- 2.5) 中场停顿（--mid-gap）：modify 收工后静默 N 秒再发 remove ----
+    # 放在这里而不是放在 gen_table 之后：这段时间内【完全不碰 Redis】，
+    # 是一个连续的静默窗口，最贴合「改单后停一会儿再删单」的意图。
+    # （生成 remove 表是纯本地 Excel 动作，不影响平台侧看到的间隔。）
+    mid_gap = float(getattr(args, "mid_gap", 0.0) or 0.0)
+    if mid_gap > 0:
+        log("  中场停顿 %.1fs（modify 已发完，等平台处理后再发 remove）" % mid_gap)
+        time.sleep(mid_gap)
 
     # ---- 3) remove：同一批单号，删掉（删干净下一轮 create 才能重建同名号）----
     t0 = time.time()
@@ -621,7 +652,8 @@ def main():
     ap.add_argument("--flow", action="store_true",
                     help="业务流模式：一组 = create→modify→remove（各 batch 条），"
                          "循环跑。每轮 modify/remove 表会用本轮 create 回包抓到的"
-                         "真实单号重新生成（Ref 是动态的，不能预先写死）")
+                         "真实单号重新生成（Ref 是动态的，不能预先写死）。"
+                         "加 --mid-gap SEC 可变成 create→modify→停SEC秒→remove")
     ap.add_argument("--type", default="normal",
                     help="用例类型 normal/error/destroy/all（默认 normal）")
     ap.add_argument("--assign-id", type=int, default=None,
@@ -637,6 +669,11 @@ def main():
                     help="按轮数跑（如 5）；指定后忽略 --hours。便于短测/回归")
     ap.add_argument("--batch", type=int, default=500, help="每轮条数（默认 500）")
     ap.add_argument("--gap", type=float, default=0.0, help="轮间间隔秒（默认 0）")
+    ap.add_argument("--mid-gap", type=float, default=0.0, metavar="SEC",
+                    help="业务流模式：modify 发完后停 SEC 秒再发 remove，"
+                         "即一组 = create→modify→停SEC秒→remove（默认 0=不停）。"
+                         "用来观察「改单后停留一段时间再删单」这种时序场景。"
+                         "仅 --flow 下有效")
     ap.add_argument("--clean", choices=["monitor", "per-round"],
                     default="monitor",
                     help="monitor=只监控不清理(默认，最安全)；"
@@ -728,6 +765,10 @@ def main():
             print("[提示] --flow 已启用，忽略 --interface=%s（一组固定跑 %s）"
                   % (args.interface, "→".join(FLOW_STAGES)))
     else:
+        if args.mid_gap:
+            print("[FAIL] --mid-gap 只在业务流模式（--flow）下有效："
+                  "单接口模式没有 modify→remove 这个中途位置")
+            return 1
         if not args.interface:
             print("[FAIL] 必须给 --interface（或改用 --flow 跑业务流）")
             return 1
@@ -782,7 +823,7 @@ def main():
 
     if args.flow:
         log("稳定性测试开始（业务流模式）: 一组 = %s 各 %d 条，目标流=%s %s"
-            % (" → ".join(FLOW_STAGES), args.batch, stream, target_desc))
+            % (flow_desc_of(args), args.batch, stream, target_desc))
         log("每轮 modify/remove 表会用【本轮 create 回包抓到的真实单号】重新生成"
             "（Ref 是动态的，不能预先写死）")
     else:
@@ -898,8 +939,8 @@ def main():
                                           (round_no - 1) * args.batch, args.batch)
 
             if args.flow:
-                log("--- 第 %d 组开始（%s）: create → modify → remove，各 %d 条 ---"
-                    % (round_no, remain, args.batch))
+                log("--- 第 %d 组开始（%s）: %s，各 %d 条 ---"
+                    % (round_no, remain, flow_desc_of(args), args.batch))
             else:
                 log("--- 第 %d 轮开始（%s）---" % (round_no, remain))
 
@@ -1097,6 +1138,8 @@ def main():
         summary = {
             "mode_flow": bool(args.flow),
             "flow_stages": list(FLOW_STAGES) if args.flow else None,
+            "flow_desc": flow_desc_of(args) if args.flow else None,
+            "mid_gap_s": (float(args.mid_gap) if args.flow else None),
             "interface": "(业务流 create→modify→remove)" if args.flow else args.interface,
             "type": args.type,
             "stream": stream,

@@ -130,6 +130,7 @@ python send_test.py --host 192.168.1.137 --db 0 --assign-id 1 --type normal --ma
 | `--rounds` | 0 | 按轮数跑；指定后忽略 `--hours`（短测用）。`--flow` 下是"组数" |
 | `--batch` | 500 | **每轮/每段条数**（`--flow` 时三段各发这么多） |
 | `--gap` | 0.0 | 轮间间隔秒 |
+| `--mid-gap` | 0.0 | **业务流中场停顿秒**：把一组改成 `create → modify → 停 N 秒 → remove`。停顿期间不碰 Redis，计入本组耗时。⚠ 只在 `--flow` 下有效，单接口模式传了会直接拒绝 |
 | `--rotate` | 关 | 每轮换一批用例（按**本类型的行号**分段，末尾回绕）。⚠ 与 `--flow` 互斥 |
 | `--clean` | `monitor` | `monitor`=只监控；`per-round`=每轮清回包流（⚠ 该流是多条 `ST-*` 共用，非独占环境别开；`--flow` 只允许 `monitor`） |
 | `--keep-round-stats` | 关 | 保留每轮 stats（默认只留异常轮） |

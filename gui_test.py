@@ -542,6 +542,10 @@ class MainWindow(QWidget):
                 self.cp.set("gui", "soak_hours", str(self.spin_soak_hours.value()))
                 self.cp.set("gui", "soak_batch", str(self.spin_soak_batch.value()))
                 self.cp.set("gui", "soak_gap", str(self.spin_soak_gap.value()))
+                self.cp.set("gui", "soak_midgap_on",
+                            "1" if self.chk_soak_midgap.isChecked() else "0")
+                self.cp.set("gui", "soak_midgap_sec",
+                            "%g" % self.spin_soak_midgap.value())
                 self.cp.set("gui", "soak_clean",
                             self.combo_soak_clean.currentData() or "monitor")
                 self.cp.set("gui", "soak_rotate",
@@ -1226,6 +1230,33 @@ class MainWindow(QWidget):
         sp.addWidget(QLabel("流处理"), 2, 2)
         sp.addWidget(self.combo_soak_clean, 2, 3)
 
+        # ---- 业务流中场停顿：create→modify→停N秒→remove ----
+        # 只在业务流模式下有意义（单接口模式没有 modify→remove 这个位置），
+        # 所以由 _sync_soak_flow() 按模式启用/置灰。
+        self.chk_soak_midgap = QCheckBox("业务流中场停顿：modify 之后停")
+        self.chk_soak_midgap.setChecked(
+            ini_get(self.cp, "gui", "soak_midgap_on", "0") == "1")
+        self.chk_soak_midgap.setToolTip(
+            "把一组业务流改成：create → modify →【停 N 秒】→ remove。\n\n"
+            "用途：观察「改单后停留一段时间再删单」的时序场景 ——\n"
+            "比如平台在 modify 之后需要一段时间才把改动落库，\n"
+            "立刻 remove 和等一会儿 remove 的行为可能不同。\n\n"
+            "· 停顿期间【完全不碰 Redis】，是一个干净的静默窗口\n"
+            "· 停顿计入本组耗时（trend.csv 的耗时/速率会相应变慢）\n"
+            "· 只对业务流模式生效；单接口模式不传这个参数")
+
+        self.spin_soak_midgap = QDoubleSpinBox()
+        self.spin_soak_midgap.setRange(0.1, 86400)
+        self.spin_soak_midgap.setDecimals(1)
+        self.spin_soak_midgap.setSuffix(" 秒")
+        self.spin_soak_midgap.setValue(
+            float(ini_get(self.cp, "gui", "soak_midgap_sec", "10") or 10))
+        self.spin_soak_midgap.setMaximumWidth(110)
+        self.spin_soak_midgap.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_soak_midgap.setToolTip("modify 发完后等多少秒再发 remove（默认 10 秒）")
+        sp.addWidget(self.chk_soak_midgap, 3, 0, 1, 3)
+        sp.addWidget(self.spin_soak_midgap, 3, 3)
+
         self.chk_soak_rotate = QCheckBox("轮换用例（每轮换一批，避免重复发同一批数据）")
         self.chk_soak_rotate.setChecked(ini_get(self.cp, "gui", "soak_rotate", "1") == "1")
         self.chk_soak_rotate.setToolTip(
@@ -1235,7 +1266,7 @@ class MainWindow(QWidget):
             "全是 normal，配 --type destroy 会一条都选不到，整场 soak 全变「跳过」。\n\n"
             "· create 等有唯一性约束的接口【建议开启】\n"
             "· 不开也能跑，但每轮都发同一批，数据代表性差")
-        sp.addWidget(self.chk_soak_rotate, 3, 0, 1, 4)
+        sp.addWidget(self.chk_soak_rotate, 4, 0, 1, 4)
 
         self.chk_soak_keep = QCheckBox("保留每轮明细（默认只留异常轮）")
         self.chk_soak_keep.setChecked(
@@ -1243,7 +1274,7 @@ class MainWindow(QWidget):
         self.chk_soak_keep.setToolTip(
             "默认只保留【异常轮】的 stats JSON/Excel，正常轮的明细会被清掉，\n"
             "避免跑一晚上堆出几千个文件。勾上则每轮都留（占空间，排查细粒度用）。")
-        sp.addWidget(self.chk_soak_keep, 4, 0, 1, 4)
+        sp.addWidget(self.chk_soak_keep, 5, 0, 1, 4)
 
         # ---- 异常阈值 ----
         note = QLabel(
@@ -1254,7 +1285,7 @@ class MainWindow(QWidget):
         note.setWordWrap(True)
         note.setStyleSheet("color:#a15c00; background:#fff8e6;"
                            " border:1px solid #f0d9a0; border-radius:3px; padding:4px;")
-        sp.addWidget(note, 5, 0, 1, 4)
+        sp.addWidget(note, 6, 0, 1, 4)
 
         self.spin_soak_minreply = QDoubleSpinBox()
         self.spin_soak_minreply.setRange(-1, 100)
@@ -1326,25 +1357,25 @@ class MainWindow(QWidget):
             "  光看回复率会把它判成「全绿」。\n\n"
             "失败原因会归类显示在日志/trend.csv 的「异常」列里。")
 
-        sp.addWidget(QLabel("lag 上限"), 6, 0)
-        sp.addWidget(self.spin_soak_maxlag, 6, 1)
-        sp.addWidget(QLabel("未ACK 上限"), 6, 2)
-        sp.addWidget(self.spin_soak_maxpend, 6, 3)
+        sp.addWidget(QLabel("lag 上限"), 7, 0)
+        sp.addWidget(self.spin_soak_maxlag, 7, 1)
+        sp.addWidget(QLabel("未ACK 上限"), 7, 2)
+        sp.addWidget(self.spin_soak_maxpend, 7, 3)
 
-        sp.addWidget(QLabel("回复率下限%"), 7, 0)
-        sp.addWidget(self.spin_soak_minreply, 7, 1)
-        sp.addWidget(QLabel("超时未回上限"), 7, 2)
-        sp.addWidget(self.spin_soak_maxtout, 7, 3)
+        sp.addWidget(QLabel("回复率下限%"), 8, 0)
+        sp.addWidget(self.spin_soak_minreply, 8, 1)
+        sp.addWidget(QLabel("超时未回上限"), 8, 2)
+        sp.addWidget(self.spin_soak_maxtout, 8, 3)
 
-        sp.addWidget(QLabel("在途上限"), 8, 0)
-        sp.addWidget(self.spin_soak_maxout, 8, 1)
-        sp.addWidget(QLabel("业务失败上限"), 8, 2)
-        sp.addWidget(self.spin_soak_maxbiz, 8, 3)
+        sp.addWidget(QLabel("在途上限"), 9, 0)
+        sp.addWidget(self.spin_soak_maxout, 9, 1)
+        sp.addWidget(QLabel("业务失败上限"), 9, 2)
+        sp.addWidget(self.spin_soak_maxbiz, 9, 3)
 
         self.lbl_soak_hint = QLabel("")
         self.lbl_soak_hint.setWordWrap(True)
         self.lbl_soak_hint.setStyleSheet("color:#666;")
-        sp.addWidget(self.lbl_soak_hint, 9, 0, 1, 4)
+        sp.addWidget(self.lbl_soak_hint, 10, 0, 1, 4)
 
         g.addWidget(self.soak_params, r, 0, 1, 4)
         r += 1
@@ -1353,7 +1384,8 @@ class MainWindow(QWidget):
         # （曾经漏了 combo_soak_mode / combo_soak_clean，用户只是滚页面
         #   却把「结束条件」「流处理」改了）。
         for w in (self.spin_soak_batch, self.spin_soak_rounds, self.spin_soak_hours,
-                  self.spin_soak_gap, self.spin_soak_maxlag, self.spin_soak_maxpend,
+                  self.spin_soak_gap, self.spin_soak_midgap,
+                  self.spin_soak_maxlag, self.spin_soak_maxpend,
                   self.spin_soak_maxtout, self.spin_soak_maxout,
                   self.spin_soak_maxbiz, self.spin_soak_minreply,
                   self.combo_soak_mode, self.combo_soak_clean):
@@ -1361,6 +1393,9 @@ class MainWindow(QWidget):
         self.combo_soak_mode.currentIndexChanged.connect(self._sync_soak_mode)
         self.chk_soak.toggled.connect(self._sync_soak_visibility)
         self.chk_soak_flow.toggled.connect(self._sync_soak_flow)
+        # 中场停顿：勾选启用值框；值变了刷新提示
+        self.chk_soak_midgap.toggled.connect(self._sync_soak_midgap)
+        self.spin_soak_midgap.valueChanged.connect(self._update_soak_hint)
         # 注意：chk_svc_refecho 属于【右栏服务管理】，而这里是左栏，
         # 构建顺序上它还不存在 —— 那个信号在 _build_right 里接。
         self.spin_soak_batch.valueChanged.connect(self._update_soak_hint)
@@ -1670,6 +1705,34 @@ class MainWindow(QWidget):
                 "\n\n⚠ 业务流模式下：用例类型固定 normal、清理固定 monitor、"
                 "「轮换用例」不生效（已置灰）。")
         self._sync_refecho_hint()
+        self._sync_soak_midgap()
+        self._update_soak_hint()
+
+    def _sync_soak_midgap(self):
+        """中场停顿只在【业务流模式】下有意义，按模式启用/置灰。
+
+        单接口模式（反复发一个接口）没有 modify→remove 这个中途位置，
+        soak_test.py 会直接拒绝 --mid-gap 并退出 —— 置灰免得点了报错。
+        """
+        flow = self.chk_soak_flow.isChecked()
+        on = self.chk_soak_midgap.isChecked()
+        self.chk_soak_midgap.setEnabled(flow)
+        # 秒数框：业务流 + 勾了停顿 才可编辑
+        self.spin_soak_midgap.setEnabled(flow and on)
+        if not flow:
+            self.chk_soak_midgap.setToolTip(
+                "⚠ 只有勾选上面的「业务流模式」时才生效。\n\n"
+                "单接口模式没有 modify→remove 这个中途位置，\n"
+                "soak_test.py 会拒绝 --mid-gap。")
+        else:
+            self.chk_soak_midgap.setToolTip(
+                "把一组业务流改成：create → modify →【停 N 秒】→ remove。\n\n"
+                "用途：观察「改单后停留一段时间再删单」的时序场景 ——\n"
+                "比如平台在 modify 之后需要一段时间才把改动落库，\n"
+                "立刻 remove 和等一会儿 remove 的行为可能不同。\n\n"
+                "· 停顿期间【完全不碰 Redis】，是一个干净的静默窗口\n"
+                "· 停顿计入本组耗时（trend.csv 的耗时/速率会相应变慢）")
+        # 勾选/取消会改变"将执行"的描述，提示要跟着刷新
         self._update_soak_hint()
 
     def _sync_refecho_hint(self):
@@ -1704,13 +1767,17 @@ class MainWindow(QWidget):
             flow = self.chk_soak_flow.isChecked()
             if flow:
                 # 业务流：一组 = 三段各 b 条
+                mid = ""
+                if self.chk_soak_midgap.isChecked():
+                    mid = " + 中场停 %gs" % self.spin_soak_midgap.value()
                 if self._soak_by_rounds():
-                    desc = "共 %d 组 × (create+modify+remove 各 %d 条) = 约 %d 条" % (
-                        self.spin_soak_rounds.value(), b,
+                    desc = "共 %d 组 × (create+modify+remove 各 %d 条%s) = 约 %d 条" % (
+                        self.spin_soak_rounds.value(), b, mid,
                         self.spin_soak_rounds.value() * b * 3)
                 else:
-                    desc = ("时长 %.2fh，每组 create+modify+remove 各 %d 条"
-                            "（组数取决于每组耗时）" % (self.spin_soak_hours.value(), b))
+                    desc = ("时长 %.2fh，每组 create+modify+remove 各 %d 条%s"
+                            "（组数取决于每组耗时）"
+                            % (self.spin_soak_hours.value(), b, mid))
                 desc += "；目标流 %s" % self._stream_name()
             else:
                 if self._soak_by_rounds():
@@ -1784,6 +1851,10 @@ class MainWindow(QWidget):
             a += ["--hours", "%g" % self.spin_soak_hours.value()]
         a += ["--batch", str(self.spin_soak_batch.value())]
         a += ["--gap", "%g" % self.spin_soak_gap.value()]
+        # 业务流中场停顿（create→modify→停N秒→remove）：
+        # 只在 flow 模式传；单接口模式传了 soak 会直接拒绝退出。
+        if flow and self.chk_soak_midgap.isChecked():
+            a += ["--mid-gap", "%g" % self.spin_soak_midgap.value()]
         a += ["--clean", "monitor" if flow
               else (self.combo_soak_clean.currentData() or "monitor")]
         if self.chk_soak_rotate.isChecked() and not flow:
@@ -1864,9 +1935,15 @@ class MainWindow(QWidget):
             warn = ("\n⚠ 流处理选了「每轮清理回包流」：\n"
                     "   DataHub_reply_stream 是多条 ST-* 共用的全局流，\n"
                     "   非独占环境会清掉别人的回包。确认只有你在用再继续。\n")
-        what = ("一组 = create → modify → remove 各 %d 条"
-                % self.spin_soak_batch.value()) if flow \
-            else ("接口      : %s" % ",".join(names))
+        if flow:
+            flow_desc = "create → modify → remove"
+            if self.chk_soak_midgap.isChecked():
+                flow_desc = ("create → modify → 停 %gs → remove"
+                             % self.spin_soak_midgap.value())
+            what = "一组 = %s 各 %d 条" % (flow_desc,
+                                          self.spin_soak_batch.value())
+        else:
+            what = "接口      : %s" % ",".join(names)
         if not self._ask(
                 "确认运行稳定性测试",
                 "即将运行稳定性测试：\n\n"
@@ -1888,9 +1965,13 @@ class MainWindow(QWidget):
         self.append_log("")
         self.append_log("#" * 60)
         if flow:
-            self.append_log("# 开始稳定性测试：业务流 create→modify→remove 各 %d 条 %s"
+            fd = "create→modify→remove"
+            if self.chk_soak_midgap.isChecked():
+                fd = ("create→modify→停%gs→remove"
+                      % self.spin_soak_midgap.value())
+            self.append_log("# 开始稳定性测试：业务流 %s 各 %d 条 %s"
                             " 目标流=%s"
-                            % (self.spin_soak_batch.value(), rounds_txt,
+                            % (fd, self.spin_soak_batch.value(), rounds_txt,
                                self._stream_name()))
             self.append_log("# 每组会从 create 回包抓真实单号，现生成 modify/remove 表")
         else:
