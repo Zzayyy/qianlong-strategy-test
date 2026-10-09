@@ -37,7 +37,7 @@ REF_KEY = "Ref"          # make_excel 的 --ref-spec 用
 #     1) 带的块更多：create 全套 12 个，modify 也要 12 个（原来只带 Entrust+CondPrice）
 #     2) 同名块取值不同：MarketOrderType 15→1、
 #        CondPrice.TriggerPrice 0.123→0.0675、
-#        CondLoss/CondProfit 合约 10011743→90007676、
+#        CondLoss/CondProfit 合约 10011743→90008169、
 #        CondTargetLoss/CondTargetProfit 标的 510050→159901
 #        （ExchangeNum / PriceUnit / EntrustAmount 与 create 一致：2 / 0.0001 / 20）
 #   ⚠ 字段名大小写【保持与 create 一致的大写】
@@ -45,7 +45,7 @@ REF_KEY = "Ref"          # make_excel 的 --ref-spec 用
 #       TriggerPercent / TriggerDate / TriggerTime），
 #     不采用目标报文里的小写写法 —— 详见 _common.py 顶部说明（实测大写）。
 MODIFY_BLOCKS = [
-    ("CfgExceedPrice", {"ExchangeNum": 2, "StockCode": "90007676",
+    ("CfgExceedPrice", {"ExchangeNum": 2, "StockCode": "90008169",
                         "StockName": "50ETF", "PriceStepBuy": -1,
                         "PriceStepSell": 1, "PriceType": 0,
                         "PriceUnit": "0.0001", "Decimals": 4}),
@@ -57,22 +57,22 @@ MODIFY_BLOCKS = [
                       "MarketMax": 5, "MarketInterval": 300}),
     ("CfgAppend", {"MarketOrderType": 15, "Tick": 2, "IntervalSec": 300,
                    "Repeat": 2, "EndWithdraw": False}),
-    ("Entrust", {"ContractCode": "90007676", "ExchangeNum": 2,
+    ("Entrust", {"ContractCode": "90008169", "ExchangeNum": 2,
                  "EntrustPrice": "0.1033", "MarketOrderType": 1,
                  "CoveredType": False, "BSType": 1, "OCType": 1,
                  "PriceUnit": "0.0001", "EntrustAmount": 20}),
-    ("CondPrice", {"ContractCode": "90007676", "ExchangeNum": 2,
+    ("CondPrice", {"ContractCode": "90008169", "ExchangeNum": 2,
                    "Op": ">", "TriggerPrice": "0.0675"}),
-    ("CondPercent", {"ContractCode": "90007676", "ExchangeNum": 2,
+    ("CondPercent", {"ContractCode": "90008169", "ExchangeNum": 2,
                      "Op": ">", "TriggerPercent": "5.25"}),
     # 字段名是 TriggerDate（不是 TriggerData）；时间按现场要求固定。
-    ("CondTime", {"ContractCode": "90007676", "ExchangeNum": 2,
+    ("CondTime", {"ContractCode": "90008169", "ExchangeNum": 2,
                   "TriggerDate": "20260918", "TriggerTime": "093100"}),
-    ("CondLoss", {"ContractCode": "90007676", "ExchangeNum": 2,
+    ("CondLoss", {"ContractCode": "90008169", "ExchangeNum": 2,
                   "Method": 1, "ValueType": 1, "Value": "0.0675"}),
     ("CondTargetLoss", {"StockCode": "159901", "ExchangeNum": 2,
                         "Method": 1, "ValueType": 1, "Value": "0.0675"}),
-    ("CondProfit", {"ContractCode": "90007676", "ExchangeNum": 2, "Method": 1,
+    ("CondProfit", {"ContractCode": "90008169", "ExchangeNum": 2, "Method": 1,
                     "ValueType": 1, "Value": "0.0675", "WithdrawType": 2,
                     "Withdraw": "0.50"}),
     ("CondTargetProfit", {"StockCode": "159901", "ExchangeNum": 2,
