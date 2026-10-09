@@ -13,8 +13,32 @@ interfaces/_common.py —— 接口定义的公共工具
   * 值里可以放 token（__LONG__ / __SQL__ …），发送时才展开
 """
 import datetime
+import os
 import re
 import time
+
+# ==================== 行情合约代码（每天在变，可配）====================
+# 期权合约代码（9000xxxx）每天换，写死在代码里就得天天改源码。
+# 这里统一从【环境变量 ST_CONTRACT_CODE】取，取不到才用下面的兜底默认值：
+#   · GUI「生成压测数据」会把这个值透传给 make_excel.py（写进表里）
+#   · 也可以直接设环境变量：set ST_CONTRACT_CODE=90008169
+# ★ 生成表时就把值固化进 xlsx 了（表里存的是字面量，不是 token），
+#   所以换代码后【必须重新生成表】才生效 —— GUI 点「生成压测数据」即可。
+DEFAULT_CONTRACT_CODE = "90008169"      # 期权合约（Entrust / Cond* 用）
+DEFAULT_TARGET_STOCK_CODE = "159901"    # 止盈止损标的（CondTarget* 用）
+
+
+def contract_code():
+    """当前使用的行情合约代码。环境变量优先，非法/为空则用默认值。"""
+    v = (os.environ.get("ST_CONTRACT_CODE") or "").strip()
+    return v or DEFAULT_CONTRACT_CODE
+
+
+def target_stock_code():
+    """止盈止损（CondTargetLoss/CondTargetProfit）用的标的代码，同样可配。"""
+    v = (os.environ.get("ST_TARGET_STOCK_CODE") or "").strip()
+    return v or DEFAULT_TARGET_STOCK_CODE
+
 
 # ==================== 破坏 token ====================
 TOKEN_MAP = {
@@ -323,12 +347,12 @@ def fmt_shareholders(seq):
     return [(sh, 1), (sz, 2)]
 
 REAL_ENTRUST = {
-    "ContractCode": "90008169", "ExchangeNum": 2, "EntrustPrice": "0.1033",
+    "ContractCode": contract_code(), "ExchangeNum": 2, "EntrustPrice": "0.1033",
     "MarketOrderType": 15, "CoveredType": False, "BSType": 1, "OCType": 1,
     "PriceUnit": "0.0001", "EntrustAmount": 20, "FOK": False,
 }
 REAL_CFG_EXCEED = {
-    "ExchangeNum": 2, "StockCode": "90008169", "StockName": "50ETF",
+    "ExchangeNum": 2, "StockCode": contract_code(), "StockName": "50ETF",
     "PriceStepBuy": -1, "PriceStepSell": 1, "PriceType": 0,
     "PriceUnit": "0.0001", "Decimals": 4,
 }
@@ -344,12 +368,14 @@ REAL_CFG_APPEND = {
     "MarketOrderType": 15, "Tick": 2, "IntervalSec": 3, "Repeat": 2,
     "EndWithdraw": False,
 }
-REAL_COND_PRICE = {"ContractCode": "90008169", "ExchangeNum": 2,
+REAL_COND_PRICE = {"ContractCode": contract_code(), "ExchangeNum": 2,
                    "Op": ">", "TriggerPrice": "0.123"}
-REAL_COND_PERCENT = {"ContractCode": "90008169", "ExchangeNum": 2,
+REAL_COND_PERCENT = {"ContractCode": contract_code(), "ExchangeNum": 2,
                      "Op": ">", "TriggerPercent": "5.25"}
-REAL_COND_TIME = {"ContractCode": "90008169", "ExchangeNum": 2,
+REAL_COND_TIME = {"ContractCode": contract_code(), "ExchangeNum": 2,
                   "TriggerDate": "__TODAY_PLUS7__", "TriggerTime": "093240"}
+# ⚠ 下面这两组的代码与「行情合约代码」不同源，保持原值不动
+#   （CondLoss/CondProfit 用 10011743，CondTarget* 用标的 510050）。
 REAL_COND_LOSS = {"ContractCode": "10011743", "ExchangeNum": 1,
                   "Method": 1, "ValueType": 1, "Value": "0.0675"}
 REAL_COND_TARGET_LOSS = {"StockCode": "510050", "ExchangeNum": 1,

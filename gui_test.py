@@ -530,6 +530,11 @@ class MainWindow(QWidget):
             self.cp.set("gui", "bulk_accounts", str(self.spin_bulk_accounts.value()))
             self.cp.set("gui", "bulk_start", str(self.spin_bulk_start.value()))
             self.cp.set("gui", "ref_map", self.edit_ref_map.text().strip())
+            # 行情代码（每天都在换，记住上次填的，省得天天重填）
+            self.cp.set("gui", "contract_code",
+                        self.edit_contract_code.text().strip())
+            self.cp.set("gui", "target_stock_code",
+                        self.edit_target_code.text().strip())
             # 稳定性测试参数（纯偏好，不点「运行」不会发任何数据）
             if hasattr(self, "chk_soak"):
                 self.cp.set("gui", "soak",
@@ -824,10 +829,43 @@ class MainWindow(QWidget):
         g.addWidget(self.edit_ref_map, row_gen + 2, 1, 1, 2)
         g.addWidget(btn_pick_map, row_gen + 2, 3)
 
+        # ---- 行情代码（每天都在换，做成可填，免得天天改源码）----
+        self.edit_contract_code = QLineEdit(
+            ini_get(self.cp, "gui", "contract_code", ""))
+        self.edit_contract_code.setPlaceholderText("90008169")
+        self.edit_contract_code.setMaximumWidth(140)
+        self.edit_contract_code.setToolTip(
+            "行情【合约代码】。留空 = 用 interfaces/_common.py 里的默认值。\n\n"
+            "★ 改完必须点「生成压测数据」重新生成表才生效 ——\n"
+            "  表里存的是字面量，不是运行时 token。\n"
+            "  生成后会打印一行 [OK] 行情代码：合约=... 便于核对。\n\n"
+            "写入的字段：\n"
+            "  create/modify 的 Entrust.ContractCode、\n"
+            "  CfgExceedPrice.StockCode、\n"
+            "  CondPrice / CondPercent / CondTime .ContractCode\n\n"
+            "⚠ modify 还会用它覆盖 CondLoss / CondProfit .ContractCode；\n"
+            "  但 create 里这两组是【另一个代码 10011743】，不受本框影响。")
+        self.guard.install(self.edit_contract_code)
+
+        self.edit_target_code = QLineEdit(
+            ini_get(self.cp, "gui", "target_stock_code", ""))
+        self.edit_target_code.setPlaceholderText("159901")
+        self.edit_target_code.setMaximumWidth(140)
+        self.edit_target_code.setToolTip(
+            "止盈止损【标的代码】，写进 CondTargetLoss / CondTargetProfit 的 StockCode。\n"
+            "留空 = 用 _common.py 里的默认值。同样需要重新生成表才生效。\n\n"
+            "⚠ 只对 modify 生效：create 里这两组是【510050】，不受本框影响。")
+        self.guard.install(self.edit_target_code)
+
+        g.addWidget(QLabel("合约代码"), row_gen + 3, 0)
+        g.addWidget(self.edit_contract_code, row_gen + 3, 1)
+        g.addWidget(QLabel("止盈止损标的"), row_gen + 3, 2)
+        g.addWidget(self.edit_target_code, row_gen + 3, 3)
+
         self.lbl_gen = QLabel("")
         self.lbl_gen.setWordWrap(True)
         self.lbl_gen.setStyleSheet("color:#666;")
-        g.addWidget(self.lbl_gen, row_gen + 3, 0, 1, 4)
+        g.addWidget(self.lbl_gen, row_gen + 4, 0, 1, 4)
 
         return box
 
@@ -888,6 +926,11 @@ class MainWindow(QWidget):
                 return
 
         cmds = []
+        codes = []
+        if self.edit_contract_code.text().strip():
+            codes += ["--contract-code", self.edit_contract_code.text().strip()]
+        if self.edit_target_code.text().strip():
+            codes += ["--target-stock-code", self.edit_target_code.text().strip()]
         for n in names:
             cmd = self._base_cmd("make_excel.py") + ["--interface", n]
             if bulk_n:
@@ -895,6 +938,7 @@ class MainWindow(QWidget):
                         "--bulk-start", str(self.spin_bulk_start.value())]
                 if ref_map and n in ("modify", "remove"):
                     cmd += ["--ref-map", ref_map]
+            cmd += codes
             cmds.append(cmd)
 
         self.append_log("")
@@ -903,6 +947,10 @@ class MainWindow(QWidget):
         self.append_log("#   接口=%s  批量账号=%s  Ref回填=%s"
                         % (",".join(names), bulk_n or "关",
                            os.path.basename(ref_map) if ref_map else "关"))
+        if codes:
+            self.append_log("#   行情代码：合约=%s  止盈止损标的=%s"
+                            % (self.edit_contract_code.text().strip() or "（默认）",
+                               self.edit_target_code.text().strip() or "（默认）"))
         self.append_log("#" * 60)
         self._run(cmds, on_done=lambda rc: self._after_generate(rc, names))
 
@@ -1850,6 +1898,12 @@ class MainWindow(QWidget):
         else:
             a += ["--hours", "%g" % self.spin_soak_hours.value()]
         a += ["--batch", str(self.spin_soak_batch.value())]
+        # 行情代码：业务流每轮要重生成 modify/remove 表，必须沿用同一套代码，
+        # 否则会把生成好的表悄悄换回默认合约。
+        if self.edit_contract_code.text().strip():
+            a += ["--contract-code", self.edit_contract_code.text().strip()]
+        if self.edit_target_code.text().strip():
+            a += ["--target-stock-code", self.edit_target_code.text().strip()]
         a += ["--gap", "%g" % self.spin_soak_gap.value()]
         # 业务流中场停顿（create→modify→停N秒→remove）：
         # 只在 flow 模式传；单接口模式传了 soak 会直接拒绝退出。

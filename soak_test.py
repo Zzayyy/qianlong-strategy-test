@@ -282,6 +282,47 @@ def _rows_of_type(excel_path, type_tag, want_types=None):
         return []
 
 
+def _table_contract_code(excel_path, col="Entrust_ContractCode"):
+    """读表里第一行 normal 的合约代码，用于检测"表比参数旧"。
+
+    返回 None 表示读不到（表不存在/没这列/没 normal 行）。
+    """
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(excel_path, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            it = ws.iter_rows(values_only=True)
+            try:
+                header = next(it)
+            except StopIteration:
+                return None
+            import re as _re
+            keys = []
+            for h in header:
+                m = _re.search(r"\(([A-Za-z_][A-Za-z0-9_]*)\)", str(h))
+                keys.append(m.group(1) if m else str(h).strip())
+            if col not in keys:
+                return None
+            ci = keys.index(col)
+            ti = keys.index("case_type") if "case_type" in keys else None
+            for raw in it:
+                if raw is None or ci >= len(raw):
+                    continue
+                if ti is not None and ti < len(raw):
+                    t = str(raw[ti]).strip().lower()
+                    if t and t != "normal":
+                        continue
+                v = raw[ci]
+                if v not in (None, ""):
+                    return str(v).strip()
+            return None
+        finally:
+            wb.close()
+    except Exception:
+        return None
+
+
 def _cases_spec(offset, batch, total):
     """按【数据行号】生成 --cases 规格（1 起始，末尾回绕）。
 
@@ -426,19 +467,41 @@ def flow_desc_of(args):
     return " → ".join(FLOW_STAGES)
 
 
-def gen_table(interface, count, ref_map="", timeout=900):
+def _flow_codes(args):
+    """业务流重生成表时要沿用的行情代码（--contract-code / --target-stock-code）。"""
+    return {
+        "contract": (getattr(args, "contract_code", "") or "").strip(),
+        "target": (getattr(args, "target_stock_code", "") or "").strip(),
+    }
+
+
+def gen_table(interface, count, ref_map="", timeout=900, codes=None):
     """调 make_excel.py 生成/重生成一张表。
 
     返回 (ok, msg, actual_path)。actual_path 为实际写入的表 ——
     ★ 如果原表被 Excel/WPS 占着，make_excel 会【另存 _v2.xlsx 且原表不变】，
       这时候必须让 soak 报错停下，否则会拿旧表接着发（静默发错数据）。
+
+    codes: {"contract": "...", "target": "..."}（可空）
+      ★ 业务流每轮都要重生成 modify/remove 表，必须把行情代码一起传下去，
+        否则会把用户生成好的表【悄悄换成默认代码】—— 发出去的合约就变了。
     """
     cmd = [sys.executable, MAKE_EXCEL, "--interface", interface,
            "--bulk-normal", str(count)]
     if ref_map:
         cmd += ["--ref-map", ref_map]
+    codes = codes or {}
+    if codes.get("contract"):
+        cmd += ["--contract-code", codes["contract"]]
+    if codes.get("target"):
+        cmd += ["--target-stock-code", codes["target"]]
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    # 双保险：make_excel 也认环境变量（它在 import 接口前读）
+    if codes.get("contract"):
+        env["ST_CONTRACT_CODE"] = codes["contract"]
+    if codes.get("target"):
+        env["ST_TARGET_STOCK_CODE"] = codes["target"]
     try:
         p = subprocess.run(cmd, cwd=BASE_DIR, env=env,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -465,16 +528,30 @@ def ensure_create_table(args, log):
 
     create 的 Ref 是自生成的（__REF{i}__ 当天展开），不依赖 refs.json，
     所以它的表【只需生成一次】；modify/remove 才要每轮按新 refs 重生成。
+
+    ★ 但行情代码（--contract-code）是【写死在表里的字面量】：
+      只判行数会漏掉"表是旧的、用的还是上一天的合约"这种情况 ——
+      实测踩过：表有 10000 行就直接放行，结果 create 发出去的合约
+      与 modify 不是同一个（用户在 GUI 改了代码也不生效）。
+      所以这里同时核对表里的合约代码，不一致就重新生成。
     """
     excel = os.path.join(BASE_DIR, "data", "create.xlsx")
     n = len(_rows_of_type(excel, "normal", {"normal"}))
-    if n >= args.batch:
+    want = (_flow_codes(args) or {}).get("contract") or ""
+    have = _table_contract_code(excel) if want else None
+    if want and have and have != want:
+        log("create.xlsx 里的合约是 %s，与本次 --contract-code %s 不一致 —— 重新生成"
+            % (have, want))
+    elif n >= args.batch:
         log("create.xlsx 已有 %d 行 normal（>= 每轮 %d），无需重新生成"
             % (n, args.batch))
         return True
-    log("create.xlsx 只有 %d 行 normal，少于每轮 %d —— 自动生成 --bulk-normal %d"
-        % (n, args.batch, args.batch))
-    ok, msg, _ = gen_table("create", args.batch)
+    if n < args.batch:
+        log("create.xlsx 只有 %d 行 normal，少于每轮 %d —— 自动生成 --bulk-normal %d"
+            % (n, args.batch, args.batch))
+    # 重新生成时按 max(现有行数, 每轮条数) 生成：
+    # 不能只用 args.batch，否则会把 1 万行的表缩成几十行（用户还得再生成一次）。
+    ok, msg, _ = gen_table("create", max(n, args.batch), codes=_flow_codes(args))
     log("  生成 create.xlsx: %s%s" % ("OK" if ok else "失败", "" if ok else " " + msg))
     return ok
 
@@ -530,7 +607,8 @@ def run_flow_cycle(args, round_no, cycle_dir, refs_path, log, on_step=None):
     log("  create 抓到 %d 个真实单号 -> %s" % (n_refs, os.path.basename(refs_path)))
 
     t0 = time.time()
-    ok, msg, _ = gen_table("modify", args.batch, ref_map=refs_path)
+    ok, msg, _ = gen_table("modify", args.batch, ref_map=refs_path,
+                           codes=_flow_codes(args))
     log("  生成 modify 表: %s（%.1fs）%s"
         % ("OK" if ok else "失败", time.time() - t0, "" if ok else " " + msg))
     if not ok:
@@ -554,7 +632,8 @@ def run_flow_cycle(args, round_no, cycle_dir, refs_path, log, on_step=None):
 
     # ---- 3) remove：同一批单号，删掉（删干净下一轮 create 才能重建同名号）----
     t0 = time.time()
-    ok, msg, _ = gen_table("remove", args.batch, ref_map=refs_path)
+    ok, msg, _ = gen_table("remove", args.batch, ref_map=refs_path,
+                           codes=_flow_codes(args))
     log("  生成 remove 表: %s（%.1fs）%s"
         % ("OK" if ok else "失败", time.time() - t0, "" if ok else " " + msg))
     if not ok:
@@ -686,6 +765,12 @@ def main():
     ap.add_argument("--round-timeout", type=float, default=600.0,
                     help="单轮最长秒数，防卡死（默认 600）")
     ap.add_argument("--soak-out", default="", help="输出根目录（默认 out/soak）")
+    # 行情代码（每天在变）：业务流每轮重生成 modify/remove 表时要沿用同一套代码
+    ap.add_argument("--contract-code", default="",
+                    help="行情合约代码：业务流重生成 modify/remove 表时传给 make_excel。"
+                         "留空则用 make_excel 自己的默认值/环境变量")
+    ap.add_argument("--target-stock-code", default="",
+                    help="止盈止损标的代码：同上，传给 make_excel")
 
     # ---- 异常判据（默认：发送失败 + 回复率(按类型) + lag/pending/在途/超时）----
     ap.add_argument("--min-reply-rate", type=float, default=None,
@@ -852,6 +937,11 @@ def main():
             log("⚠ 该类型没有可轮换的行（--rotate 失效，将每轮发同一批）")
     if args.passthrough:
         log("透传 send_test.py 参数: %s" % " ".join(args.passthrough))
+    _fc = _flow_codes(args)
+    if args.flow and (_fc["contract"] or _fc["target"]):
+        log("行情代码（重生成 modify/remove 表时沿用）: 合约=%s  止盈止损标的=%s"
+            % (_fc["contract"] or "（make_excel 默认）",
+               _fc["target"] or "（make_excel 默认）"))
     if args.clean == "per-round":
         log("⚠ --clean per-round：会清空回包流 %s。该流是多条 ST-* 共用的，"
             "非独占环境请改用 monitor" % REPLY_STREAM)

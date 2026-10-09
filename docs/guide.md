@@ -49,7 +49,7 @@ cd strategy_test
 
 * **左栏**管「发什么」，从上到下一条主流程：
   * **1. 测试数据** —— 管**磁盘上的数据**：勾接口（读哪个 `data/*.xlsx`）、
-    批量账号数、Ref 回填、生成压测数据。只写文件，不发送。
+    批量账号数、Ref 回填、**行情代码**、生成压测数据。只写文件，不发送。
   * **2. 发送参数** —— 管**这一批怎么发**，内含四个分区：
     发送范围（`--type` / `--cases`）→ 规模与速率 → 回复处理 → 稳定性测试。
 * **右栏**管「连哪儿、以谁身份、结果存哪」＋服务管理
@@ -266,6 +266,34 @@ python -c "import pwd_encode as p; print(p.decode_pwd('<密文>','010100011300')
 ---
 
 ## 6. 用例
+
+### 行情代码（每天都在换，别改源码）
+
+`create` / `modify` 报文里的**期权合约代码**（`9000xxxx`）每天换一次。
+写死在 `interfaces/_common.py` 里就要天天改代码，所以做成了可配：
+
+| 入口 | 怎么设 |
+|---|---|
+| **GUI** | 左栏「1. 测试数据 → 合约代码 / 止盈止损标的」两个输入框（会记住） |
+| 命令行 | `make_excel.py --interface modify --contract-code 90008169` |
+| 环境变量 | `set ST_CONTRACT_CODE=90008169`（Windows）/ `export ...`（Linux） |
+
+优先级：**命令行 > 环境变量 > `interfaces/_common.py` 的默认值**。
+
+写入哪些字段：
+
+| 代码 | 写入字段 | create | modify |
+|---|---|---|---|
+| 合约代码 | `Entrust.ContractCode`、`CfgExceedPrice.StockCode`、`CondPrice`/`CondPercent`/`CondTime` 的 `ContractCode` | ✅ | ✅ |
+| 合约代码 | `CondLoss`/`CondProfit.ContractCode` | ❌（固定 `10011743`） | ✅ |
+| 止盈止损标的 | `CondTargetLoss`/`CondTargetProfit.StockCode` | ❌（固定 `510050`） | ✅ |
+
+> ⚠ **表里存的是字面量，不是运行时 token** —— 改完必须点
+> 「生成压测数据」（或跑一次 `make_excel.py`）**重新生成表**才生效。
+> 生成时会打印一行 `[OK] 行情代码：合约=... 止盈止损标的=...`，可用来核对。
+>
+> 业务流模式每轮都会重生成 `modify`/`remove` 表，soak 会把这两个代码
+> **一起传下去**，所以不会把表悄悄换回默认合约。
 
 ### 类型
 

@@ -56,6 +56,15 @@
 | `--ref-map` | 空 | ★**推荐**：读 `send_test` 落盘的 `refs.json` 回填**真实单号** |
 | `--ref-seq` | 1 | 备选：靠行序对齐时用，当天已建过 N 张就填 N+1 |
 | `--ref-spec` | 空 | **仅 modify/remove**：按单号区间生成引用行，如 `7,100` |
+| `--contract-code` | 环境变量/内置默认 | **行情合约代码**（每天都换）。写进 `Entrust.ContractCode`、`CfgExceedPrice.StockCode`、`CondPrice/CondPercent/CondTime.ContractCode`；modify 还会覆盖 `CondLoss/CondProfit` |
+| `--target-stock-code` | 环境变量/内置默认 | 止盈止损**标的代码**，写进 `CondTargetLoss/CondTargetProfit.StockCode`（**仅 modify**；create 里是 `510050`） |
+
+> **行情代码每天在换**，所以做成了可配（GUI 里有输入框），不必改源码。
+> 优先级：命令行 `--contract-code` > 环境变量 `ST_CONTRACT_CODE` >
+> `interfaces/_common.py` 的 `DEFAULT_CONTRACT_CODE`。
+> ⚠ 表里存的是**字面量**（不是 token），所以**换代码后必须重新生成表**才生效。
+> 业务流模式下 soak 每轮都会重生成 `modify`/`remove` 表，会带上
+> `--contract-code` 一起传下去，不会把代码换回默认值。
 
 用法与数据规则见 [guide.md](guide.md) 第 6 节。
 
@@ -136,6 +145,8 @@ python send_test.py --host 192.168.1.137 --db 0 --assign-id 1 --type normal --ma
 | `--keep-round-stats` | 关 | 保留每轮 stats（默认只留异常轮） |
 | `--round-timeout` | 600 | 单轮最长秒数，防卡死 |
 | `--soak-out` | `out/soak` | 输出根目录 |
+| `--contract-code` | 空 | **行情合约代码**。业务流每轮重生成 `modify`/`remove` 表时传给 `make_excel.py`，避免把表悄悄换回默认合约。留空 = 用 `make_excel` 的默认值/环境变量 |
+| `--target-stock-code` | 空 | 止盈止损**标的代码**，同上传给 `make_excel` |
 
 ### 判据参数（0 / 负值 = 不判）
 

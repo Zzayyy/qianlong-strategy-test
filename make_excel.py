@@ -362,12 +362,34 @@ def main():
                     help="★推荐：用 send_test 发 create 时自动落盘的 refs.json 回填【真实单号】。"
                          "比 --ref-seq 靠行序猜可靠得多（单号来自平台回包）。"
                          "例：--bulk-normal 10000 --ref-map out/performance/create_xxx_refs.json")
+    # 行情代码每天都在换，做成参数就不必改源码（GUI 里有输入框）
+    ap.add_argument("--contract-code", default="",
+                    help="行情合约代码（Entrust/CondPrice/CondPercent/CondTime/"
+                         "CondLoss/CondProfit 用），默认取环境变量 ST_CONTRACT_CODE "
+                         "或 interfaces/_common.py 里的 DEFAULT_CONTRACT_CODE")
+    ap.add_argument("--target-stock-code", default="",
+                    help="止盈止损标的代码（CondTargetLoss/CondTargetProfit 用），"
+                         "默认取环境变量 ST_TARGET_STOCK_CODE 或默认值")
     ap.add_argument("--list", action="store_true", help="只列出各接口用例数，不生成")
     args = ap.parse_args()
+
+    # ★ 必须在 load_interface 之前注入环境变量：
+    #   接口模块是在 import 时把 contract_code() 求值进 REAL_BLOCKS / MODIFY_BLOCKS 的，
+    #   晚了就还是旧值（表里会静默写成上一天的代码）。
+    if args.contract_code.strip():
+        os.environ["ST_CONTRACT_CODE"] = args.contract_code.strip()
+    if args.target_stock_code.strip():
+        os.environ["ST_TARGET_STOCK_CODE"] = args.target_stock_code.strip()
 
     names = list_interfaces() if args.interface == "all" else [args.interface]
     if not names:
         sys.exit("[FAIL] 没有可用接口定义")
+
+    # 显式告知本次用了哪个合约代码，避免"改完参数表里还是旧值"这种静默问题
+    if args.contract_code.strip() or args.target_stock_code.strip():
+        sys.path.insert(0, INTERFACES_DIR)
+        from _common import contract_code as _cc, target_stock_code as _tc
+        print("[OK] 行情代码：合约=%s  止盈止损标的=%s" % (_cc(), _tc()))
 
     if args.list:
         print("%-12s %-38s %8s %8s %8s" % ("接口", "说明", "normal", "error", "destroy"))
