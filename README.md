@@ -7,7 +7,7 @@
 
 ## 快速开始
 
-需要 Python 3.8+，直接用仓库根目录的 `venv`（已装 PySide6 + openpyxl）。
+Python 3.8+，直接用仓库根目录的 `venv`（已装 PySide6 + openpyxl）。
 
 ```powershell
 cd strategy_test
