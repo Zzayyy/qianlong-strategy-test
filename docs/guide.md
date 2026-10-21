@@ -334,6 +334,153 @@ token 机制与 `datahub_test/interfaces/_common.py` 一致：配置里存占位
 |---|---|
 | `__TODAY__` / `__TODAY_D30__` / `__TODAY_D_1__` | `YYYY-MM-DD`（`ValidDate` 用） |
 | `__TODAY8__` / `__TODAY_PLUS7__` | `YYYYMMDD`（`CondTime.TriggerDate` 用） |
+| `__NOW8__` | 当天 `YYYYMMDD` |
+| `__NOW_HHMMSS__` | 当前时刻（如 `093240`） |
+| `__NOW_M10__` / `__NOW_H2__` / `__NOW_S30__` | 10 分钟后 / 2 小时后 / 30 秒后 |
+| `__NOW_M-5__` | 5 分钟**前**（负号紧贴数字，别写成 `__NOW_M_5__`） |
+
+`__NOW_*` 是给 `CondType=2`（时间条件）用的：表在白天生成、单子可能晚上才发，
+所以「触发时刻」必须在**发送时**才求值，不能生成时写死。
+
+### 按行情 CODE 列表生成条件单（`--codes-file`）
+
+**场景**：策略服务器性能测试，要求「当日活跃的每个 CODE 都注册一张条件单」，
+且 `CondType` 按指定配比铺开（如 2000 条里 1 类 200 条、2 类 600 条、其余各 400 条）。
+
+**与 `--bulk-normal` 的区别**：
+
+| | 一行是什么 | CODE | 用途 |
+|---|---|---|---|
+| `--bulk-normal N` | 一个**账号**一行 | 全表固定 | 压吞吐（1 万个不同账号下单） |
+| `--codes-file` | 一个**CODE**一行 | 每行不同 | 验触发链路（每个合约都挂上单） |
+
+#### 6.1 先把同事的日志转成 csv
+
+同事给的是策略服务器自己打的行情推送日志（`latestprice_SH.txt`）：
+
+```
+CHQSHOpt::OnPushData code=10012532 latest price=873 DateTimeStamp=111031410
+```
+
+```bash
+python code_list.py --txt latestprice_SH.txt          # 产出 data/codes_latestprice_SH.csv
+python code_list.py --txt latestprice_SH.txt --list   # 只看统计，不写文件
+```
+
+**两个必须知道的坑（都已在代码里处理，但看日志时要认得）**：
+
+1. **同一个 code 会出现很多次**。实测 1057 行只有 **466 个不同 code** ——
+   那是 4 个时点的增量快照（每来一笔行情打一行），交集为 0。
+   ⇒ 按 code 去重，取 `DateTimeStamp` 最大的那条（= 最新价）。
+2. **中间夹着乱码分隔行**：`µ±ǰѐʱ¼⸠11:03:50`。
+   那是对方工具用 GBK 打的"当前保存时间"被 UTF-8 二次编码的产物，
+   与任务无关 ⇒ 跳过，但脚本会把**跳过的行数**打出来（实测 3 行），免得以为解析漏了。
+
+产物 `data/codes_latestprice_SH.csv`：
+
+```
+code,price_raw,price_yuan,exchange,timestamp
+10011425,1308,0.1308,1,110847600
+```
+
+> 日志里的 `latest price` 是**整数、单位 0.0001 元**（873 → 0.0873 元）。
+> csv 里同时保留 `price_raw`（原值，便于对账）和 `price_yuan`（换算值，生成报文用）。
+
+#### 6.2 生成条件单表
+
+```bash
+python make_excel.py --interface create \
+    --codes-file data/codes_latestprice_SH.csv \
+    --cond-mix 1:200,2:600,3:400,4:400,5:400 \
+    --accounts 100 --exchange 1 --trigger broken \
+    --plan-out out/plan.csv
+```
+
+**GUI 里怎么操作（两种生成方式互斥，选一个另一组会自动置灰）**：
+
+「1. 测试数据」面板顶部有「**生成方式**」下拉框：
+
+| 生成方式 | 填什么 | 生成结果 |
+|---|---|---|
+| 按账号批量 | 批量账号数、账号起始、Ref回填、合约代码 | N 行不同账号，代码全表固定 |
+| **按CODE列表** | **CODE列表、CondType配比、账号数、触发方向** | 一个 code 一条，CondType 按配比 |
+
+选「按CODE列表」后：
+
+* ✅ **要填**：`CODE列表`（点浏览选 `data/codes_*.csv`）、`CondType配比`、`账号数`、`触发方向`
+* ⬜ **自动置灰、不用填**：批量账号数、账号起始、Ref回填、合约代码、止盈止损标的
+  —— 这些参数在 CODE 模式下**不参与**（每行的代码来自 csv，不是那个输入框）
+* ⚠ 接口**只勾 create**（其它接口没有「一个 code 一条单」的概念）
+* 点「生成压测数据」后会先弹确认框，把配比合计/账号数/触发方向列出来核对
+
+| 参数 | 作用 |
+|---|---|
+| `--cond-mix` | CondType 配比，合计 = 总条数 |
+| `--accounts` | 参与**轮换**的账号个数（第 i 条用第 i % N 个账号） |
+| `--exchange` | 交易所 1=沪 2=深（现场 SH 列表一律填 1） |
+| `--trigger` | `broken`=触发价设成必触发；`safe`=碰不到 |
+| `--plan-out` | 输出每条单的 code/CondType/账号/触发值，**发之前人工过目** |
+
+**覆盖策略**：把各 CondType 的条数连起来，用**全局取模**轮流贴到 code 上
+（不是每个类型都从头开始贴 —— 那样前几类会重复压在同一批 code 上，尾部 code 轮不到）。
+实测 2000 条 / 466 code：并集 **466/466 全覆盖**，每个 code 出现 4~5 次。
+
+> ⚠ **条数总和 >= CODE 个数**，否则一定有 code 覆盖不到。
+
+**各 CondType 用哪个条件块**（决定「行情来了会不会触发」）：
+
+| CondType | 条件块 | 触发值怎么来 |
+|---|---|---|
+| 1 价格 | `CondPrice`（`Op` + `TriggerPrice`） | 按**该 code 现价** × 系数 |
+| 2 时间 | `CondTime`（`TriggerDate` + `TriggerTime`） | 发送时刻 +10 分钟 |
+| 3 百分比 | `CondPercent`（`Op` + `TriggerPercent`） | broken 用 `50`（涨 50% 触发） |
+| 4 合约止盈止损 | `CondLoss` / `CondProfit` | 固定阈值 `0.05`（不吃行情价） |
+| 5 标的止盈止损 | `CondTargetLoss` / `CondTargetProfit` | 固定阈值 `3.0` |
+
+`--trigger broken` 时 1 类的触发价 = 现价 × 0.5（**必然触发**，用来量"行情→触发"的延迟）；
+`safe` 时 = 现价 × 3.0（正常波动碰不到，只验证注册成功）。
+零价 code（当日无成交）用兜底价 `0.1` 元，否则 `0 × 任何系数` 还是 0，会被平台拒。
+
+> **所有阈值一律用正数**（2026-10-20 要求）。注意 `CondType=3` 的 `Op` 是 `">"`，
+> 所以 `50` 的含义是「**涨** 50% 触发」，不是"跌 50%"。
+> `CfgExceedPrice.PriceStepBuy` 也从 `-1` 改成了 `1`（原值 `-1` 在真实流量里
+> 是"买入不限价"的开关，不是负价格）—— 真平台 pilot 时留意下单价。
+
+**报文里哪些字段跟着本行的 code 走**（这是本模式的核心）：
+
+| 字段 | 是否用列表 code |
+|---|---|
+| `Entrust.ContractCode` | ✅ |
+| `CfgExceedPrice.StockCode` | ✅ |
+| `CondPrice` / `CondPercent` / `CondTime` 的 `ContractCode` | ✅ |
+| **`CondLoss` / `CondProfit` 的 `ContractCode`** | ✅（2026-10-20 明确要求同步） |
+| `CondTargetLoss` / `CondTargetProfit` 的 `StockCode` | ❌ 保持 `510050` |
+| 所有块的 `ExchangeNum` | 统一 `--exchange`（SH=1） |
+
+> `CondTarget*` 要的是**标的股票代码**（50ETF 期权 → `510050`），
+> 不是期权合约代码。塞期权 code 进去平台会判"标的代码非法"，所以不覆盖。
+
+#### 6.3 发之前先校验
+
+```bash
+python tests/_verify_codes.py --excel data/create.xlsx \
+    --codes data/codes_latestprice_SH.csv \
+    --expect 1:200,2:600,3:400,4:400,5:400 --accounts 100 --exchange 1
+```
+
+24 项检查，覆盖：条数/配比、code 全覆盖、账号轮换数、`UniqueAccount` 跟随、
+所有块 `ExchangeNum`、**七处 code 是否都等于本行 code**、`CondTarget*` 没被期权 code 覆盖、
+Ref 唯一、broken 模式下触发价确实低于现价、报文结构完整。
+
+#### 6.4 发送
+
+```bash
+python send_test.py --interface create --type normal --max 0 --workers 4 --wait 30
+```
+
+> ⚠ **必须 `--max 0`**（= 每行各发一次）。`config.ini` 里默认 `max=100`，
+> 不改会只发前 100 条；写成 `--max 3000` 则会循环复用凑数 → Ref 重复 →
+> `ref already inserted`，2000 条里只有 2000 个不同的 Ref 才可能成功。
 
 ### 压测数据扩充（`--bulk-normal`）
 

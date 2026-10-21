@@ -49,7 +49,7 @@ REF_KEY = "Ref"          # make_excel 的 --ref-spec 用
 #   （环境变量 ST_CONTRACT_CODE / ST_TARGET_STOCK_CODE 可覆盖，GUI 里能填）。
 MODIFY_BLOCKS = [
     ("CfgExceedPrice", {"ExchangeNum": 2, "StockCode": contract_code(),
-                        "StockName": "50ETF", "PriceStepBuy": -1,
+                        "StockName": "50ETF", "PriceStepBuy": 1,
                         "PriceStepSell": 1, "PriceType": 0,
                         "PriceUnit": "0.0001", "Decimals": 4}),
     ("CfgFixedSplit", {"LimitBase": 50, "LimitStep": 50, "LimitInterval": 300,

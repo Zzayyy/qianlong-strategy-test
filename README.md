@@ -91,6 +91,7 @@ cd strategy_test
 | `soak_test.py` | 稳定性测试编排（连续跑几小时看指标劣化） |
 | `ssh_runner.py` | SSH 远程执行（稳定性测试跑 Linux 用：上传/执行/回传/下载） |
 | `make_excel.py` | **用例生成器**：按 `interfaces/` 定义生成 `data/{接口}.xlsx` |
+| `code_list.py` | **行情日志 → csv**：同事给的 `latestprice_SH.txt` 转成 code 列表（去重取最新价） |
 | `interfaces/` | **接口定义**（五个接口）+ `_common.py` |
 | `check_env.py` | **只读**环境体检（连之前先跑它） |
 | `tests/` | 辅助排查工具（不是测试） |

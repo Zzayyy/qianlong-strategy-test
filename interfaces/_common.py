@@ -122,6 +122,12 @@ def expand(v):
         __TODAY__ / __TODAY_D30__ / __TODAY_D_1__  -> YYYY-MM-DD（ValidDate 用）
         __TODAY8__ / __TODAY_PLUS7__               -> YYYYMMDD  （TriggerDate 用）
 
+    动态时刻（CondType=2 时间条件用，都在【发送时】才求值）：
+        __NOW8__            -> 当天 YYYYMMDD
+        __NOW_HHMMSS__      -> 当前时刻（如 093240）
+        __NOW_M5__ / __NOW_H2__ / __NOW_S30__   -> 5 分钟后 / 2 小时后 / 30 秒后
+        __NOW_M-5__         -> 5 分钟【前】（负号必须紧贴数字，不要写成 __NOW_M_5__）
+
     动态条件单号（发送时才展开，日期取发送当天）：
         __REF3__    -> 单个，如 20260924000003
         __REF1_10__ -> 范围，展开成逗号分隔的 1~10 号（配合 Refs 列）
@@ -130,8 +136,15 @@ def expand(v):
         s = v.strip()
         if s == "__TODAY__":
             return time.strftime("%Y-%m-%d")
-        if s == "__TODAY8__":
+        if s == "__TODAY8__" or s == "__NOW8__":
             return time.strftime("%Y%m%d")
+        if s == "__NOW_HHMMSS__":
+            return time.strftime("%H%M%S")
+        m = re.fullmatch(r"__NOW_([SMH])(-?\d+)__", s)
+        if m:
+            unit, n = m.group(1), int(m.group(2))
+            secs = {"S": 1, "M": 60, "H": 3600}[unit] * n
+            return time.strftime("%H%M%S", time.localtime(time.time() + secs))
         if s.startswith("__TODAY_D") and s.endswith("__"):
             try:
                 n = int(s[len("__TODAY_D"):-2].lstrip("_"))
@@ -353,7 +366,12 @@ REAL_ENTRUST = {
 }
 REAL_CFG_EXCEED = {
     "ExchangeNum": 2, "StockCode": contract_code(), "StockName": "50ETF",
-    "PriceStepBuy": -1, "PriceStepSell": 1, "PriceType": 0,
+    # ★ PriceStepBuy 原值 -1 是照抄 136 ST-0 真实流量的样本，平台语义是
+    #   "买入不限价"（负数不是价格，是开关值）。2026-10-20 用户要求
+    #   【表里不要出现负价格】，改为 1（与 PriceStepSell 对称）。
+    #   ⚠ 若现场平台把 -1 当"不限价"、1 当"按步长限价"，买入价格可能
+    #     不再是最优价 —— 真平台 pilot 时留意下单价格是否符合预期。
+    "PriceStepBuy": 1, "PriceStepSell": 1, "PriceType": 0,
     "PriceUnit": "0.0001", "Decimals": 4,
 }
 REAL_CFG_FIXED_SPLIT = {

@@ -223,6 +223,61 @@ def build_bulk_rows(mod, count, start=0, ref_seq=1):
     return fn(count, start)
 
 
+def build_code_rows_by_file(mod, codes_file, cond_mix, accounts=100,
+                            account_start=0, trigger="broken", exchange=0,
+                            ref_start=1):
+    """按行情 code 列表生成条件单行（一个 code 一条，CondType 按配比）。
+
+    只对实现了 build_code_rows 的接口有效（当前只有 create）。
+
+    返回 (rows, plan)；plan 是给人过目的明细（可落盘成 csv）。
+    """
+    fn = getattr(mod, "build_code_rows", None)
+    if fn is None:
+        raise ValueError("接口 %s 未实现 build_code_rows，不支持 --codes-file"
+                         "\n        目前支持：create" % mod.NAME)
+
+    import code_list as CL
+    try:
+        quotes = CL.read_csv(codes_file)
+    except Exception as e:
+        raise ValueError("读不了 --codes-file %s: %s" % (codes_file, e))
+    if not quotes:
+        raise ValueError("--codes-file %s 里没有可用 code" % codes_file)
+
+    try:
+        mix = mod.parse_cond_mix(cond_mix)
+    except ValueError as e:
+        raise ValueError("--cond-mix 解析失败: %s" % e)
+
+    # exchange=0 -> 用 csv 里每条自己的交易所；否则整体覆盖
+    ex = int(exchange or 0)
+    if ex:
+        for q in quotes:
+            q["exchange"] = ex
+
+    rows, plan = fn(quotes, mix, accounts=accounts,
+                    account_start=account_start, trigger=trigger,
+                    exchange=(ex or (quotes[0].get("exchange") or 1)),
+                    ref_start=ref_start)
+    return rows, plan
+
+
+def write_plan(plan, path):
+    """把「每条单对应的 code / CondType / 账号 / 触发值」写成 csv，供人工过目。"""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write("case_no,code,cond_type,account,price_yuan,trigger\n")
+        for p in plan:
+            f.write("%s,%s,%s,%s,%s,%s\n" % (
+                p.get("case_no", ""), p.get("code", ""),
+                p.get("cond_type", ""), p.get("account", ""),
+                p.get("price_yuan", ""), p.get("trigger", "")))
+    os.replace(tmp, path)
+    return path
+
+
 def load_ref_map(path):
     """读 send_test 落盘的 refs JSON，转成 {账号: Ref}。
 
@@ -268,7 +323,8 @@ def apply_ref_map(rows, fa_i, ref_i, refmap):
 
 
 def build_one(name, ref_spec="", bulk_normal=0, bulk_start=0, ref_seq=1,
-              ref_map=""):
+              ref_map="", codes_file="", cond_mix="", accounts=100,
+              trigger="broken", exchange=0, ref_start=1, plan_out=""):
     mod = load_interface(name)
     rows = list(mod.ROWS)
     keys = [k for k, _ in mod.HEADERS]
@@ -276,6 +332,45 @@ def build_one(name, ref_spec="", bulk_normal=0, bulk_start=0, ref_seq=1,
 
     if ref_spec and bulk_normal:
         sys.exit("[FAIL] --ref-spec 与 --bulk-normal 互斥，不能同时使用")
+    if codes_file and (bulk_normal or ref_spec):
+        sys.exit("[FAIL] --codes-file 与 --bulk-normal / --ref-spec 互斥，"
+                 "三选一")
+
+    def _drop_normal(src):
+        """去掉原表里手写的 normal 行（error/destroy 全部保留）。"""
+        return [r for r in src
+                if not (isinstance(r, (list, tuple)) and len(r) == len(keys)
+                        and str(r[type_i]) == "normal")]
+
+    # ---- 按行情 code 列表生成（一个 code 一条，CondType 按配比）----
+    if codes_file:
+        if not cond_mix:
+            sys.exit("[FAIL] 用了 --codes-file 就必须给 --cond-mix，"
+                     "如 --cond-mix 1:200,2:600,3:400,4:400,5:400")
+        try:
+            extra, plan = build_code_rows_by_file(
+                mod, codes_file, cond_mix, accounts=accounts,
+                account_start=bulk_start, trigger=trigger,
+                exchange=exchange, ref_start=ref_start)
+        except ValueError as e:
+            sys.exit("[FAIL] %s --codes-file: %s" % (name, e))
+        rows = list(extra) + _drop_normal(rows)
+
+        from collections import Counter
+        cnt = Counter(p["cond_type"] for p in plan)
+        codes = {p["code"] for p in plan}
+        accts = {p["account"] for p in plan}
+        print("[OK] %s: 按 %d 个 code 生成 %d 条（%s）"
+              % (name, len(codes), len(extra),
+                 "  ".join("CondType%d=%d" % (k, cnt[k]) for k in sorted(cnt))))
+        print("     账号 %d 个轮换（%s ~ %s）  触发模式=%s  交易所=%s"
+              % (len(accts), min(accts), max(accts), trigger,
+                 exchange or "按 csv"))
+        if plan_out:
+            try:
+                print("[OK] 生成清单: %s" % write_plan(plan, plan_out))
+            except Exception as e:
+                print("[WARN] 写 --plan-out 失败: %s" % e)
 
     if bulk_normal:
         try:
@@ -302,9 +397,7 @@ def build_one(name, ref_spec="", bulk_normal=0, bulk_start=0, ref_seq=1,
             print("[OK] %s: 已用 %s 回填真实单号（映射 %d 条）"
                   % (name, os.path.basename(ref_map), len(refmap)))
 
-        kept = [r for r in rows
-                if not (isinstance(r, (list, tuple)) and len(r) == len(keys)
-                        and str(r[type_i]) == "normal")]
+        kept = _drop_normal(rows)
         rows = list(extra) + kept
         extra_msg = ""
         if getattr(mod, "REF_KEY", "") and ref_seq != 1 and not ref_map:
@@ -362,6 +455,29 @@ def main():
                     help="★推荐：用 send_test 发 create 时自动落盘的 refs.json 回填【真实单号】。"
                          "比 --ref-seq 靠行序猜可靠得多（单号来自平台回包）。"
                          "例：--bulk-normal 10000 --ref-map out/performance/create_xxx_refs.json")
+    # ---- 按行情 code 列表生成（一个 code 一条条件单）----
+    ap.add_argument("--codes-file", default="",
+                    help="★按行情 code 列表生成（仅 create）：一个 code 一条条件单。"
+                         "文件由 code_list.py 从同事给的日志转出，或手写一行一个 code。"
+                         "与 --bulk-normal / --ref-spec 互斥。")
+    ap.add_argument("--cond-mix", default="",
+                    help="配合 --codes-file：CondType 配比，如 "
+                         "1:200,2:600,3:400,4:400,5:400（合计=总条数）")
+    ap.add_argument("--accounts", type=int, default=100,
+                    help="配合 --codes-file：参与轮换的账号个数（默认 100）")
+    ap.add_argument("--trigger", default="broken", choices=("broken", "safe"),
+                    help="配合 --codes-file：触发价相对现价的方向。"
+                         "broken=必触发（量行情→触发延迟用，默认）；"
+                         "safe=碰不到（只验注册成功）")
+    ap.add_argument("--exchange", type=int, default=0,
+                    help="交易所编号 1=沪 2=深。0=按 codes 文件里每条的 exchange 列。"
+                         "现场 SH 列表应填 1")
+    ap.add_argument("--ref-start", type=int, default=1,
+                    help="配合 --codes-file：当天起始单号（默认 1）。"
+                         "当天已经发过 N 张单就填 N+1，否则 ref already inserted")
+    ap.add_argument("--plan-out", default="",
+                    help="配合 --codes-file：把每条的 code/CondType/账号/触发值"
+                         "写成 csv，便于发之前人工过目")
     # 行情代码每天都在换，做成参数就不必改源码（GUI 里有输入框）
     ap.add_argument("--contract-code", default="",
                     help="行情合约代码（Entrust/CondPrice/CondPercent/CondTime/"
@@ -417,9 +533,28 @@ def main():
         print("    账号号段一致；modify/remove 的单号靠行序对齐 create，须按 create 先发。")
         return
 
+    if args.codes_file:
+        # --codes-file 只对 create 有意义；若用户写了 --interface all，
+        # 不能默默对五个接口都跑一遍（其它接口没有 build_code_rows）。
+        bad = [n for n in names if n != "create"]
+        if bad:
+            sys.exit("[FAIL] --codes-file 只支持 create（当前还选了：%s）\n"
+                     "       请显式写 --interface create" % ",".join(bad))
+        # 互斥先判：同时给了 --bulk-normal 时，报"互斥"比报"缺配比"更贴切
+        if args.bulk_normal or args.ref_spec:
+            sys.exit("[FAIL] --codes-file 与 --bulk-normal / --ref-spec 互斥，"
+                     "三选一")
+        if not args.cond_mix.strip():
+            sys.exit("[FAIL] 用了 --codes-file 必须给 --cond-mix，"
+                     "如 --cond-mix 1:200,2:600,3:400,4:400,5:400")
+
     for n in names:
         build_one(n, args.ref_spec, args.bulk_normal, args.bulk_start,
-                  args.ref_seq, args.ref_map)
+                  args.ref_seq, args.ref_map,
+                  codes_file=args.codes_file, cond_mix=args.cond_mix,
+                  accounts=args.accounts, trigger=args.trigger,
+                  exchange=args.exchange, ref_start=args.ref_start,
+                  plan_out=args.plan_out)
 
 
 if __name__ == "__main__":

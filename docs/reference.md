@@ -58,6 +58,13 @@
 | `--ref-spec` | 空 | **仅 modify/remove**：按单号区间生成引用行，如 `7,100` |
 | `--contract-code` | 环境变量/内置默认 | **行情合约代码**（每天都换）。写进 `Entrust.ContractCode`、`CfgExceedPrice.StockCode`、`CondPrice/CondPercent/CondTime.ContractCode`；modify 还会覆盖 `CondLoss/CondProfit` |
 | `--target-stock-code` | 环境变量/内置默认 | 止盈止损**标的代码**，写进 `CondTargetLoss/CondTargetProfit.StockCode`（**仅 modify**；create 里是 `510050`） |
+| `--codes-file` | 空 | ★**仅 create**：按行情 code 列表生成，**一个 code 一条条件单**。与 `--bulk-normal`/`--ref-spec` 互斥 |
+| `--cond-mix` | 空 | 配合 `--codes-file`：CondType 配比，如 `1:200,2:600,3:400,4:400,5:400`（合计=总条数） |
+| `--accounts` | 100 | 配合 `--codes-file`：参与**轮换**的账号个数 |
+| `--trigger` | `broken` | 配合 `--codes-file`：`broken`=触发价设成必触发（量延迟用）/ `safe`=碰不到（只验注册） |
+| `--exchange` | 0 | 交易所 1=沪 2=深；0=按 codes 文件每条的 exchange 列 |
+| `--ref-start` | 1 | 配合 `--codes-file`：当天起始单号（当天已发过 N 张就填 N+1） |
+| `--plan-out` | 空 | 配合 `--codes-file`：把每条的 code/CondType/账号/触发值写成 csv，供发前人工过目 |
 
 > **行情代码每天在换**，所以做成了可配（GUI 里有输入框），不必改源码。
 > 优先级：命令行 `--contract-code` > 环境变量 `ST_CONTRACT_CODE` >
@@ -67,6 +74,19 @@
 > `--contract-code` 一起传下去，不会把代码换回默认值。
 
 用法与数据规则见 [guide.md](guide.md) 第 6 节。
+
+---
+
+## 2.1 code_list.py（行情日志 → csv）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--txt` | **必填** | 同事给的行情推送日志，如 `latestprice_SH.txt` |
+| `--csv` | `data/codes_<文件名>.csv` | 输出路径 |
+| `--exchange` | 0 | 0=按文件名自动判（`_SH`→1，`_SZ`→2） |
+| `--list` | 关 | 只打印统计，不写文件 |
+
+解析规则与两个坑（乱码行、同 code 重复）见 [guide.md](guide.md) 第 6.1 节。
 
 ---
 

@@ -28,7 +28,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (ZH, REAL_ACCOUNT, REAL_UNIQUE_ACCOUNT, REAL_BLOCKS,
                      collect, is_blank, put, to_typed, gen_fuzz, gen_cross,
-                     add_cases, fmt_account, ACCOUNT_START)
+                     add_cases, fmt_account, ACCOUNT_START, unique_account)
 
 NAME = "create"
 TITLE = "插入条件单 (create, MsgType=4)"
@@ -348,6 +348,248 @@ def build_bulk_rows(count, start=0):
         r[idx["CondDesc"]] = "stress%d" % seq
         out.append(tuple(r))
     return out
+
+
+# ==================== 按行情 code 生成（--codes-file）====================
+# 场景：策略服务器性能测试，要求「每个 code 都注册一遍条件单」，
+# 且 CondType 按配比分布（如 2000 条里 1/2/3/4/5 各若干）。
+#
+# 与 build_bulk_rows 的区别：
+#   build_bulk_rows  一个账号一行，code 全表固定（压吞吐用）
+#   build_code_rows  一个 code 一行，CondType 按配比铺开（验触发链路用）
+#
+# ★ 各 CondType 用哪个条件块（决定「行情来了会不会触发」）：
+#   1 价格        -> CondPrice   （Op + TriggerPrice）
+#   2 时间        -> CondTime    （TriggerDate + TriggerTime）
+#   3 百分比      -> CondPercent （Op + TriggerPercent）
+#   4 合约止盈止损 -> CondLoss / CondProfit （按持仓盈亏，不吃行情价）
+#   5 标的止盈止损 -> CondTargetLoss / CondTargetProfit
+#   ⇒ 1/3 的触发价按【该行 code 的现价】算；2 用相对当前时刻；
+#     4/5 不依赖现价（但 ContractCode/StockCode 仍写该行的 code）。
+COND_TYPES = (1, 2, 3, 4, 5)
+
+# 触发价相对现价的方向：
+#   trigger="broken"  故意设成【必破】—— 用来量"行情到触发"的延迟
+#   trigger="safe"    设成【碰不到】—— 只验证注册成功，不希望真触发
+TRIGGER_MODES = ("broken", "safe")
+
+# 各模式下的价格系数（乘在现价上）
+# broken: Op=">" 且触发价压到现价的 50%，只要行情不暴跌一半就必然触发
+# safe  : Op=">" 且触发价抬到现价的 3 倍，正常波动碰不到
+_TRIGGER_FACTOR = {"broken": 0.5, "safe": 3.0}
+
+# 零价 code（日志里最新价=0，多为当日无成交）的兜底现价（元）。
+# 不兜底的话 0 × 任何系数都还是 0，报文里出现 "0.0000" 会被平台拒。
+ZERO_PRICE_FALLBACK = 0.1000
+
+
+def parse_cond_mix(spec):
+    """解析 CondType 配比，如 "1:200,2:600,3:400,4:400,5:400"。
+
+    返回 [(CondType, 条数), ...]（按 CondType 升序）。
+    写错就抛 ValueError —— 绝不静默忽略（静默会让配比失效，悄悄变成全表）。
+    """
+    s = str(spec or "").strip()
+    if not s:
+        raise ValueError("配比为空")
+    out = {}
+    for tok in s.replace("；", ",").replace(";", ",").replace(" ", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if ":" not in tok and "：" not in tok:
+            raise ValueError("配比项 %r 格式应为 <CondType>:<条数>" % tok)
+        k, v = tok.replace("：", ":").split(":", 1)
+        try:
+            ct, n = int(k), int(v)
+        except ValueError:
+            raise ValueError("配比项 %r 的 CondType/条数必须是整数" % tok)
+        if ct not in COND_TYPES:
+            raise ValueError("CondType=%d 非法，只能是 %s"
+                             % (ct, "/".join(str(x) for x in COND_TYPES)))
+        if n < 0:
+            raise ValueError("CondType=%d 的条数不能为负: %d" % (ct, n))
+        if ct in out:
+            raise ValueError("CondType=%d 在配比里出现了两次" % ct)
+        out[ct] = n
+    if not out or sum(out.values()) <= 0:
+        raise ValueError("配比里没有任何条数")
+    return sorted(out.items())
+
+
+def _price_of(quote):
+    """取该 code 的现价（元，float）；零价走兜底。"""
+    try:
+        p = float(quote.get("price_yuan") or 0)
+    except (TypeError, ValueError):
+        p = 0.0
+    if p <= 0:
+        p = ZERO_PRICE_FALLBACK
+    return p
+
+
+def _round_price(p, decimals=4):
+    """价格按最小变动单位格式化（期权 0.0001 元）。"""
+    return ("%." + str(int(decimals)) + "f") % p
+
+
+def build_code_rows(quotes, mix, accounts=100, account_start=0,
+                    trigger="broken", exchange=1, ref_start=1):
+    """按行情 code 列表生成条件单行：一条 code 一条单，CondType 按配比铺开。
+
+    参数：
+      quotes        code_list.read_csv() 的结果 [{code, price_yuan, exchange...}]
+      mix           parse_cond_mix() 的结果 [(CondType, 条数), ...]
+      accounts      参与轮换的账号个数（100 = 用 100 个账号轮着发）
+      account_start 账号 6 位序号起点（0 = _common.ACCOUNT_START）
+      trigger       "broken"（必触发）/ "safe"（不触发）
+      exchange      交易所编号：1=沪 2=深（现场 SH 列表全部为 1）
+      ref_start     当天起始单号（默认 1；当天已建过 N 张就填 N+1）
+
+    ★ 覆盖策略：把「每个 CondType 的 N 条」连起来，用 **全局取模** 轮流贴到 code 上：
+          i = 0,1,2,...（跨 CondType 连续累加） -> code = codes[i % len(codes)]
+      这样每个类型自己就能覆盖到尽量多的 code，且各类型错开；
+      实测 2000 条 / 466 code 时并集 466/466 全覆盖，每个 code 4~5 条。
+      如果每个类型都从 0 开始贴，前几类会重复压在同一批 code 上，尾部 code 反而轮不到。
+
+    ★ 账号：accounts 个账号**轮换**（第 i 行用第 i % accounts 个）。
+      注意这会让同一个账号下有很多张单 —— 这是预期的（性能测试要的是
+      "100 个账号各挂 N 张单"的负载形态），不是 bug。
+
+    ★ Ref 必须逐行唯一（重复会 ref already inserted），从 ref_start 起递增。
+      ⚠ ref_start 只影响【当天已建过多少张单】这个序号基准；
+        若当天已发过 N 张，务必传 --ref-start N+1，否则会撞号。
+    """
+    if not quotes:
+        raise ValueError("code 列表为空")
+    if not mix:
+        raise ValueError("CondType 配比为空")
+    if trigger not in _TRIGGER_FACTOR:
+        raise ValueError("trigger 只能是 %s" % "/".join(TRIGGER_MODES))
+    accounts = int(accounts or 0)
+    if accounts <= 0:
+        raise ValueError("账号个数必须 > 0")
+    account_start = int(account_start) or ACCOUNT_START
+    if account_start + accounts - 1 > 999999:
+        raise ValueError("账号序号 %d 超出 6 位上限 999999"
+                         % (account_start + accounts - 1))
+
+    keys = list(_KEYS)
+    idx = {k: i for i, k in enumerate(keys)}
+    template = None
+    for r in ROWS:
+        if (isinstance(r, (list, tuple)) and len(r) == len(keys)
+                and str(r[idx["case_type"]]) == "normal"):
+            template = list(r)
+            break
+    if template is None:
+        raise ValueError("ROWS 中没有 normal 模板行")
+
+    at = REAL_ACCOUNT["AccountType"]
+    aa = REAL_ACCOUNT["AccAtt"]
+    total = sum(n for _, n in mix)
+    seq_i = 0                      # 跨 CondType 连续序号（决定 code 与账号）
+    out = []
+    plan = []                      # 供 --plan-out 落盘（人工过目）
+
+    for ct, n in mix:
+        for k in range(int(n)):
+            quote = quotes[seq_i % len(quotes)]
+            code = str(quote["code"]).strip()
+            facct = fmt_account(account_start + (seq_i % accounts))
+            price = _price_of(quote)
+            factor = _TRIGGER_FACTOR[trigger]
+            trig = price * factor
+
+            r = list(template)
+            case_no = "CX%05d" % (seq_i + 1)
+            r[idx["case_no"]] = case_no
+            r[idx["case_type"]] = "normal"
+            r[idx["case_desc"]] = ("code=%s CondType=%d %s（第 %d/%d 条）"
+                                   % (code, ct, trigger, seq_i + 1, total))
+            # ---- 账号：100 个轮换 ----
+            r[idx["Account_Model"]] = REAL_ACCOUNT["Model"]
+            r[idx["Account_AccountType"]] = at
+            r[idx["Account_AccAtt"]] = aa
+            r[idx["Account_FAccount"]] = facct
+            r[idx["UniqueAccount"]] = unique_account(facct, at, aa)
+            # ---- 单号：逐行唯一 ----
+            r[idx["Ref"]] = "__REF%d__" % (ref_start + seq_i)
+            r[idx["CondType"]] = ct
+            r[idx["CondName"]] = "perf_%s" % code
+            r[idx["CondDesc"]] = "lat_%s_%d" % (code, ct)
+
+            # ---- 所有代码字段都写【本行的 code】----
+            # 行情侧（决定"有没有行情推过来"）
+            for col in ("Entrust_ContractCode", "CfgExceedPrice_StockCode",
+                        "CondPrice_ContractCode", "CondPercent_ContractCode",
+                        "CondTime_ContractCode"):
+                if col in idx:
+                    r[idx[col]] = code
+            # ★ CondLoss / CondProfit 也要用列表里的 code（用户 2026-10-20 明确要求）
+            for col in ("CondLoss_ContractCode", "CondProfit_ContractCode"):
+                if col in idx:
+                    r[idx[col]] = code
+            # 止盈止损标的：CondTarget* 要的是【标的】代码，不是期权合约，
+            # 所以保持模板里的标的（create 固定 510050，与 --target-stock-code 无关），
+            # 不塞期权 code —— 塞进去平台会判"标的代码非法"。
+            # （这与 docs/guide.md 里"create 的 CondTarget* 固定 510050"的约定一致）
+
+            # ---- 交易所：全部按参数（现场 SH = 1）----
+            for col in _EXCHANGE_COLS:
+                if col in idx:
+                    r[idx[col]] = int(exchange)
+
+            # ---- 触发值：按该 code 的现价算，让 1/3 类真的能触发 ----
+            if "CondPrice_Op" in idx:
+                r[idx["CondPrice_Op"]] = ">"
+            if "CondPrice_TriggerPrice" in idx:
+                r[idx["CondPrice_TriggerPrice"]] = _round_price(trig)
+            if "CondPercent_Op" in idx:
+                r[idx["CondPercent_Op"]] = ">"
+            if "CondPercent_TriggerPercent" in idx:
+                # ★ 阈值一律用【正数】（2026-10-20 用户要求：表里不要出现负价格）。
+                #   语义：broken 用 50%（涨 50% 触发），safe 用 200%（碰不到）。
+                #   注意 Op 保持 ">"（不动）—— 所以 broken 的百分比方向
+                #   现在是"涨 50% 触发"，不再是原来的"跌 50%"。
+                pct = 50.0 if trigger == "broken" else 200.0
+                r[idx["CondPercent_TriggerPercent"]] = "%.2f" % pct
+            # 时间条件：发出去之后 10 分钟，确保"注册完才到期"
+            if "CondTime_TriggerDate" in idx:
+                r[idx["CondTime_TriggerDate"]] = "__TODAY8__"
+            if "CondTime_TriggerTime" in idx:
+                r[idx["CondTime_TriggerTime"]] = "__NOW_M10__"
+            # 止盈止损类按持仓盈亏，用现价的一个比例作阈值
+            # ★ 阈值一律正数（同 CondPercent）：CondLoss/Profit 用 5%，
+            #   CondTargetLoss/Profit 用 3。方向由 CondType 与平台解释决定，
+            #   这里只保证"表里没有负价格"。
+            for col, val in (("CondLoss_Value", "0.0500"),
+                             ("CondProfit_Value", "0.0500")):
+                if col in idx:
+                    r[idx[col]] = val
+            for col, val in (("CondTargetLoss_Value", "3.0000"),
+                             ("CondTargetProfit_Value", "3.0000")):
+                if col in idx:
+                    r[idx[col]] = val
+
+            plan.append({"case_no": case_no, "code": code, "cond_type": ct,
+                         "account": facct, "price_yuan": "%.4f" % price,
+                         "trigger": ("%s %s" % (
+                             "CondPercent" if ct == 3 else "CondPrice", trig))
+                         if ct in (1, 3) else ("时间/止盈止损" )})
+            out.append(tuple(r))
+            seq_i += 1
+    return out, plan
+
+
+# 需要统一成同一交易所的列（含嵌套块内的 ExchangeNum）
+_EXCHANGE_COLS = [
+    "Entrust_ExchangeNum", "CfgExceedPrice_ExchangeNum",
+    "CondPrice_ExchangeNum", "CondPercent_ExchangeNum",
+    "CondTime_ExchangeNum", "CondLoss_ExchangeNum",
+    "CondTargetLoss_ExchangeNum", "CondProfit_ExchangeNum",
+    "CondTargetProfit_ExchangeNum",
+]
 
 
 # ==================== 报文构造 ====================

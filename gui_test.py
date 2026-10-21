@@ -535,6 +535,16 @@ class MainWindow(QWidget):
                         self.edit_contract_code.text().strip())
             self.cp.set("gui", "target_stock_code",
                         self.edit_target_code.text().strip())
+            # CODE 列表模式（策略服务器性能测试用：一个 code 一条条件单）
+            if hasattr(self, "edit_codes_file"):
+                self.cp.set("gui", "gen_mode", self._gen_mode())
+                self.cp.set("gui", "codes_file",
+                            self.edit_codes_file.text().strip())
+                self.cp.set("gui", "cond_mix", self.edit_cond_mix.text().strip())
+                self.cp.set("gui", "code_accounts",
+                            str(self.spin_accounts.value()))
+                self.cp.set("gui", "code_trigger",
+                            self.combo_trigger.currentData() or "broken")
             # 稳定性测试参数（纯偏好，不点「运行」不会发任何数据）
             if hasattr(self, "chk_soak"):
                 self.cp.set("gui", "soak",
@@ -811,13 +821,35 @@ class MainWindow(QWidget):
 
         self.btn_gen = QPushButton("生成压测数据")
         self.btn_gen.setToolTip(
-            "对勾选的接口执行 make_excel.py：\n"
-            "  批量账号数 > 0  -> 加 --bulk-normal N（替换 normal 段为 N 行不同账号）\n"
-            "  选了 Ref文件    -> 对 modify/remove 加 --ref-map（回填真实单号）\n"
+            "按上面选的「生成方式」执行 make_excel.py：\n\n"
+            "  按账号批量：加 --bulk-normal N（替换 normal 段为 N 行不同账号）\n"
+            "            选了 Ref文件 -> 对 modify/remove 加 --ref-map（回填真实单号）\n"
+            "  按CODE列表：加 --codes-file + --cond-mix（一个 code 一条条件单）\n\n"
             "只重写 data/*.xlsx，不会发送任何数据。")
         self.btn_gen.clicked.connect(self.on_generate)
         self.btn_open_data = QPushButton("打开 data 目录")
         self.btn_open_data.clicked.connect(self._open_data_dir)
+
+        # ---- 生成方式（两种方式参数完全不同，必须二选一，另一组置灰）----
+        # 【为什么要加这个开关】两种方式用的是互斥的 make_excel 参数：
+        #   按账号批量 -> --bulk-normal / --bulk-start / --ref-map
+        #   按CODE列表 -> --codes-file / --cond-mix / --accounts / --trigger
+        # 以前只靠"CODE列表填了就走 code 模式"隐式判断，界面上另一组控件
+        # 仍然可编辑，但会被静默忽略 —— 用户以为改了合约代码生效了，其实没有。
+        self.combo_gen_mode = QComboBox()
+        self.combo_gen_mode.addItem("按账号批量（--bulk-normal）", "bulk")
+        self.combo_gen_mode.addItem("按CODE列表（一个 code 一条单）", "codes")
+        _gm = ini_get(self.cp, "gui", "gen_mode", "bulk") or "bulk"
+        self.combo_gen_mode.setCurrentIndex(
+            max(0, self.combo_gen_mode.findData(_gm)))
+        self.combo_gen_mode.setToolTip(
+            "两种生成方式的参数互不相同，选一个，另一组会置灰。\n\n"
+            "按账号批量：normal 段换成 N 行【不同账号】，所有行用同一个合约代码\n"
+            "            —— 压吞吐、测平台并发能力\n\n"
+            "按CODE列表：一个行情 CODE 一条条件单，CondType 按配比铺开\n"
+            "            —— 每个合约都挂上单，验「行情→触发」链路\n\n"
+            "★ 按CODE列表只对 create 生效（其它接口没有这个概念）。")
+        self.combo_gen_mode.currentIndexChanged.connect(self._sync_gen_mode)
 
         g.addWidget(QLabel("批量账号数"), row_gen, 0)
         g.addWidget(self.spin_bulk_accounts, row_gen, 1)
@@ -839,6 +871,8 @@ class MainWindow(QWidget):
             "★ 改完必须点「生成压测数据」重新生成表才生效 ——\n"
             "  表里存的是字面量，不是运行时 token。\n"
             "  生成后会打印一行 [OK] 行情代码：合约=... 便于核对。\n\n"
+            "★ 只对「按账号批量」方式生效。\n"
+            "  「按CODE列表」方式下每行的代码取自 csv，本框会被忽略（会置灰）。\n\n"
             "写入的字段：\n"
             "  create/modify 的 Entrust.ContractCode、\n"
             "  CfgExceedPrice.StockCode、\n"
@@ -862,12 +896,152 @@ class MainWindow(QWidget):
         g.addWidget(QLabel("止盈止损标的"), row_gen + 3, 2)
         g.addWidget(self.edit_target_code, row_gen + 3, 3)
 
+        # ---- 按行情 CODE 列表生成（一个 code 一条条件单）----
+        # 场景：策略服务器性能测试，要求每个 code 都注册一遍，
+        #       CondType 按配比铺开（如 2000 条里 1/2/3/4/5 各若干）。
+        # 与上面的「批量账号数」是两条互斥的路：
+        #   批量账号数   -> 一个账号一行，code 固定（压吞吐）
+        #   CODE 列表    -> 一个 code 一条，CondType 按配比（验触发链路）
+        self.edit_codes_file = QLineEdit(
+            ini_get(self.cp, "gui", "codes_file", ""))
+        self.edit_codes_file.setPlaceholderText(
+            "codes csv（code_list.py 从 latestprice_SH.txt 转出）")
+        self.edit_codes_file.setToolTip(
+            "★ 按行情 CODE 列表生成条件单：一个 code 一条，CondType 按下面的配比铺开。\n\n"
+            "文件来源：同事给的 latestprice_SH.txt（行情推送日志）先用\n"
+            "  python code_list.py --txt latestprice_SH.txt\n"
+            "转成 csv（自动跳过乱码行、按 code 去重取最新价）。\n\n"
+            "⚠ 与「批量账号数」互斥：填了本框就走 code 模式，忽略批量账号数。\n"
+            "⚠ 只对 create 生效。")
+        self.edit_codes_file.textChanged.connect(self._update_case_count)
+        self.guard.install(self.edit_codes_file)
+        btn_pick_codes = QPushButton("浏览…")
+        btn_pick_codes.setToolTip("选择 code_list.py 转出的 codes csv")
+        btn_pick_codes.clicked.connect(self._pick_codes_file)
+
+        self.edit_cond_mix = QLineEdit(
+            ini_get(self.cp, "gui", "cond_mix", "1:200,2:600,3:400,4:400,5:400"))
+        self.edit_cond_mix.setPlaceholderText("1:200,2:600,3:400,4:400,5:400")
+        self.edit_cond_mix.setToolTip(
+            "CondType 配比：<CondType>:<条数>，逗号分隔，合计 = 总条数。\n\n"
+            "  CondType=1 价格 / 2 时间 / 3 百分比 / 4 合约止盈止损 / 5 标的止盈止损\n\n"
+            "例：1:200,2:600,3:400,4:400,5:400 = 2000 条，"
+            "其中 1 类 200 条、2 类 600 条，其余各 400 条。\n\n"
+            "⚠ 条数总和应 >= CODE 个数，否则一定有 code 覆盖不到。")
+        self.guard.install(self.edit_cond_mix)
+
+        self.spin_accounts = QSpinBox()
+        self.spin_accounts.setRange(1, 100000)
+        self.spin_accounts.setValue(
+            int(ini_get(self.cp, "gui", "code_accounts", "100") or 100))
+        self.spin_accounts.setMaximumWidth(90)
+        self.spin_accounts.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_accounts.setToolTip(
+            "code 模式下参与【轮换】的账号个数（默认 100）。\n"
+            "第 i 条单用第 i %% N 个账号 —— 同一个账号下会挂多张单，这是预期的。")
+        self.guard.install(self.spin_accounts)
+
+        self.combo_trigger = QComboBox()
+        self.combo_trigger.addItem("必触发（量延迟）", "broken")
+        self.combo_trigger.addItem("不触发（只验注册）", "safe")
+        _tg = ini_get(self.cp, "gui", "code_trigger", "broken") or "broken"
+        self.combo_trigger.setCurrentIndex(
+            max(0, self.combo_trigger.findData(_tg)))
+        self.combo_trigger.setMaximumWidth(150)
+        self.combo_trigger.setToolTip(
+            "触发价相对【该 code 现价】的方向：\n\n"
+            "  必触发：CondPrice 触发价 = 现价 × 0.5，行情一跌破就触发\n"
+            "          —— 测「行情到了 → 策略触发」的延迟用这个\n"
+            "  不触发：触发价 = 现价 × 3.0，正常波动碰不到\n"
+            "          —— 只想验证 2000 张单都注册成功时用\n\n"
+            "现价取自 codes csv（来自同事的日志），零价 code 用兜底价 %s 元。"
+            % 0.1)
+        self.guard.install(self.combo_trigger)
+
+        g.addWidget(QLabel("CODE列表"), row_gen + 5, 0)
+        g.addWidget(self.edit_codes_file, row_gen + 5, 1, 1, 2)
+        g.addWidget(btn_pick_codes, row_gen + 5, 3)
+        g.addWidget(QLabel("CondType配比"), row_gen + 6, 0)
+        g.addWidget(self.edit_cond_mix, row_gen + 6, 1, 1, 2)
+        g.addWidget(QLabel("账号数"), row_gen + 7, 0)
+        g.addWidget(self.spin_accounts, row_gen + 7, 1)
+        g.addWidget(QLabel("触发方向"), row_gen + 7, 2)
+        g.addWidget(self.combo_trigger, row_gen + 7, 3)
+
+        # 「生成方式」放在最上面（row_gen-1），让用户先选方式再看参数
+        g.addWidget(QLabel("生成方式"), row_gen - 1, 0)
+        g.addWidget(self.combo_gen_mode, row_gen - 1, 1, 1, 3)
+
         self.lbl_gen = QLabel("")
         self.lbl_gen.setWordWrap(True)
         self.lbl_gen.setStyleSheet("color:#666;")
-        g.addWidget(self.lbl_gen, row_gen + 4, 0, 1, 4)
+        g.addWidget(self.lbl_gen, row_gen + 8, 0, 1, 4)
+
+        # ---- 记录两组控件，供 _sync_gen_mode 置灰用 ----
+        # 注意：置灰是【视觉+防误改】，真正的互斥判断仍在 on_generate 里
+        # （用户可能改了模式又改回来，或配置文件里残留旧值）。
+        self._bulk_widgets = [
+            self.spin_bulk_accounts, self.spin_bulk_start,
+            self.edit_ref_map, btn_pick_map,
+            self.edit_contract_code, self.edit_target_code,
+        ]
+        self._codes_widgets = [
+            self.edit_codes_file, btn_pick_codes,
+            self.edit_cond_mix, self.spin_accounts, self.combo_trigger,
+        ]
+        self._sync_gen_mode()
 
         return box
+
+    def _gen_mode(self):
+        """当前生成方式："bulk" 或 "codes"。"""
+        return self.combo_gen_mode.currentData() or "bulk"
+
+    def _sync_gen_mode(self, *_):
+        """按「生成方式」置灰另一组控件，并更新按钮提示。
+
+        ★ 为什么要置灰而不是"填了哪个就用哪个"：
+          两种方式的参数**互斥**（--bulk-normal 与 --codes-file 不能同时给，
+          make_excel 会直接报错）。如果只靠隐式判断，界面上一组控件仍可编辑，
+          用户改完以为生效、实际被忽略 —— 这是最容易搞错的地方。
+        """
+        mode = self._gen_mode()
+        is_codes = (mode == "codes")
+        for w in self._bulk_widgets:
+            w.setEnabled(not is_codes)
+        for w in self._codes_widgets:
+            w.setEnabled(is_codes)
+
+        if is_codes:
+            self.btn_gen.setToolTip(
+                "当前方式：按CODE列表\n\n"
+                "执行 make_excel.py --interface create \\\n"
+                "    --codes-file <CODE列表> --cond-mix <配比> \\\n"
+                "    --accounts <账号数> --trigger <触发方向>\n\n"
+                "★ 只对 create 生效，只勾 create。\n"
+                "★ 上面「批量账号数/账号起始/Ref回填/合约代码」已置灰 —— "
+                "这些参数在本方式下不参与。")
+        else:
+            self.btn_gen.setToolTip(
+                "当前方式：按账号批量\n\n"
+                "执行 make_excel.py --bulk-normal N（每行一个不同账号）；\n"
+                "选了 Ref文件 -> 对 modify/remove 加 --ref-map（回填真实单号）。\n\n"
+                "★ 下面「CODE列表/CondType配比/账号数/触发方向」已置灰 —— "
+                "这些参数在本方式下不参与。")
+        # ★ 构建期不能调 _update_case_count()：_box_data 比 _box_send 先执行，
+        #   那时 combo_type 还没创建（AttributeError: no attribute 'combo_type'）。
+        #   只在实际切换下拉框时（构建完成后）才刷新计数提示。
+        if getattr(self, "combo_type", None) is not None:
+            self._update_case_count()
+
+    def _pick_codes_file(self):
+        """浏览选择 code_list.py 转出的 codes csv。"""
+        cur = self.edit_codes_file.text().strip() or os.path.join(BASE_DIR, "data")
+        d, _ = QFileDialog.getOpenFileName(
+            self, "选择 codes csv（code_list.py 转出）", cur,
+            "CSV (*.csv);;文本 (*.txt);;所有文件 (*)")
+        if d:
+            self.edit_codes_file.setText(d)
 
     def _pick_ref_map(self):
         """浏览选择 create 落盘的 refs.json。"""
@@ -899,41 +1073,108 @@ class MainWindow(QWidget):
         bulk_n = self.spin_bulk_accounts.value()
         ref_map = self.edit_ref_map.text().strip()
         ref_ifaces = [n for n in names if n in ("modify", "remove")]
+        codes_file = self.edit_codes_file.text().strip()
+        cond_mix = self.edit_cond_mix.text().strip()
+        mode = self._gen_mode()
 
-        # ---- 生成前的一致性校验（照 datahub_test：宁可先问，也别生成无效数据）----
-        if ref_map and not bulk_n:
-            QMessageBox.warning(
-                self, "参数不匹配",
-                "填了「Ref回填」但「批量账号数」是 0。\n\n"
-                "Ref 回填要按【账号】去 refs.json 查单号，必须先勾「批量账号数」"
-                "生成多账号行（数量要与 create 造单数量一致）。")
-            return
-        if ref_map and not ref_ifaces:
-            self.append_log("[提示] Ref回填只对 modify/remove 生效，"
-                            "当前勾选的接口用不到，将忽略。")
-        if ref_map and ref_ifaces and self.spin_bulk_start.value() != 0:
-            if not self._ask("可能生成无效数据",
-                             "「账号起始序号」是 %d（非 0）。\n\n"
-                             "回填是按【账号】查单号的，改了起点会和 create 的账号序列"
-                             "错位，导致一行都查不到、Ref 仍是 __REF token。\n\n"
-                             "确定继续吗？" % self.spin_bulk_start.value()):
+        # ---- 按 CODE 列表生成（与批量账号是两条互斥的路）----
+        if mode == "codes":
+            if not codes_file:
+                QMessageBox.warning(
+                    self, "缺少 CODE 列表",
+                    "生成方式是「按CODE列表」，但「CODE列表」文件是空的。\n\n"
+                    "先用 code_list.py 把同事给的日志转成 csv：\n"
+                    "    python code_list.py --txt latestprice_SH.txt\n"
+                    "然后点「浏览…」选中 data/codes_*.csv。\n\n"
+                    "（如果你其实想按账号批量生成，把「生成方式」切回"
+                    "「按账号批量」即可。）")
                 return
-        if not bulk_n and not (ref_map and ref_ifaces):
-            if not self._ask("确认",
-                             "「批量账号数」是 0，也没有可用的 Ref 回填。\n\n"
-                             "这样生成出来还是原来的小表（每个接口 normal 只有 2~5 条），"
-                             "压测时会被循环复用。\n\n仍要继续吗？"):
+            if names != ["create"]:
+                QMessageBox.warning(
+                    self, "参数不匹配",
+                    "「按CODE列表」只支持生成 create 一个接口。\n\n"
+                    "当前勾选：%s\n\n"
+                    "请只勾 create（modify/remove/pwdUpdate/account 没有"
+                    "「一个 code 一条单」的概念）。" % ",".join(names))
                 return
+            if not cond_mix:
+                QMessageBox.warning(self, "参数不匹配",
+                                    "填了「CODE列表」就必须填「CondType配比」。\n\n"
+                                    "例：1:200,2:600,3:400,4:400,5:400")
+                return
+            # 配比里 condtype=1 的位置常常不足以覆盖所有 code，提前提醒
+            try:
+                mix = dict((int(x.split(":")[0]), int(x.split(":")[1]))
+                           for x in cond_mix.replace("，", ",").split(",")
+                           if ":" in x)
+            except Exception:
+                mix = None
+            if mix is None:
+                QMessageBox.warning(self, "配比写错了",
+                                    "「CondType配比」解析不了：%s\n\n"
+                                    "格式：1:200,2:600,3:400,4:400,5:400" % cond_mix)
+                return
+            if not self._ask("确认生成",
+                             "将按 CODE 列表生成条件单：\n\n"
+                             "  列表文件：%s\n"
+                             "  配比：%s（合计 %d 条）\n"
+                             "  账号轮换：%d 个\n"
+                             "  触发方向：%s\n\n"
+                             "只写 data/create.xlsx，不会发送任何数据。"
+                             % (os.path.basename(codes_file), cond_mix,
+                                sum(mix.values()), self.spin_accounts.value(),
+                                self.combo_trigger.currentText())):
+                return
+        else:
+            # ---- 生成前的一致性校验（照 datahub_test：宁可先问，也别生成无效数据）----
+            if ref_map and not bulk_n:
+                QMessageBox.warning(
+                    self, "参数不匹配",
+                    "填了「Ref回填」但「批量账号数」是 0。\n\n"
+                    "Ref 回填要按【账号】去 refs.json 查单号，必须先勾「批量账号数」"
+                    "生成多账号行（数量要与 create 造单数量一致）。")
+                return
+            if ref_map and not ref_ifaces:
+                self.append_log("[提示] Ref回填只对 modify/remove 生效，"
+                                "当前勾选的接口用不到，将忽略。")
+            if ref_map and ref_ifaces and self.spin_bulk_start.value() != 0:
+                if not self._ask("可能生成无效数据",
+                                 "「账号起始序号」是 %d（非 0）。\n\n"
+                                 "回填是按【账号】查单号的，改了起点会和 create 的账号序列"
+                                 "错位，导致一行都查不到、Ref 仍是 __REF token。\n\n"
+                                 "确定继续吗？" % self.spin_bulk_start.value()):
+                    return
+            if not bulk_n and not (ref_map and ref_ifaces):
+                if not self._ask("确认",
+                                 "「批量账号数」是 0，也没有可用的 Ref 回填。\n\n"
+                                 "这样生成出来还是原来的小表（每个接口 normal 只有 2~5 条），"
+                                 "压测时会被循环复用。\n\n仍要继续吗？"):
+                    return
 
         cmds = []
         codes = []
-        if self.edit_contract_code.text().strip():
-            codes += ["--contract-code", self.edit_contract_code.text().strip()]
-        if self.edit_target_code.text().strip():
-            codes += ["--target-stock-code", self.edit_target_code.text().strip()]
+        # ★ 行情代码只对 bulk 方式有意义：
+        #   codes 模式下每行的代码来自 csv，传 --contract-code 也不会被用到
+        #   （create.build_code_rows 直接写行内的 code），所以干脆不传，
+        #   免得日志里打印一个"看起来生效其实没用"的代码让人误会。
+        if mode != "codes":
+            if self.edit_contract_code.text().strip():
+                codes += ["--contract-code", self.edit_contract_code.text().strip()]
+            if self.edit_target_code.text().strip():
+                codes += ["--target-stock-code",
+                          self.edit_target_code.text().strip()]
         for n in names:
             cmd = self._base_cmd("make_excel.py") + ["--interface", n]
-            if bulk_n:
+            if mode == "codes":
+                # code 模式：一个 code 一条，CondType 按配比
+                plan_out = os.path.join(
+                    PERF_DIR, "plan_%s.csv" % time.strftime("%Y%m%d_%H%M%S"))
+                cmd += ["--codes-file", codes_file,
+                        "--cond-mix", cond_mix,
+                        "--accounts", str(self.spin_accounts.value()),
+                        "--trigger", self.combo_trigger.currentData() or "broken",
+                        "--plan-out", plan_out]
+            elif bulk_n:
                 cmd += ["--bulk-normal", str(bulk_n),
                         "--bulk-start", str(self.spin_bulk_start.value())]
                 if ref_map and n in ("modify", "remove"):
@@ -944,9 +1185,15 @@ class MainWindow(QWidget):
         self.append_log("")
         self.append_log("#" * 60)
         self.append_log("# 生成压测数据（只写 data/*.xlsx，不发送）")
-        self.append_log("#   接口=%s  批量账号=%s  Ref回填=%s"
-                        % (",".join(names), bulk_n or "关",
-                           os.path.basename(ref_map) if ref_map else "关"))
+        if mode == "codes":
+            self.append_log("#   ★ CODE 模式：列表=%s  配比=%s  账号=%d  触发=%s"
+                            % (os.path.basename(codes_file), cond_mix,
+                               self.spin_accounts.value(),
+                               self.combo_trigger.currentText()))
+        else:
+            self.append_log("#   接口=%s  批量账号=%s  Ref回填=%s"
+                            % (",".join(names), bulk_n or "关",
+                               os.path.basename(ref_map) if ref_map else "关"))
         if codes:
             self.append_log("#   行情代码：合约=%s  止盈止损标的=%s"
                             % (self.edit_contract_code.text().strip() or "（默认）",
@@ -2511,6 +2758,15 @@ class MainWindow(QWidget):
             return
         detail = " ".join("%s" % n for n in names)
         txt = "已选接口: %s ｜ 类型: %s" % (detail, t)
+        # CODE 模式：直接显示配比合计，省得用户去算
+        if self._gen_mode() == "codes":
+            mix = self.edit_cond_mix.text().strip()
+            try:
+                n = sum(int(x.split(":")[1])
+                        for x in mix.replace("，", ",").split(",") if ":" in x)
+                txt += " ｜ ★CODE模式: %d 条（%s）" % (n, mix)
+            except Exception:
+                txt += " ｜ ★CODE模式（配比待确认）"
         if spec:
             txt += " ｜ 指定用例: %s" % spec
         txt += "　（条数在点「开始发送」时统计）"
