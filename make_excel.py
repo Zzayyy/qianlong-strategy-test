@@ -470,7 +470,9 @@ def main():
                          "broken=必触发（量行情→触发延迟用，默认）；"
                          "safe=碰不到（只验注册成功）")
     ap.add_argument("--exchange", type=int, default=0,
-                    help="交易所编号 1=沪 2=深。0=按 codes 文件里每条的 exchange 列。"
+                    help="交易所编号 1=沪 2=深。0=不覆盖（用 _common.DEFAULT_EXCHANGE_NUM）。"
+                         "★ 对两种生成方式都生效：--bulk-normal 时改全部块的 "
+                         "ExchangeNum；--codes-file 时还会覆盖 csv 里的 exchange 列。"
                          "现场 SH 列表应填 1")
     ap.add_argument("--ref-start", type=int, default=1,
                     help="配合 --codes-file：当天起始单号（默认 1）。"
@@ -496,6 +498,10 @@ def main():
         os.environ["ST_CONTRACT_CODE"] = args.contract_code.strip()
     if args.target_stock_code.strip():
         os.environ["ST_TARGET_STOCK_CODE"] = args.target_stock_code.strip()
+    # 交易所：同样必须在 load_interface 之前注入（REAL_BLOCKS/MODIFY_BLOCKS
+    # 是在 import 接口模块时就把 EXCHANGE_NUM 求值进去的）。
+    if args.exchange:
+        os.environ["ST_EXCHANGE_NUM"] = str(args.exchange)
 
     names = list_interfaces() if args.interface == "all" else [args.interface]
     if not names:
@@ -506,6 +512,9 @@ def main():
         sys.path.insert(0, INTERFACES_DIR)
         from _common import contract_code as _cc, target_stock_code as _tc
         print("[OK] 行情代码：合约=%s  止盈止损标的=%s" % (_cc(), _tc()))
+
+    if args.exchange:
+        print("[OK] 交易所：所有块 ExchangeNum=%d（1=沪 2=深）" % args.exchange)
 
     if args.list:
         print("%-12s %-38s %8s %8s %8s" % ("接口", "说明", "normal", "error", "destroy"))

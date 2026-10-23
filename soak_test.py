@@ -282,8 +282,8 @@ def _rows_of_type(excel_path, type_tag, want_types=None):
         return []
 
 
-def _table_contract_code(excel_path, col="Entrust_ContractCode"):
-    """读表里第一行 normal 的合约代码，用于检测"表比参数旧"。
+def _table_col_value(excel_path, col):
+    """读表里第一行 normal 的某一列值，用于检测"表比参数旧"。
 
     返回 None 表示读不到（表不存在/没这列/没 normal 行）。
     """
@@ -315,12 +315,18 @@ def _table_contract_code(excel_path, col="Entrust_ContractCode"):
                         continue
                 v = raw[ci]
                 if v not in (None, ""):
-                    return str(v).strip()
+                    return v
             return None
         finally:
             wb.close()
     except Exception:
         return None
+
+
+def _table_contract_code(excel_path, col="Entrust_ContractCode"):
+    """读表里第一行 normal 的合约代码（_table_col_value 的语义化包装）。"""
+    v = _table_col_value(excel_path, col)
+    return None if v is None else str(v).strip()
 
 
 def _cases_spec(offset, batch, total):
@@ -468,10 +474,11 @@ def flow_desc_of(args):
 
 
 def _flow_codes(args):
-    """业务流重生成表时要沿用的行情代码（--contract-code / --target-stock-code）。"""
+    """业务流重生成表时要沿用的参数（行情代码 + 交易所编号）。"""
     return {
         "contract": (getattr(args, "contract_code", "") or "").strip(),
         "target": (getattr(args, "target_stock_code", "") or "").strip(),
+        "exchange": int(getattr(args, "exchange", 0) or 0),
     }
 
 
@@ -482,9 +489,10 @@ def gen_table(interface, count, ref_map="", timeout=900, codes=None):
     ★ 如果原表被 Excel/WPS 占着，make_excel 会【另存 _v2.xlsx 且原表不变】，
       这时候必须让 soak 报错停下，否则会拿旧表接着发（静默发错数据）。
 
-    codes: {"contract": "...", "target": "..."}（可空）
-      ★ 业务流每轮都要重生成 modify/remove 表，必须把行情代码一起传下去，
-        否则会把用户生成好的表【悄悄换成默认代码】—— 发出去的合约就变了。
+    codes: {"contract": "...", "target": "...", "exchange": 1}（可空）
+      ★ 业务流每轮都要重生成 modify/remove 表，必须把行情代码与交易所
+        一起传下去，否则会把用户生成好的表【悄悄换成默认值】——
+        发出去的合约/ExchangeNum 就变了。
     """
     cmd = [sys.executable, MAKE_EXCEL, "--interface", interface,
            "--bulk-normal", str(count)]
@@ -495,6 +503,8 @@ def gen_table(interface, count, ref_map="", timeout=900, codes=None):
         cmd += ["--contract-code", codes["contract"]]
     if codes.get("target"):
         cmd += ["--target-stock-code", codes["target"]]
+    if codes.get("exchange"):
+        cmd += ["--exchange", str(codes["exchange"])]
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     # 双保险：make_excel 也认环境变量（它在 import 接口前读）
@@ -502,6 +512,8 @@ def gen_table(interface, count, ref_map="", timeout=900, codes=None):
         env["ST_CONTRACT_CODE"] = codes["contract"]
     if codes.get("target"):
         env["ST_TARGET_STOCK_CODE"] = codes["target"]
+    if codes.get("exchange"):
+        env["ST_EXCHANGE_NUM"] = str(codes["exchange"])
     try:
         p = subprocess.run(cmd, cwd=BASE_DIR, env=env,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -534,19 +546,37 @@ def ensure_create_table(args, log):
       实测踩过：表有 10000 行就直接放行，结果 create 发出去的合约
       与 modify 不是同一个（用户在 GUI 改了代码也不生效）。
       所以这里同时核对表里的合约代码，不一致就重新生成。
+
+    ★ ExchangeNum（--exchange）同理是字面量：只换交易所不重生成的话，
+      create 还是旧口径，而 modify/remove 每轮重生成已是新口径 ——
+      同一组业务流里两种口径混着发。这里一并核对。
     """
     excel = os.path.join(BASE_DIR, "data", "create.xlsx")
     n = len(_rows_of_type(excel, "normal", {"normal"}))
-    want = (_flow_codes(args) or {}).get("contract") or ""
+    _fc = _flow_codes(args)
+    want = _fc.get("contract") or ""
     have = _table_contract_code(excel) if want else None
+    stale = False
     if want and have and have != want:
         log("create.xlsx 里的合约是 %s，与本次 --contract-code %s 不一致 —— 重新生成"
             % (have, want))
-    elif n >= args.batch:
-        log("create.xlsx 已有 %d 行 normal（>= 每轮 %d），无需重新生成"
-            % (n, args.batch))
-        return True
-    if n < args.batch:
+        stale = True
+    want_ex = _fc.get("exchange") or 0
+    have_ex = _table_col_value(excel, "Entrust_ExchangeNum") if want_ex else None
+    if want_ex and have_ex not in (None, ""):
+        try:
+            same_ex = int(have_ex) == int(want_ex)
+        except (TypeError, ValueError):
+            same_ex = False
+        if not same_ex:
+            log("create.xlsx 里的 Entrust_ExchangeNum 是 %s，与本次 --exchange %d "
+                "不一致 —— 重新生成" % (have_ex, want_ex))
+            stale = True
+    if not stale:
+        if n >= args.batch:
+            log("create.xlsx 已有 %d 行 normal（>= 每轮 %d），无需重新生成"
+                % (n, args.batch))
+            return True
         log("create.xlsx 只有 %d 行 normal，少于每轮 %d —— 自动生成 --bulk-normal %d"
             % (n, args.batch, args.batch))
     # 重新生成时按 max(现有行数, 每轮条数) 生成：
@@ -771,6 +801,11 @@ def main():
                          "留空则用 make_excel 自己的默认值/环境变量")
     ap.add_argument("--target-stock-code", default="",
                     help="止盈止损标的代码：同上，传给 make_excel")
+    ap.add_argument("--exchange", type=int, default=0, choices=(0, 1, 2),
+                    help="交易所编号 1=沪 2=深：业务流重生成 create/modify 表时传给 "
+                         "make_excel，统一改写【所有块】的 ExchangeNum。"
+                         "0=不覆盖（用 _common.DEFAULT_EXCHANGE_NUM，当前 1=沪）。"
+                         "★ 只在 --flow 下有效 —— 单接口模式不会重生成表。")
 
     # ---- 异常判据（默认：发送失败 + 回复率(按类型) + lag/pending/在途/超时）----
     ap.add_argument("--min-reply-rate", type=float, default=None,
@@ -938,10 +973,14 @@ def main():
     if args.passthrough:
         log("透传 send_test.py 参数: %s" % " ".join(args.passthrough))
     _fc = _flow_codes(args)
-    if args.flow and (_fc["contract"] or _fc["target"]):
-        log("行情代码（重生成 modify/remove 表时沿用）: 合约=%s  止盈止损标的=%s"
+    if args.flow and (_fc["contract"] or _fc["target"] or _fc["exchange"]):
+        log("重生成表时沿用的参数: 合约=%s  止盈止损标的=%s  ExchangeNum=%s"
             % (_fc["contract"] or "（make_excel 默认）",
-               _fc["target"] or "（make_excel 默认）"))
+               _fc["target"] or "（make_excel 默认）",
+               _fc["exchange"] or "（make_excel 默认）"))
+    if args.exchange and not args.flow:
+        log("⚠ --exchange %d 在单接口模式下不生效：该模式不重生成表，"
+            "请在「生成压测数据」里改交易所" % args.exchange)
     if args.clean == "per-round":
         log("⚠ --clean per-round：会清空回包流 %s。该流是多条 ST-* 共用的，"
             "非独占环境请改用 monitor" % REPLY_STREAM)
@@ -1238,6 +1277,8 @@ def main():
             "rounds_planned": args.rounds if by_rounds else None,
             "hours_planned": None if by_rounds else args.hours,
             "batch": args.batch,
+            "exchange": args.exchange or None,
+            "contract_code": getattr(args, "contract_code", "") or None,
             "clean_mode": args.clean,
             "rotate": bool(args.rotate),
             # ---- 本轮实际生效的判据（事后复盘必须知道"用什么判的"）----

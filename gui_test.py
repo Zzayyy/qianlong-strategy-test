@@ -535,6 +535,10 @@ class MainWindow(QWidget):
                         self.edit_contract_code.text().strip())
             self.cp.set("gui", "target_stock_code",
                         self.edit_target_code.text().strip())
+            # 交易所（写进所有块的 ExchangeNum）
+            if hasattr(self, "combo_exchange"):
+                self.cp.set("gui", "exchange",
+                            str(self.combo_exchange.currentData() or 1))
             # CODE 列表模式（策略服务器性能测试用：一个 code 一条条件单）
             if hasattr(self, "edit_codes_file"):
                 self.cp.set("gui", "gen_mode", self._gen_mode())
@@ -891,10 +895,38 @@ class MainWindow(QWidget):
             "⚠ 只对 modify 生效：create 里这两组是【510050】，不受本框影响。")
         self.guard.install(self.edit_target_code)
 
+        # ---- 交易所（所有块的 ExchangeNum）----
+        # 1=沪 2=深。它写进全部 9 个块的 *_ExchangeNum 列（create 与 modify 同源，
+        # 见 interfaces/_common.py 的 EXCHANGE_NUM）。
+        # ★ 刻意【不】放进 _bulk_widgets / _codes_widgets：
+        #   CODE 列表模式下它同样生效（会覆盖 csv 里的 exchange 列），不该被置灰。
+        self.combo_exchange = QComboBox()
+        self.combo_exchange.addItem("1 = 沪", 1)
+        self.combo_exchange.addItem("2 = 深", 2)
+        try:
+            _ex_i = int(float(ini_get(self.cp, "gui", "exchange", "1") or 1))
+        except ValueError:
+            _ex_i = 1
+        self.combo_exchange.setCurrentIndex(
+            max(0, self.combo_exchange.findData(_ex_i)))
+        self.combo_exchange.setMaximumWidth(140)
+        self.combo_exchange.setToolTip(
+            "交易所编号，写进【所有嵌套块】的 ExchangeNum：\n"
+            "  Entrust / CfgExceedPrice / CondPrice / CondPercent / CondTime /\n"
+            "  CondLoss / CondTargetLoss / CondProfit / CondTargetProfit\n\n"
+            "1 = 沪（现场 SH 列表 1001xxxx 全部是 1）  2 = 深\n\n"
+            "★ 表里存的是字面量：改完必须重新生成表才生效。\n"
+            "★ 业务流模式（create→modify→remove）会把本值一路传给 soak，\n"
+            "  每轮重生成的 modify 表也用它。\n"
+            "★ CODE 列表模式下同样生效（覆盖 csv 的 exchange 列）。")
+        self.guard.install(self.combo_exchange)
+
         g.addWidget(QLabel("合约代码"), row_gen + 3, 0)
         g.addWidget(self.edit_contract_code, row_gen + 3, 1)
         g.addWidget(QLabel("止盈止损标的"), row_gen + 3, 2)
         g.addWidget(self.edit_target_code, row_gen + 3, 3)
+        g.addWidget(QLabel("交易所"), row_gen + 4, 0)
+        g.addWidget(self.combo_exchange, row_gen + 4, 1)
 
         # ---- 按行情 CODE 列表生成（一个 code 一条条件单）----
         # 场景：策略服务器性能测试，要求每个 code 都注册一遍，
@@ -1180,6 +1212,8 @@ class MainWindow(QWidget):
                 if ref_map and n in ("modify", "remove"):
                     cmd += ["--ref-map", ref_map]
             cmd += codes
+            # 交易所对所有块生效，两种生成方式都带（codes 模式下覆盖 csv 的 exchange）
+            cmd += ["--exchange", str(self.combo_exchange.currentData() or 1)]
             cmds.append(cmd)
 
         self.append_log("")
@@ -1198,6 +1232,8 @@ class MainWindow(QWidget):
             self.append_log("#   行情代码：合约=%s  止盈止损标的=%s"
                             % (self.edit_contract_code.text().strip() or "（默认）",
                                self.edit_target_code.text().strip() or "（默认）"))
+        self.append_log("#   交易所：所有块 ExchangeNum=%s（1=沪 2=深）"
+                        % (self.combo_exchange.currentData() or 1))
         self.append_log("#" * 60)
         self._run(cmds, on_done=lambda rc: self._after_generate(rc, names))
 
@@ -2151,6 +2187,9 @@ class MainWindow(QWidget):
             a += ["--contract-code", self.edit_contract_code.text().strip()]
         if self.edit_target_code.text().strip():
             a += ["--target-stock-code", self.edit_target_code.text().strip()]
+        # 交易所：业务流每轮重生成 create/modify 表时统一所有块的 ExchangeNum，
+        # 不传的话 soak 会用 _common 的默认值，可能与本面板选的不一致。
+        a += ["--exchange", str(self.combo_exchange.currentData() or 1)]
         a += ["--gap", "%g" % self.spin_soak_gap.value()]
         # 业务流中场停顿（create→modify→停N秒→remove）：
         # 只在 flow 模式传；单接口模式传了 soak 会直接拒绝退出。

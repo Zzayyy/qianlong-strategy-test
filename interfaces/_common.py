@@ -40,6 +40,36 @@ def target_stock_code():
     return v or DEFAULT_TARGET_STOCK_CODE
 
 
+# ==================== 交易所编号（所有块的 ExchangeNum）====================
+# 口径：1=沪 2=深（同 account.py 的股东号样本）。
+# ★ 现场 SH 列表（1001xxxx）【所有块一律 1】。
+#   这里做成唯一开关：create 的 REAL_BLOCKS 与 modify 的 MODIFY_BLOCKS 都取它，
+#   改这一处两张表一起变 —— 以前两处各写死（create 混着 2 和 1、modify 全 2），
+#   改一处另一处仍是旧值，很容易漏。
+DEFAULT_EXCHANGE_NUM = 1
+
+
+def exchange_num():
+    """当前生效的 ExchangeNum。环境变量 ST_EXCHANGE_NUM 优先。
+
+    ★ 与 contract_code() 同一套路：make_excel.py / soak_test.py 在 import
+      接口模块【之前】把 --exchange 注入环境变量，模板就按新值生成。
+      表里存的是字面量，所以换值后必须重新生成表才生效。
+    """
+    v = (os.environ.get("ST_EXCHANGE_NUM") or "").strip()
+    if not v:
+        return DEFAULT_EXCHANGE_NUM
+    try:
+        n = int(v)
+    except ValueError:
+        return DEFAULT_EXCHANGE_NUM
+    return n if n in (1, 2) else DEFAULT_EXCHANGE_NUM
+
+
+# 模块导入时求值（REAL_BLOCKS / MODIFY_BLOCKS 都在 import 时用到它）
+EXCHANGE_NUM = exchange_num()
+
+
 # ==================== 破坏 token ====================
 TOKEN_MAP = {
     "__EMPTY__": "",              # 空串（区别于"留空=不出现"）
@@ -360,12 +390,12 @@ def fmt_shareholders(seq):
     return [(sh, 1), (sz, 2)]
 
 REAL_ENTRUST = {
-    "ContractCode": contract_code(), "ExchangeNum": 2, "EntrustPrice": "0.1033",
+    "ContractCode": contract_code(), "ExchangeNum": EXCHANGE_NUM, "EntrustPrice": "0.1033",
     "MarketOrderType": 15, "CoveredType": False, "BSType": 1, "OCType": 1,
     "PriceUnit": "0.0001", "EntrustAmount": 20, "FOK": False,
 }
 REAL_CFG_EXCEED = {
-    "ExchangeNum": 2, "StockCode": contract_code(), "StockName": "50ETF",
+    "ExchangeNum": EXCHANGE_NUM, "StockCode": contract_code(), "StockName": "50ETF",
     # ★ PriceStepBuy 原值 -1 是照抄 136 ST-0 真实流量的样本，平台语义是
     #   "买入不限价"（负数不是价格，是开关值）。2026-10-20 用户要求
     #   【表里不要出现负价格】，改为 1（与 PriceStepSell 对称）。
@@ -386,22 +416,22 @@ REAL_CFG_APPEND = {
     "MarketOrderType": 15, "Tick": 2, "IntervalSec": 3, "Repeat": 2,
     "EndWithdraw": False,
 }
-REAL_COND_PRICE = {"ContractCode": contract_code(), "ExchangeNum": 2,
+REAL_COND_PRICE = {"ContractCode": contract_code(), "ExchangeNum": EXCHANGE_NUM,
                    "Op": ">", "TriggerPrice": "0.123"}
-REAL_COND_PERCENT = {"ContractCode": contract_code(), "ExchangeNum": 2,
+REAL_COND_PERCENT = {"ContractCode": contract_code(), "ExchangeNum": EXCHANGE_NUM,
                      "Op": ">", "TriggerPercent": "5.25"}
-REAL_COND_TIME = {"ContractCode": contract_code(), "ExchangeNum": 2,
+REAL_COND_TIME = {"ContractCode": contract_code(), "ExchangeNum": EXCHANGE_NUM,
                   "TriggerDate": "__TODAY_PLUS7__", "TriggerTime": "093240"}
 # ⚠ 下面这两组的代码与「行情合约代码」不同源，保持原值不动
 #   （CondLoss/CondProfit 用 10011743，CondTarget* 用标的 510050）。
-REAL_COND_LOSS = {"ContractCode": "10011743", "ExchangeNum": 1,
+REAL_COND_LOSS = {"ContractCode": "10011743", "ExchangeNum": EXCHANGE_NUM,
                   "Method": 1, "ValueType": 1, "Value": "0.0675"}
-REAL_COND_TARGET_LOSS = {"StockCode": "510050", "ExchangeNum": 1,
+REAL_COND_TARGET_LOSS = {"StockCode": "510050", "ExchangeNum": EXCHANGE_NUM,
                          "Method": 1, "ValueType": 1, "Value": "3.216"}
-REAL_COND_PROFIT = {"ContractCode": "10011743", "ExchangeNum": 1, "Method": 1,
+REAL_COND_PROFIT = {"ContractCode": "10011743", "ExchangeNum": EXCHANGE_NUM, "Method": 1,
                     "ValueType": 1, "Value": "0.0675", "WithdrawType": 2,
                     "Withdraw": "0.50"}
-REAL_COND_TARGET_PROFIT = {"StockCode": "510050", "ExchangeNum": 1,
+REAL_COND_TARGET_PROFIT = {"StockCode": "510050", "ExchangeNum": EXCHANGE_NUM,
                            "Method": 1, "ValueType": 1, "Value": "3.216",
                            "WithdrawType": 2, "Withdraw": "0.50"}
 
