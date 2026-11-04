@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import deque
 
 # 屏蔽 Qt 在 Windows 上枚举旧系统字体失败的无害警告（Fixedsys/MS Sans Serif 等）
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts.warning=false")
@@ -453,6 +454,13 @@ class MainWindow(QWidget):
         self.summary_loader = None
         self._rows = []
         self._batch_start = 0.0
+        # 日志「跟随最新」：运行中往上翻看历史时暂停往控件里写新行，
+        # 否则每来一行都会被拽回底部（细节见 append_log）
+        self._log_following = True     # 当前是否在跟随最新
+        self._log_pending = deque()    # 暂停期间攒下的新行
+        self._log_dropped = 0          # 缓冲超上限丢掉的行数（状态栏如实报）
+        self._log_gate = False         # 程序性滚动时屏蔽 valueChanged 回调
+        self._log_lines = 0            # 显示区行数缓存（暂停时不必每行扫全文）
         self.guard = WheelGuard(self)
         self.svc_strategy = ServiceProc("策略平台", self)
         self.svc_datahub = ServiceProc("数据中台", self)
@@ -523,9 +531,11 @@ class MainWindow(QWidget):
                 self.cp.set("gui", "ssh_dir", self.edit_ssh_dir.text().strip())
                 self.cp.set("gui", "ssh_nohup",
                             "1" if self.chk_ssh_nohup.isChecked() else "0")
-            # 「每次发送前自动清空日志」记住用户的选择（纯偏好，无风险）
+            # 日志区的两个纯偏好设置记住用户的选择（无风险）
             self.cp.set("gui", "autoclear_log",
                         "1" if self.chk_autoclear.isChecked() else "0")
+            self.cp.set("gui", "autofollow_log",
+                        "1" if self.chk_autofollow.isChecked() else "0")
             # 生成压测数据的参数（只是默认值，误填也不会自动发送）
             self.cp.set("gui", "bulk_accounts", str(self.spin_bulk_accounts.value()))
             self.cp.set("gui", "bulk_start", str(self.spin_bulk_start.value()))
@@ -2409,6 +2419,7 @@ class MainWindow(QWidget):
         if self.chk_ssh_nohup.isChecked():
             self.append_log("[SSH] 后台模式：启动后立即返回，结果不会自动下载；"
                             "跑完点「下载远端结果」取回")
+        self._log_resume()   # 同 _run：开跑就回到最新，别把本次输出憋在缓冲里
         self.worker = SshSoakWorker(
             kw["host"], kw["port"], kw["user"], kw["pwd"], kw["remote_dir"],
             jobs, uploads=uploads, downloads=dls, parent=self)
@@ -2563,10 +2574,26 @@ class MainWindow(QWidget):
             "这样每次只看本次输出，不用手动清。")
         self.chk_autoclear.setChecked(
             ini_get(self.cp, "gui", "autoclear_log", "0") == "1")
+        self.chk_autofollow = QCheckBox("自动跟随最新")
+        self.chk_autofollow.setToolTip(
+            "勾上：停在底部时自动显示最新日志；往上翻看历史时自动暂停，\n"
+            "      新日志先攒着，不会把正在看的内容顶掉（完整日志仍写 out/logs/）。\n"
+            "不勾：一直不自动滚动，只在点「回到最新」时跳一次。")
+        self.chk_autofollow.setChecked(
+            ini_get(self.cp, "gui", "autofollow_log", "1") == "1")
+        self._log_following = self.chk_autofollow.isChecked()
+        self.chk_autofollow.toggled.connect(self._on_follow_toggled)
+        self.btn_goto_latest = QPushButton("回到最新")
+        self.btn_goto_latest.setToolTip(
+            "跳到最新一行，并把暂停跟随期间攒下的日志一次补上。")
+        self.btn_goto_latest.setEnabled(not self._log_following)
+        self.btn_goto_latest.clicked.connect(lambda: self._log_resume())
         self.lbl_logstat = QLabel("")
         self.lbl_logstat.setStyleSheet("color:#888;")
         bar.addWidget(self.btn_clear_log)
         bar.addWidget(self.chk_autoclear)
+        bar.addWidget(self.chk_autofollow)
+        bar.addWidget(self.btn_goto_latest)
         bar.addStretch(1)
         bar.addWidget(self.lbl_logstat)
         v.addLayout(bar)
@@ -2577,7 +2604,10 @@ class MainWindow(QWidget):
         self.log.document().setMaximumBlockCount(MAX_LOG_LINES)
         # 文本变化时刷新"已清空/行数"提示
         self.log.textChanged.connect(self._update_logstat)
+        # 用户滚回底部时自动恢复跟随；往上翻由 append_log 自己判定
+        self.log.verticalScrollBar().valueChanged.connect(self._on_log_scroll)
         v.addWidget(self.log)
+        self._render_logstat()
 
         self.tabs.addTab(page, "运行日志")
 
@@ -2621,19 +2651,42 @@ class MainWindow(QWidget):
 
         return self.tabs
 
-    # ---- 日志清空 ----
+    # ---- 日志状态提示 / 清空 ----
     def _update_logstat(self):
         # 别用 blockCount()-1 估算：QTextEdit 首次 append 不会多出空块，
         # 会算出比实际少 1 的行数（踩过）。直接数非空行最准。
         txt = self.log.toPlainText()
-        n = sum(1 for line in txt.splitlines() if line.strip())
-        self.lbl_logstat.setText("" if n == 0 else "%d 行" % n)
+        self._log_lines = sum(1 for line in txt.splitlines() if line.strip())
+        self._render_logstat()
+
+    def _render_logstat(self):
+        """状态栏：跟随中显示行数；暂停时告诉用户攒了多少新行。"""
+        n = self._log_lines
+        self.btn_goto_latest.setEnabled(not self._log_following)
+        if self._log_following:
+            self.lbl_logstat.setStyleSheet("color:#888;")
+            self.lbl_logstat.setText("" if n == 0 else "%d 行" % n)
+        else:
+            new = len(self._log_pending) + self._log_dropped
+            self.lbl_logstat.setStyleSheet("color:#c60;font-weight:bold;")
+            self.lbl_logstat.setText(
+                "%s已暂停跟随 · 新增 %d 行"
+                % (("%d 行 · " % n) if n else "", new))
 
     def clear_log(self, note=None):
         """清空日志显示（不删 out/logs/ 下的文件）。"""
-        self.log.clear()
+        self._log_pending.clear()
+        self._log_dropped = 0
+        self._log_following = self.chk_autofollow.isChecked()
+        self._log_gate = True
+        try:
+            self.log.clear()
+        finally:
+            self._log_gate = False
         if note:
-            self.append_log(note)
+            # 提示行必须立刻显示，别被暂停缓冲吞掉（清空本来就该回到最新）
+            self._log_write([note])
+        self._render_logstat()
 
     def on_clear_log(self):
         if self.worker and self.worker.isRunning():
@@ -2694,10 +2747,89 @@ class MainWindow(QWidget):
         self.btn_st_dh.clicked.connect(self._start_datahub)
         self.btn_sp_dh.clicked.connect(self.svc_datahub.stop)
 
-    # ---------------- 小工具 ----------------
+    # ---------------- 日志：智能跟随最新 ----------------
+    def _log_at_bottom(self):
+        """视口是否停在底部（留一行容差；内容不足一屏时也算在底部）。
+
+        QTextEdit 的滚动条以像素计，singleStep 约等于一行高。
+        """
+        sb = self.log.verticalScrollBar()
+        slop = max(sb.singleStep(), 4)
+        return sb.value() >= sb.maximum() - slop
+
+    def _log_write(self, lines):
+        """把一批行写进显示区并停在底部（lines 为空时只滚到底）。"""
+        self._log_gate = True
+        try:
+            if lines:
+                # append 支持多行字符串，一次插入比逐行 append 快得多
+                # （补日志时可能一次几千行）
+                self.log.append("\n".join(lines))
+            self.log.moveCursor(QTextCursor.MoveOperation.End)
+            self.log.ensureCursorVisible()
+        finally:
+            self._log_gate = False
+
+    def _log_resume(self):
+        """补上暂停期间攒下的日志并回到最新。
+
+        「自动跟随最新」没勾时只跳这一次，之后继续暂停。
+        """
+        lines = []
+        lines.extend(self._log_pending)
+        if self._log_dropped:
+            # 放在末尾：补太多行时 maximumBlockCount 会从最旧的一头裁，
+            # 放开头会连这行提示一起被裁掉，用户反而看不到"有日志没显示"
+            lines.append("[提示] 上面只补了最近 %d 行，暂停期间另有 %d 行未显示"
+                         "（完整日志见 out/logs/）"
+                         % (len(lines), self._log_dropped))
+        self._log_pending.clear()
+        self._log_dropped = 0
+        self._log_write(lines)
+        self._log_following = self.chk_autofollow.isChecked()
+        self._render_logstat()
+
+    def _on_log_scroll(self, _value):
+        """用户滚动时裁决：滚回底部 -> 恢复跟随；往上翻 -> 立即暂停。"""
+        if self._log_gate:      # 程序性滚动（append / clear）不算用户操作
+            return
+        if self._log_at_bottom():
+            if self.chk_autofollow.isChecked() and not self._log_following:
+                self._log_resume()
+        elif self._log_following:
+            self._log_following = False
+            self._render_logstat()
+
+    def _on_follow_toggled(self, checked):
+        if checked:
+            if self._log_at_bottom():
+                self._log_resume()
+        else:
+            self._log_following = False
+        self._render_logstat()
+
     def append_log(self, text):
-        self.log.append(text)
-        self.log.moveCursor(QTextCursor.MoveOperation.End)
+        """追加一行日志：默认跟随最新，用户往上翻看历史时自动暂停。
+
+        【原来的坑】每行都 append + moveCursor(End)，运行中会把视口强制
+        拽回底部，想回头看上面的报错根本停不住；而且 document 设了
+        maximumBlockCount(4000)，高频输出几秒就把正在看的那几行顶掉。
+        现在往上翻时干脆不往控件里写，新行攒在内存里，滚回底部 /
+        点「回到最新」再一次性补上（子进程仍把完整日志写进 out/logs/）。
+        """
+        if not self.chk_autofollow.isChecked() or not self._log_at_bottom():
+            if self._log_following:
+                self._log_following = False
+            self._log_pending.append(text)
+            if len(self._log_pending) > MAX_LOG_LINES:
+                # 长时间不回到底部别让缓冲无限涨；丢掉多少行如实报在状态栏
+                self._log_pending.popleft()
+                self._log_dropped += 1
+            self._render_logstat()
+            return
+        if not self._log_following:
+            self._log_resume()
+        self._log_write([text])
 
     def _on_svc_line(self, tag, text):
         self.append_log("[%s] %s" % (tag, text))
@@ -2909,6 +3041,9 @@ class MainWindow(QWidget):
             self._sync_soak_button(running)
 
     def _run(self, cmds, on_done=None):
+        # 主动开跑 = 要看本次输出：先补上暂停期间攒的日志并回到最新，
+        # 否则上一轮留下的暂停状态会把这一轮的输出全憋在缓冲里
+        self._log_resume()
         self._set_running(True)
         self.worker = Worker(cmds, BASE_DIR, parent=self)
         self.worker.line.connect(self.append_log)
@@ -3166,6 +3301,7 @@ class MainWindow(QWidget):
         else:
             # 不自应答：等真/Mock 数据中台分配编号（走完整握手）
             a += ["--no-assign"]
+        self._log_resume()   # 常驻服务一起来就有持续输出，别让它被暂停缓冲吞掉
         ok, err = self.svc_strategy.start(a, BASE_DIR)
         if not ok:
             QMessageBox.warning(self, "启动失败", err)
@@ -3175,6 +3311,7 @@ class MainWindow(QWidget):
         a += ["--alloc-start", str(self.spin_dh_alloc.value())]
         if self.chk_svc_suffix.isChecked():
             a += ["--channel-suffix", "_1"]
+        self._log_resume()
         ok, err = self.svc_datahub.start(a, BASE_DIR)
         if not ok:
             QMessageBox.warning(self, "启动失败", err)
